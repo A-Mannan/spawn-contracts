@@ -1,0 +1,72 @@
+[profile.default]
+src = "src"
+out = "out"
+test = "test"
+script = "script"
+libs = ["lib"]
+
+# Pinned per openspec/changes/add-milestone-launchpad/design.md.
+# cancun is mandatory, not an optimisation: transient storage (tstore/tload)
+# backs every settlement lock in the hook.
+solc = "0.8.26"
+evm_version = "cancun"
+
+# Low optimizer_runs biases the optimiser toward smaller bytecode, which is what
+# the 24 KB size gate on the singleton hook needs. Raise only if gas regresses
+# materially and the size gate still has headroom.
+optimizer = true
+optimizer_runs = 200
+
+bytecode_hash = "none"
+cbor_metadata = false
+
+ffi = false
+ast = true
+build_info = true
+extra_output = ["storageLayout"]
+
+# Uniswap v4 uses custom errors extensively; keep full revert data in traces.
+verbosity = 1
+
+[profile.default.fuzz]
+runs = 512
+
+[profile.default.invariant]
+runs = 256
+depth = 64
+fail_on_revert = false
+call_override = false
+
+# Fork profile: Base mainnet, endpoint supplied from the environment so no RPC
+# URL or key is committed. Select with `forge test --profile fork`.
+[profile.fork]
+eth_rpc_url = "${BASE_RPC_URL}"
+
+[profile.fork.fuzz]
+runs = 64
+
+[profile.fork.invariant]
+runs = 32
+depth = 32
+
+# Deeper settings for the release check (task 14.4).
+[profile.deep.fuzz]
+runs = 10_000
+
+[profile.deep.invariant]
+runs = 1_000
+depth = 128
+
+[rpc_endpoints]
+base = "${BASE_RPC_URL}"
+base_sepolia = "${BASE_SEPOLIA_RPC_URL}"
+
+[etherscan]
+base = { key = "${BASESCAN_API_KEY}", chain = 8453 }
+base_sepolia = { key = "${BASESCAN_API_KEY}", chain = 84532 }
+
+[fmt]
+line_length = 120
+tab_width = 4
+bracket_spacing = false
+int_types = "long"

@@ -180,11 +180,15 @@ contract PayoutPluginRegistryTest is Test {
         vm.expectRevert(PayoutPluginRegistry.InvalidTake.selector);
         registry.registerPlugin(address(utilityTake), 1, GAS_LIMIT, PluginRole.UTILITY);
 
-        DirectPlugin lowGas = new DirectPlugin();
-        uint32 minGasLimit = registry.MIN_PLUGIN_GAS_LIMIT();
+        DirectPlugin minimumGas = new DirectPlugin();
+        vm.prank(ADMINISTRATOR);
+        uint8 minimumGasIndex = registry.registerPlugin(address(minimumGas), 0, 1, PluginRole.PAYOUT);
+        assertEq(registry.entry(minimumGasIndex).gasLimit, 1, "one gas accepted");
+
+        DirectPlugin zeroGas = new DirectPlugin();
         vm.prank(ADMINISTRATOR);
         vm.expectRevert(PayoutPluginRegistry.UnsafeGasLimit.selector);
-        registry.registerPlugin(address(lowGas), 0, minGasLimit - 1, PluginRole.PAYOUT);
+        registry.registerPlugin(address(zeroGas), 0, 0, PluginRole.PAYOUT);
 
         DirectPlugin highGas = new DirectPlugin();
         uint32 maxGasLimit = registry.MAX_PLUGIN_GAS_LIMIT();

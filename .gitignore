@@ -1,0 +1,20 @@
+# Foundry
+out/
+cache/
+broadcast/
+foundry-out/
+.forge-snapshots/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Editors & OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Node (only if tooling is added later)
+node_modules/

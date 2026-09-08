@@ -1,36 +1,41 @@
 ## Purpose
 
-Defines the one-way, permissionless transition from the bonding curve phase to the graduated phase: the bonding curve positions are retired in place, proceeds are split, a permanently locked full-range position is seeded, and the milestone ladder becomes active.
+Defines the one-way transition from the bonding curve phase to the graduated phase — auto-triggered by the first swap after the far level is crossed, and also callable permissionlessly: the bonding curve positions are retired in place, proceeds are split, a permanently locked full-range position is seeded, and the milestone ladder becomes active.
 
 ## ADDED Requirements
 
-### Requirement: Permissionless graduation at the far tick
+### Requirement: Graduation at the far tick — auto-triggered and permissionless
 
-The system SHALL allow any address to trigger graduation once the pool's current tick has reached the configured far tick. The system SHALL verify the tick condition at call time rather than relying on any recorded flag, timestamp, or external attestation.
+The system SHALL graduate the pool once its current tick has reached the far tick, by either of two paths: automatically, in the `beforeSwap` of the first swap arriving after the crossing, or by any address calling the permissionless graduation entry point. The crossing swap itself SHALL NOT graduate in its own `afterSwap`. Both paths SHALL verify the tick condition at call time rather than relying on any recorded flag, timestamp, or external attestation, and the transition SHALL run once.
 
-#### Scenario: Graduation succeeds at or above the far tick
+#### Scenario: The first swap after the crossing auto-graduates
 
-- **WHEN** any address triggers graduation while the pool's current tick is at or above the far tick
-- **THEN** graduation completes and the pool enters the graduated phase
+- **WHEN** a swap arrives while the pool's current tick is at or above the far tick and the pool is still in the bonding curve phase
+- **THEN** graduation completes in that swap's `beforeSwap`, and the swap then executes against the graduated pool
+
+#### Scenario: The crossing swap itself does not graduate
+
+- **WHEN** the swap that pushes the tick to the far level completes
+- **THEN** the pool remains in the bonding curve phase until the next swap's `beforeSwap` or a permissionless graduation call
+
+#### Scenario: Any address can trigger graduation
+
+- **WHEN** any address calls the permissionless graduation entry point while the pool's current tick is at or above the far tick
+- **THEN** graduation completes on the same terms as the auto-trigger
 
 #### Scenario: Graduation is rejected below the far tick
 
-- **WHEN** any address triggers graduation while the pool's current tick is below the far tick
+- **WHEN** graduation is attempted while the pool's current tick is below the far tick
 - **THEN** the call reverts and the pool remains in the bonding curve phase
-
-#### Scenario: No privileged trigger
-
-- **WHEN** an address unrelated to the creator or the protocol triggers graduation with the tick condition met
-- **THEN** graduation completes on the same terms as if the creator had triggered it
 
 #### Scenario: Tick condition is evaluated at call time
 
 - **WHEN** the pool's tick reached the far tick earlier but has since fallen back below it, and graduation has not yet been triggered
-- **THEN** a graduation call reverts
+- **THEN** graduation is not performed and the pool remains in the bonding curve phase
 
 #### Scenario: Graduation happens once
 
-- **WHEN** graduation is triggered on a pool that is already in the graduated phase
+- **WHEN** graduation runs on a pool that is already in the graduated phase
 - **THEN** the call reverts, and no positions are re-minted and no proceeds are re-split
 
 ### Requirement: Curve retirement and proceeds collection
@@ -54,17 +59,17 @@ Graduation SHALL burn every bonding curve position and collect both the resultin
 
 ### Requirement: Bonding curve proceeds split
 
-Graduation SHALL split collected bonding curve quote proceeds three ways: an LP-seed share, a creator share credited for pull-based claiming, and a protocol share credited for pull-based claiming. The defaults SHALL be 40% LP seed, 55% creator, and 5% protocol. The LP-seed share SHALL be configurable per launch with a floor of 20%.
+Graduation SHALL split collected bonding curve quote proceeds three ways: an LP-seed share, a creator share credited for pull-based claiming, and a protocol share credited for pull-based claiming. The split SHALL be fixed by the protocol template: 40% LP seed, 55% creator, and 5% protocol. Unbought curve token inventory and released curve token fees SHALL return to hook custody as ladder inventory.
 
 #### Scenario: Default split is applied
 
-- **WHEN** graduation completes on a launch that did not override the LP-seed share
+- **WHEN** graduation completes
 - **THEN** 40% of quote proceeds seed the full-range position, 55% is credited to the creator's claimable balance, and 5% is credited to the protocol's claimable balance
 
-#### Scenario: Configured LP-seed share is honoured
+#### Scenario: Token inventory and curve token fees become ladder inventory
 
-- **WHEN** graduation completes on a launch configured with an LP-seed share above the floor
-- **THEN** that share seeds the full-range position and the remainder is distributed to creator and protocol in their configured proportions
+- **WHEN** graduation completes on a pool whose curves still hold unbought token inventory or accrued token-denominated fees
+- **THEN** those tokens return to hook custody and are available to the ladder's band deployments, never to a recipient
 
 #### Scenario: Split allocations sum to the collected proceeds
 
@@ -78,7 +83,7 @@ Graduation SHALL split collected bonding curve quote proceeds three ways: an LP-
 
 ### Requirement: Full-range position seeding
 
-Graduation SHALL mint a single full-range liquidity position at the graduation price, funded with the LP-seed share of quote proceeds and the configured full-range token share of total supply.
+Graduation SHALL mint a single full-range liquidity position at the graduation price, funded with the LP-seed share of quote proceeds and the template's full-range token share of total supply.
 
 #### Scenario: Full-range position is created at the graduation price
 
@@ -88,7 +93,7 @@ Graduation SHALL mint a single full-range liquidity position at the graduation p
 #### Scenario: Full-range position is funded from both sides
 
 - **WHEN** graduation completes
-- **THEN** the position is funded with the LP-seed quote amount and the configured full-range share of total supply, with any unusable remainder retained in hook custody
+- **THEN** the position is funded with the LP-seed quote amount and the template's full-range share of total supply, with any unusable remainder retained in hook custody
 
 #### Scenario: Ladder inventory is untouched by seeding
 
@@ -111,7 +116,7 @@ The system SHALL expose no code path, for any caller including the creator and t
 
 #### Scenario: Lock survives ladder exhaustion
 
-- **WHEN** every ladder band, including fee-funded extensions, has been completed or reclaimed
+- **WHEN** every ladder band, including fee-funded extensions, has been completed
 - **THEN** the full-range position remains in place and still cannot be removed
 
 ### Requirement: In-place phase transition

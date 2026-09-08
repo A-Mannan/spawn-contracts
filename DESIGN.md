@@ -26,7 +26,7 @@ BONDING_CURVE (multicurve curves, demand-driven)
    │   curves minted once at launch; price rises as buyers fill them
    │   NOT time-bound; buyers can always sell back (curves are real two-sided liquidity)
    ▼
-graduate()  — permissionless, when tick reaches farTick (top of curves)
+graduate()  — permissionless (or auto-triggered by the next swap), when level reaches farLevel (top of curves)
    │   burn curves → split proceeds → mint full-range LP
    ▼
 GRADUATED (full-range LP + milestone ladder)
@@ -40,12 +40,14 @@ Key architectural decisions (from design session):
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Pre-graduation mechanism | **Multicurve** (Doppler/Zora pattern) | Demand-driven, no time-decay dump pressure; proven on Base (Zora). Dynamic Dutch Auction deferred to v2. |
+| Pre-graduation mechanism | **Nested curve** (Doppler Multicurve algorithm), fixed template, JIT-minted | 32 nested positions staircase liquidity toward the far level: scarcer cheap supply at genesis, higher average execution. Position 0 at genesis, the rest deploy ahead of the price. |
 | Graduation architecture | **In-place morph**, single hook | No migration exploits, no second pool/hook, no Airlock machinery; sa1t-proven pattern. |
-| Custody | **Direct hook balance** (flaunch-style) | No ERC-6909 claims primitive needed; ladder needs real positions anyway. |
+| Custody | **Direct hook balance** (flaunch-style) | No ERC-6909 claims primitive needed beyond mid-swap settlement; ladder needs real positions anyway. |
 | LP lock | **Code-locked, hook-held** full-range | No removal code path; hard `LPLocker` is the v2 upgrade. |
+| Launch shape | **Fixed protocol template** + anchored opening FDV | Uniform terms for every launch (Virtuals posture); the validator guards only the per-launch knobs; opening FDV anchored in ETH. |
+| Launch model | **Signed config, permissionless relay** | Creator pays nothing (EIP-712 config + deadline); anyone relays; creator = recovered signer; dev buy only on creator self-launch. |
 | Failure branches | **None in v1** | No minimum proceeds, no refund window, no duration — those were DDA baggage. Dead tokens trade on curves indefinitely (v2: time-based fallback). |
-| Anti-snipe | **Dynamic fee decay** 99%→1% over creator-chosen window | `DYNAMIC_FEE_FLAG` + `updateDynamicLPFee` block-step decay; no per-swap delta accounting. |
+| Anti-snipe | **None — structural mitigation** | Nested JIT thin books, whale-paid deploy gas, creator dev buy; sniping accepted (pump.fun posture). The 99%→1% decay wall is removed. |
 
 ---
 
@@ -58,7 +60,7 @@ The implementation must satisfy these capabilities regardless of how the code is
 | Obligation | Requirements |
 |---|---|
 | Permissionless launch entry | Validate launch config against §9 bounds; deploy token, hook (mined address), and pool; execute optional dev buy. |
-| Single-hook protocol core | One hook owns the entire lifecycle: phase state machine, multicurve curves, ladder bands, JIT deployment, harvest settlement, fee collection/routing, vesting, anti-snipe. In-place graduation — no second pool/hook, no migration path. |
+| Single-hook protocol core | One hook owns the entire lifecycle: phase state machine, nested bonding curve, ladder bands, simulated deployment, harvest settlement, fee collection/routing, vesting, launch-signature verification. In-place graduation — no second pool/hook, no migration path. |
 | Transferable creator revenue NFT | Pull-based claims on the creator's share of harvests, swap fees, and bonding curve proceeds. Transferable — the revenue stream itself trades (flaunch FeeNFT pattern). |
 | Standard token | Plain ERC20 (Permit2 optional); full supply minted to the hook at launch. |
 
@@ -81,32 +83,32 @@ enum Phase { NONE, BONDING_CURVE, GRADUATED }
 | Callback | BONDING_CURVE | GRADUATED |
 |---|---|---|
 | `beforeInitialize` | Revert unless self/factory | — |
-| `afterInitialize` | Mint multicurve fan positions (`[startingTick_i, farTick]` per curve, log-normal distribution); execute optional dev buy | — |
-| `beforeSwap` | Anti-snipe: `updateDynamicLPFee` decay step (99%→1% over window) | **JIT deploy trigger**: if pre-swap tick ∈ `[band.lower − K, band.lower)` and the swap moves toward the band, mint the band |
-| `afterSwap` | Track nothing critical (curves are passive positions) | **Harvest detection**: post-swap tick ≥ `band.upper` && deployed && !completed → collect band, route proceeds, execute buyback behind a transient-storage lock |
+| `beforeSwap` | **Simulated deployment**: walk the swap's price path with v4 swap math; mint every undeployed curve step it crosses before it fills. Auto-graduate if the level is already at or above `farLevel` (Decision: the crossing swap's own `afterSwap` cannot graduate — its proceeds are unsettled mid-swap) | **Simulated deployment**: same walk over the ladder — mint every undeployed band the path crosses (cap 8/swap, overflow skips benignly). Auto-graduate check first |
+| `afterSwap` | Track nothing critical (curves are passive positions) | **Harvest loop**: every deployed band whose top the post-swap level has crossed is completed and routed, up to 8 per swap; fee step-down applied at template thresholds |
 | `beforeAddLiquidity` / `beforeRemoveLiquidity` | Revert unless sender is the hook (no external LPs; curves hook-owned) | Same; full-range and bands hook-owned |
 
 Transient-storage locks (`tstore`/`tload`, StoreKeys pattern from flaunch) guard all settlement paths against reentrancy from nested swaps.
 
 ---
 
-## 5. Pre-graduation: multicurve curves
+## 5. Pre-graduation: nested bonding curve
 
-Direct port of Doppler's `Multicurve` production system (as used by Zora):
+The Doppler Multicurve algorithm (Adams, Czernik, Kulkarni, Kunz, April 2025 — eqs. 3.1–3.2), reimplemented in level space with attribution; the vendored implementation is BUSL-licensed and is reference, not dependency:
 
-- `Curve[]` — each curve: `tickLower`, `tickUpper`, `numPositions`, `shares` (sum = WAD). Slopes configurable per launch (phased pricing: early discount → steeper later).
-- Positions distributed via `Multicurve.calculatePositions` — log-normal fan `[startingTick_i, farTick]` per curve, `LiquidityAmounts.getLiquidityForAmount0/1`.
-- Pool initialized at the lowest curve boundary; **no rebalancing, no epochs, no duration** — "positions set once and held" (Doppler's words).
-- **Graduation**: permissionless `graduate()` when current tick ≥ `farTick` (negate for token1 orientation). The crossing is verified at call time — a flash pump can technically trigger graduation mid-tx, but the protection is **cost-based**: the attacker pays the full curve spread (buys through curves at rising prices, holds real token), and the proceeds remain in the pool. Graduation cannot be forced cheaply or profitably (residual risk documented in §10).
+- **Fixed template**: 32 nested single-sided token positions, position *i* spanning `[openingLevel + i·span/32, farLevel]`, each holding an equal share of the 25% curve supply. Liquidity staircases upward — thin at the opening, dense at the far level — so cheap supply is scarce at genesis and average execution rises with demand (the paper's anti-snipe finding).
+- **Opening FDV anchored**: the pool opens at the level where the launch's total supply is valued at the protocol's ETH-denominated opening FDV (125 ETH template default). Every launch opens at the same valuation regardless of supply.
+- **JIT-minted**: position 0 mints at genesis (pool tradable in the launch tx); positions 1–31 mint just before price reaches them via the same simulation path that deploys ladder bands. Launch gas is independent of position count.
+- **No rebalancing, no epochs, no duration** — deployed positions are held; the only liquidity change is the protocol deploying its own next template position.
+- **Graduation**: when the level reaches `farLevel`, the next swap's `beforeSwap` graduates automatically; permissionless `graduate()` races it. The crossing is verified at call time — protection is cost-based (the attacker pays the full curve spread; residual risk in §10).
 
 ### Graduation flow
 
-1. Burn all curve positions; collect balances + accrued fees.
-2. Split bonding curve proceeds: **40% LP seed / 55% creator accrual (NFT) / 5% protocol** (LP-seed share configurable, floor 20%).
+1. Burn all curve positions; collect balances + accrued fees. Unbought inventory and curve token fees return to hook custody as ladder inventory.
+2. Split bonding curve quote proceeds: **40% LP seed / 55% creator accrual (NFT) / 5% protocol** (template-fixed).
 3. Mint the **full-range LP**: 40%-share ETH + 10% of supply, at the graduation price. Code-locked: no removal path exists in the hook. Its swap fees accrue to the hook-owned position and are collected via the permissionless `collectFees` path (§7).
 4. Phase → `GRADUATED`. Ladder live.
 
-**Dead tokens (v1)**: if price never reaches `farTick`, the pool trades on its curves indefinitely. Buyers are never trapped — curves are real two-sided liquidity, sells always possible. v2: time-based fallback (force-graduate after N days with partial raise; ladder inventory reclaim rules then apply).
+**Dead tokens (v1)**: if price never reaches `farLevel`, the pool trades on its curves indefinitely. Buyers are never trapped — curves are real two-sided liquidity, sells always possible. v2: time-based fallback (force-graduate after N days with partial raise).
 
 ---
 
@@ -114,34 +116,34 @@ Direct port of Doppler's `Multicurve` production system (as used by Zora):
 
 ### 6.1 Geometry
 
-- **Bands = narrow tick ranges (limit-order semantics)**, width ≈ 5–10% of the band gap. Price entering a band partially fills it; crossing above `band.upper` completes it (position now 100% ETH — harvested).
-- **Spacing: uniform tick offsets.** A 2× market-cap step is a constant 6,931 ticks (`ln2 / ln1.0001`) — uniform in tick space = geometric in mcap space. Config: `{ bandCount, bandTickSpacing, bandWidthTicks, ladderSupplyShare }` — **one setting for all bands**.
-- **Default template**: 8–10 bands from the graduation price, 2× mcap per band, even inventory split of **65% of supply** (25% bonding curve / 65% ladder / 10% full-range LP).
+- **Bands = narrow tick ranges (limit-order semantics)**, width = 20% of the band gap (≈4.5% of price). Price entering a band partially fills it; crossing above `band.upper` completes it (position now 100% ETH — harvested).
+- **Spacing: uniform level offsets from the fixed template.** 2,235 levels per band = a 1.25× market-cap step; 30 core bands + up to 30 fee-funded extensions; reach ≈ 807× graduation mcap. Geometry is identical for every launch — no per-launch or per-band overrides.
+- **Inventory: even split of the 65% ladder supply** (~2.2% per band), topped from the milestone fund (≤2× cap) and carried residue.
 
-### 6.2 JIT deployment
+### 6.2 Simulation-driven deployment
 
-Bands are **not** deployed at graduation. `beforeSwap` mints the next band when the pre-swap tick enters the deploy window `[band.lower − K, band.lower)`, `K ≈ 2–5% of the band gap`:
+Bands are **not** deployed at graduation. On each buy, `beforeSwap` walks the swap's price path with v4's own swap math over the pool's fully deterministic, protocol-owned liquidity profile, and mints **every undeployed band the path crosses before the swap executes** — so the swap fills them as real liquidity.
 
-- Atomic with the approaching swap — even a candle that sweeps the whole band fills it correctly (the trigger fires pre-crossing).
-- A band jumped entirely in one tx (pre-swap tick already above it) is skipped benignly: inventory stays in hook custody, re-targeted at the next band.
-- Trigger fires only on swaps moving toward the band (buys); sells entering the deploy window do not mint (no wasted mints, no premature exposure).
-- JIT keeps launch gas cheap (no 10 mints at init) and no idle position state. Note: band geometry is fully deterministic from launch config — observers can compute every band's ticks and size; "hidden" means not deployed, not unknown.
-- Bands below spot never deploy (they'd be empty ETH positions).
-- **No swap gating**: all swaps flow freely in both directions at every price — the hook never reverts a swap. In-band oscillation is possible (a trader can churn a partially-filled band's conversion state), but every churn cycle pays the spread twice, and the milestone completes the instant price exits the band's top — harvest is atomic in the crossing swap's `afterSwap`. Harvest-at-crossing, not swap blocking, is the anti-stall mechanism.
+- A deployed band cannot be jumped without filling: exiting a band's top requires consuming its entire inventory, which is completion by definition. The legacy deploy-window straddle deadlock (an undeployed band straddling spot) cannot occur.
+- Deployments are capped at 8 bands per swap; a buy crossing more carries the excess forward benignly (skip-and-carry fallback). Sells never deploy.
+- Simulation/rounding mismatches can only *under*-deploy — the fallback is the legacy carry, never over-selling.
+- Whales pay the deploy gas for the positions they consume. Geometry is deterministic from the template — observers can compute every band; "hidden" means not yet deployed, not unknown.
+- **No swap gating**: all swaps flow freely in both directions at every price — the hook never reverts a swap. In-band oscillation is possible, but every churn cycle pays the spread twice, and the harvest is atomic in the crossing swap's `afterSwap`.
 
-### 6.3 Harvest settlement (atomic in `afterSwap`)
+### 6.3 Harvest settlement (atomic in `afterSwap`, bounded loop)
 
-1. Tick crosses `band.upper` → mark completed → burn the band position (collect token remainder → ETH + accrued swap fees, which fold into the harvest).
-2. Route per the **global split config**: `{ creatorWad, buybackWad, protocolWad, lpWad }` (sum = WAD):
+1. Post-swap level at or above a deployed band's upper tick → mark complete → burn the band (collect quote + accrued band fees; any token residue to carried inventory).
+2. The harvest **loop** repeats for every band completed by the same swap, up to 8; deeper sweeps settle on the next swap.
+3. Route per the **global split config** (`creatorWad, buybackWad, protocolWad, lpWad`, sum = WAD, per-launch within template bounds):
    - `creator` → NFT claimable balance (pull-based)
    - `protocol` → protocol claimable balance (pull-based)
    - `buyback` → nested `poolManager.swap` (ETH→token) behind the transient lock → burn
    - `lp` → re-minted into the full-range position
-3. MILESTONE_FUND token-fee accrual (§8.1) is credited to the next band's inventory.
+4. MILESTONE_FUND token-fee accrual (§8.1) is credited to the next band's inventory.
 
-### 6.4 Reclaim (permissionless)
+### 6.4 Abandoned bands
 
-A deployed band unfilled for **30 days** can be reclaimed by anyone: burn the position, inventory returns to hook custody and **re-targets the next-in-line band** (consistent with jumped-band handling above). No burning, no repricing in v1. v2 options for dead inventory: reprice, burn, or route to the airdrop destination.
+Reclaim is **removed**. A deployed band the market never completes is a permanent standing limit order: a returning market fills it at its level (folding its accrued fees into the normal harvest); a dead token leaves its inventory and fee accrual parked in the position — accepted leakage, recorded in the risk register.
 
 ---
 
@@ -149,16 +151,18 @@ A deployed band unfilled for **30 days** can be reclaimed by anyone: burn the po
 
 ### 7.1 Swap fee
 
-Pool fee **1%** (default; milestone-completion decay per §8.2 when enabled), routed at fee collection:
+Pool fee **1% flat from genesis** (no launch window; milestone-completion step-down per §8.2 when thresholds are crossed), routed at fee collection:
 - **60% LP** — stays in the full-range position (compounds); ladder bands also earn fees while in range, folding into their harvests
-- **30% creator** — NFT claimable
-- **10% protocol** — pull-based
+- **30% creator** — NFT claimable (ETH-denominated)
+- **10% protocol** — pull-based (ETH-denominated)
 
-Collection: v4 has no standalone `collect` — the hook burns a sliver of the full-range position and re-adds it (net position unchanged, fees harvested). Permissionless `collectFees` trigger.
+**Token-denominated fees are never paid to a person**: the 20% MILESTONE_FUND diversion applies first, and the remainder compounds into the full-range position (paired with the quote-side LP share; unpairable remainder carries to the next collection).
 
-### 7.2 Anti-snipe
+Collection: a zero-delta `modifyLiquidity` is v4's collect — it realises accrued fees while leaving the position untouched. Permissionless `collectFees` trigger.
 
-Creator-chosen window (0s / 60s / 10 min / 98 min): dynamic fee decays **99% → 1%** in block steps via `updateDynamicLPFee` (LaunchFi/Zora pattern). The windfall lands in LP and flows through the standard 60/30/10 split — no special accounting.
+### 7.2 Milestone-completion dynamic fee
+
+Base fee steps down as milestones complete — "trust earned" pricing that rewards surviving tokens with cheaper trading. Thresholds and steps are **template constants** scaled to the band count (default: 1.0% → 0.75% at 8 completions → 0.5% at 16; floor 0.25%, max 2 steps), applied in `afterSwap` at each harvest via `updateDynamicLPFee`. There is no launch-window decay: the fee can only decrease, at most twice, ever.
 
 ### 7.3 Bonding curve proceeds
 
@@ -181,7 +185,7 @@ This is the BidWall inversion: flaunch spends fees buying *support* below spot; 
 
 ### 8.2 Milestone-completion dynamic fee
 
-Base fee steps down as milestones complete — "trust earned" pricing that rewards surviving tokens with cheaper trading. Schedule is a **launch parameter** (default off): e.g., **1.5% → 1.0% → 0.5%** at cumulative completions **0 → 2 → 4**. Precedence: the anti-snipe window runs first (99% → base over the chosen window, §7.2); milestone steps apply to the base fee only, applied in `afterSwap` at each harvest via `updateDynamicLPFee`. Bounds: start ≤ 1.5%, floor ≥ 0.25%, max 2 steps.
+Covered in §7.2: template-fixed step-down thresholds (completions 8 and 16 on the 30-band template), permanent, floored at 0.25%, applied via `updateDynamicLPFee` at the crossing harvest. `DYNAMIC_FEE_FLAG` exists solely for this.
 
 ### 8.3 Milestone dividends (v2)
 
@@ -191,22 +195,32 @@ The routing enum's `airdrop` destination: a completed milestone's creator share 
 
 ## 9. Launch parameters & guardrails
 
-| Parameter | Default | Protocol bounds |
-|---|---|---|
-| Band count | 8–10 | 3–15 |
-| Band spacing | 2× mcap (6,931 ticks) | ≥ 1.5× |
-| Band width | 5–10% of gap | config, validated |
-| Ladder supply | 65% | ≤ 65%, per-band ≤ 15% |
-| Dev buy | off | ≤ 20% supply, at initial price; consumes **bonding curve inventory**; cap bounded **below the bonding curve share** so the public raise always retains a minimum share (e.g., bonding curve 25% / dev cap 20%) |
-| Dev buy vesting | none | 0–12 months linear, hook-held |
-| Milestone fee decay | off | start ≤ 1.5%, floor ≥ 0.25%, ≤ 2 steps |
-| Harvest split | 60/20/10/10 (creator/buyback/protocol/lp) | protocol min 5%, buyback max 40% |
-| MILESTONE_FUND share | 20% of collected fees | ≤ 20%, ≤ 30 bands, ≤ 2× per-band |
-| Anti-snipe window | 60s | 0s/60s/10min/98min |
-| Bonding curve LP-seed share | 40% | ≥ 20% |
-| Reclaim period | 30 days | configurable |
+**Fixed protocol template** (hook constructor argument — immutable, identical for every launch):
 
-**Dev buy** (Virtuals Team Initial Buy pattern, capped): creator buys at the initial price during launch, executed by the hook against the **bonding curve like any buyer** — consuming bonding curve inventory, so the public raise shrinks proportionally; the cap is bounded below the bonding curve share so the public always retains a minimum share. Tokens vest linearly if chosen; purchases are on-chain transparent at launch. No free creator allocation — creators earn through harvest routing and the fee NFT.
+| Parameter | Value |
+|---|---|
+| Curve shape | 32 nested positions (Doppler algorithm), 2× span, position 0 at genesis |
+| Opening FDV | 125 ETH (ETH-denominated anchor; start level derived from supply) |
+| Curve supply share | 25% |
+| Ladder | 2,235-level spacing (1.25×), 30 core bands, 447-level walls (≈4.5% of price) |
+| Ladder supply share | 65% (~2.2%/band) |
+| Full-range LP share | 10% |
+| Milestone-fund share | 20% of token fees (≤2× per band, ≤30 fee-funded bands) |
+| Base fee | 1% flat; step-downs at completions 8/16 → 0.75%/0.5% (floor 0.25%) |
+| Graduation split | 40/55/5 (LP seed/creator/protocol) |
+| Fee routing | 60/30/10 (LP/creator/protocol) |
+| Deploy / harvest caps | 8 bands per swap each |
+| Fee-funded extension | ≤30 bands |
+
+**Per-launch configuration** (the entire validator surface):
+
+| Parameter | Bounds |
+|---|---|
+| Token metadata, total supply | standard; opening level derived from supply + template FDV anchor |
+| Dev buy | off by default; ≤10% of supply, vesting 0–12 months, creator-self-launch only |
+| Harvest split | 60/20/10/10 default (creator/buyback/protocol/LP); creator ≤70%, buyback ≥10%, protocol ≥5% |
+
+**Dev buy** (Virtuals Team Initial Buy pattern, capped): executes only when the creator relays their own launch; buys at the initial price against the curve like any buyer; on-chain transparent at launch. No free creator allocation — creators earn through harvest routing and the fee NFT.
 
 ---
 
@@ -222,7 +236,8 @@ The routing enum's `airdrop` destination: a completed milestone's creator share 
 | Buyback reentrancy | Nested swap recursion during settlement | Transient-storage lock (`tstore`/`tload`) around all settlement paths |
 | LP extractability | Full-range removal | Code-locked (no removal path); v2 hard `LPLocker` |
 | NFT claim griefing (buy NFT → claim → sell) | Revenue-claim theft | Current-holder claims (flaunch pattern); documented, accepted |
-| Stale/unfilled bands | Dead inventory locked in positions | 30-day permissionless reclaim to custody; v2: reprice/burn/airdrop |
+| Stale/unfilled bands | Standing limit orders hold inventory and fee accrual indefinitely | Accepted (reclaim removed): a returning market fills the band naturally; stranding is conditional on permanent death and is fee-sized, not principal |
+| Launch-relay signature risks | Relayed deployments on stolen/stale signatures | EIP-712 over the full config + deadline; CREATE2 config-hash salt makes replay fail on the existing deployment; relayer cannot alter economics |
 | Creator degenerate config (bands at absurd mcaps, oversized dev buy) | Cheap harvests, wash-trade surface | Protocol bounds on every launch parameter (§9); dev buy on-chain transparent at launch |
 | Fee-collect griefing | Permissionless sliver burn+re-add spam | Bounded per-call cost; net position unchanged |
 
@@ -235,7 +250,7 @@ Borrow directly from the vendored protocols in this repo:
 | What | From | Where |
 |---|---|---|
 | Phase enum + in-place graduation pattern | sa1t | `sa1t-contracts/src/Sa1tHookV2.sol` (phase enum L42, `graduate` L563) |
-| Multicurve curves: `Curve[]`, `adjustCurves`, `calculatePositions`, log-normal fan, `farTick` graduation | Doppler | `doppler/src/libraries/Multicurve.sol`, `doppler/src/initializers/DopplerHookInitializer.sol` |
+| Multicurve curves: `Curve[]`, `adjustCurves`, `calculatePositions`, log-normal fan, `farTick` graduation | Doppler | `doppler/src/libraries/Multicurve.sol`, `doppler/src/initializers/DopplerHookInitializer.sol` — **algorithm only** (BUSL-1.1 licensed; reimplemented in level space with attribution, per §5) |
 | Anti-snipe fee decay | Zora / LaunchFi | `zora-coins/packages/coins/src/libs/CoinDopplerMultiCurve.sol` (launch fee 99%→1%), `launchfi-launchpad` (`updateDynamicLPFee`) |
 | Transient-storage locks, FeeNFT, fee waterfall | Flaunch | `flaunchgg-contracts/src/contracts/PositionManager.sol` (`StoreKeys`, `_distributeFees` L931), `Flaunch.sol` (ERC721 revenue streams) |
 | Nested pool swaps inside callbacks | Flaunch | `PositionManager.sol` `beforeSwap` (InternalSwapPool) |
@@ -257,4 +272,4 @@ Borrow directly from the vendored protocols in this repo:
 - Dead-token fallback: force-graduate after N days below `farTick`.
 - Weighted band inventory (front-load or back-load the ladder).
 - Per-milestone routing overrides (beyond the single global split).
-- Dead inventory options: reprice, burn, or holder airdrop.
+- Dead inventory options: reprice, burn, or holder airdrop.والے

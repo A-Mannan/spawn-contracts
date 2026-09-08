@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  FOUNDRY_PROFILE: default
+
+jobs:
+  build-and-gate:
+    name: build, size gate, unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Verify dependency pins
+        run: make pins
+
+      - name: Check formatting
+        run: make fmt-check
+
+      - name: Build
+        run: make build
+
+      # design.md Risks: the singleton hook's 24 KB budget is the leading structural
+      # risk, so the gate runs on every push rather than at release time.
+      - name: Contract size gate
+        run: make size
+
+      - name: Size gate self-test
+        run: make size-gate-selftest
+
+      - name: Full-range lock check
+        run: make lock-check
+
+      - name: Storage layout check
+        run: make layout-check
+
+      - name: Unit tests
+        run: make test-unit
+
+      - name: Invariant tests
+        run: make test-invariant
+
+  fork-tests:
+    name: Base fork tests
+    runs-on: ubuntu-latest
+    # Needs a Base RPC endpoint; skipped on forks without access to the secret.
+    if: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Fork tests
+        env:
+          BASE_RPC_URL: ${{ secrets.BASE_RPC_URL }}
+        run: |
+          if [ -z "$BASE_RPC_URL" ]; then
+            echo "BASE_RPC_URL secret not configured; skipping fork tests."
+            exit 0
+          fi
+          make test-fork

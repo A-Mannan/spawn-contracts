@@ -38,8 +38,17 @@ library TransientLock {
     /// @notice Launch-time curve minting and dev buy, performed under an explicit unlock.
     uint8 internal constant LAUNCH = 4;
 
-    /// @notice Thrown when a guarded section is re-entered within the same transaction.
+    /// @dev Dedicated transaction-global slot for untrusted payout delivery. Unlike the concern locks
+    /// above, this deliberately has no pool component: a plugin executing for one pool must not reach
+    /// custody or lifecycle entry points for any other pool.
+    bytes32 private constant _PAYOUT_DELIVERY_SLOT = keccak256("milestone-launchpad.transient.payout-delivery.v1");
+
+    /// @notice Thrown when a pool-scoped guarded section is re-entered within the same transaction.
     error Reentrant(uint8 kind, PoolId poolId);
+
+    /// @notice Thrown when payout delivery is entered recursively or a protected operation starts while
+    /// untrusted plugin code is executing.
+    error PayoutDeliveryInFlight();
 
     /// @dev Slot for a (kind, pool) pair. Per-pool rather than global: a settlement on one pool must
     /// never suppress or block activity on another.
@@ -76,6 +85,47 @@ library TransientLock {
             current := tload(slot)
         }
         isHeld = current != 0;
+    }
+
+    /// @notice Acquires the protocol-global payout-delivery guard.
+    function enterPayoutDelivery() internal {
+        bytes32 slot = _PAYOUT_DELIVERY_SLOT;
+        uint256 current;
+        assembly ("memory-safe") {
+            current := tload(slot)
+        }
+        if (current != 0) revert PayoutDeliveryInFlight();
+        assembly ("memory-safe") {
+            tstore(slot, 1)
+        }
+    }
+
+    /// @notice Releases the protocol-global payout-delivery guard. Idempotent like {exit}.
+    function exitPayoutDelivery() internal {
+        bytes32 slot = _PAYOUT_DELIVERY_SLOT;
+        assembly ("memory-safe") {
+            tstore(slot, 0)
+        }
+    }
+
+    /// @notice Whether untrusted payout delivery is active anywhere in this protocol transaction.
+    function payoutDeliveryInFlight() internal view returns (bool isHeld) {
+        bytes32 slot = _PAYOUT_DELIVERY_SLOT;
+        uint256 current;
+        assembly ("memory-safe") {
+            current := tload(slot)
+        }
+        isHeld = current != 0;
+    }
+
+    /// @notice Rejects a protected protocol operation while untrusted payout delivery is active.
+    function requireNoPayoutDelivery() internal view {
+        if (payoutDeliveryInFlight()) revert PayoutDeliveryInFlight();
+    }
+
+    /// @notice True when callback work must be suppressed.
+    function callbackWorkSuppressed(PoolId poolId) internal view returns (bool) {
+        return payoutDeliveryInFlight() || settlementInFlight(poolId);
     }
 
     /// @notice True when any settlement path is mid-flight for this pool, meaning the swap callbacks

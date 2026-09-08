@@ -33,7 +33,7 @@
 - [ ] 5.1 Build every `PoolKey` with the immutable static 1% fee and no dynamic flag or mutable fee state; verify permission and launch tests cover “Deployed hook has required callback flags”, “Pool has no dynamic-fee flag”, “Pool initialization is restricted”, “Starting price matches anchored FDV”, “Pool uses static one percent”, and “Pool is tradable at launch”.
 - [ ] 5.2 Replace `FeeStepDown.t.sol` with static-lifetime coverage for “One percent applies from genesis forever”, “Time does not affect the fee”, “Milestones do not affect the fee”, “Governance cannot change the trading fee”, and “Pool has no dynamic fee state”.
 - [ ] 5.3 Remove dev-buy vesting and deliver a creator-direct dev buy completely before launch returns while relayed launches leave inventory on curve; verify `DevBuy.t.sol` covers “Dev buy consumes curve inventory”, “Dev buy is capped at ten percent”, “Dev buy requires creator transaction”, “No dev buy is the default”, “Dev buy is observable”, “Tokens are delivered fully at launch”, and “No vesting state is created”.
-- [ ] 5.4 Preserve fixed-supply standard ERC20 behavior through the launch refactor; verify token tests cover “Protocol initially receives the full minted supply”, “Supply is fixed after launch”, and “Token remains standard ERC20”.
+- [x] 5.4 Preserve fixed-supply standard ERC20 behavior through the launch refactor; verify token tests cover “Protocol initially receives the full minted supply”, “Supply is fixed after launch”, and “Token remains standard ERC20”.
 
 ## 6. Harvest-to-pot accounting
 

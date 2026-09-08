@@ -76,7 +76,7 @@ layout-check:
 
 # Focused mutation tests for the AST-backed structural gates.
 structural-gate-selftest:
-	python3 -m unittest discover -s tools/tests -p 'test_*.py' -v
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p 'test_*.py' -v
 
 # Proves the gate actually fails on an oversized contract, rather than passing vacuously.
 # Generates a throwaway contract larger than the limit, gates it, then cleans up.

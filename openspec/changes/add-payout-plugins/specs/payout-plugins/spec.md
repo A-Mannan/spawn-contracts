@@ -122,7 +122,7 @@ Each launch SHALL store the exact signed 256-bit payout plan. A set bit SHALL se
 - **THEN** they produce identical on-chain plan data
 
 ### Requirement: Isolated harvest payout pots and attribution
-Each pool SHALL have an isolated payout pot containing net milestone proceeds not yet allocated by a flush. A harvest SHALL record pool, milestone index, and gross quote amount; deduct the active global service-fee percentage into the global protocol ledger; and credit the exact remainder to only that pool's pot. Multiple milestones MAY aggregate in one pot while their event history remains reconstructible. The hook SHALL maintain exact aggregate counters for payout pots, plugin carry, creator-path entitlement, direct creator claims, and global protocol claims, updated atomically with their component ledgers. Outside active payout-pot redemption, aggregate pots SHALL be covered by redeemable quote claims, while carry plus creator-path plus direct creator plus protocol liabilities SHALL be covered by raw ETH; combined raw ETH and claims SHALL cover their sum. The protocol SHALL NOT maintain an on-chain per-milestone tranche ledger.
+Each pool SHALL have an isolated payout pot containing net milestone proceeds not yet allocated by a flush. A harvest SHALL record pool, milestone index, and gross quote amount; deduct the active global service-fee percentage into the global protocol ledger and its exact claim-backed subset; and credit the exact remainder to only that pool's pot. Multiple milestones MAY aggregate in one pot while their event history remains reconstructible. The hook SHALL maintain exact aggregate counters for payout pots, plugin carry, creator-path entitlement, direct creator claims, global protocol claims, and the claim-backed subset of global protocol claims, updated atomically with their component ledgers. The claim-backed protocol subset SHALL never exceed the global protocol ledger. Outside active liability-class redemption, redeemable quote claims SHALL cover aggregate pots plus claim-backed protocol revenue, while raw ETH SHALL cover carry, creator-path, direct creator, and the non-claim-backed protocol remainder; combined raw ETH and claims SHALL cover their sum. Pot redemption SHALL consume only pot backing. A global protocol claim SHALL redeem exactly its captured claim-backed subset and SHALL NOT consume pot backing. The protocol SHALL NOT maintain an on-chain per-milestone tranche ledger.
 
 #### Scenario: Gross harvest is attributable
 - **WHEN** a band is harvested
@@ -140,17 +140,21 @@ Each pool SHALL have an isolated payout pot containing net milestone proceeds no
 - **WHEN** several milestones fund one pot before a flush
 - **THEN** the pot aggregates their net value and events preserve each milestone's attribution
 
-#### Scenario: Mid-swap pot accrual remains solvent
+#### Scenario: Mid-swap pot and service-fee accrual remain solvent
 - **WHEN** a harvest accrues while PoolManager settlement is in flight
-- **THEN** its pot is backed by claims without requiring premature ETH redemption
+- **THEN** its pot and protocol service fee are both classified as claim-backed without requiring premature ETH redemption
 
 #### Scenario: Aggregate liabilities equal component ledgers
 - **WHEN** harvest, flush, failure, redirect, or claim changes any payout liability
-- **THEN** each aggregate counter equals the sum of its recorded component ledgers
+- **THEN** each aggregate counter equals the sum of its recorded component ledgers and claim-backed protocol revenue does not exceed the global protocol ledger
 
 #### Scenario: Custody classes cover their liabilities
-- **WHEN** no payout-pot redemption unlock is active
-- **THEN** redeemable quote claims cover aggregate pots, raw ETH covers all carry and claimable ledgers, and combined custody covers total ETH liabilities
+- **WHEN** no liability-class redemption unlock is active
+- **THEN** redeemable quote claims cover aggregate pots plus claim-backed protocol revenue, raw ETH covers carry and claimable ledgers excluding that claim-backed subset, and combined custody covers total ETH liabilities
+
+#### Scenario: Protocol claim redeems only protocol backing
+- **WHEN** global protocol revenue includes claim-backed service fees while payout pots coexist
+- **THEN** the recipient's claim redeems exactly the protocol-backed subset and leaves every payout pot fully claim-backed
 
 ### Requirement: Permissionless whole-pot cold flush
 Any address SHALL be able to flush one pool. A flush SHALL remove the complete newly accrued pot from available accounting before external calls, redeem it exactly once in its own PoolManager unlock, and perform delivery outside all swap callbacks. The flusher tip SHALL equal the floor of 1% of the newly redeemed post-service-fee pot. An ordinary flush SHALL transfer that tip before plugin delivery and failure of that transfer SHALL revert the complete flush atomically. Plan takes SHALL apply to the remaining 99%. Previously failed carry SHALL be retried without another tip. The protocol SHALL expose no multi-pool batch-flush entry point.

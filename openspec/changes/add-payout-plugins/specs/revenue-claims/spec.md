@@ -82,7 +82,7 @@ Transferring the RevenueNFT SHALL transfer entitlement to future direct accruals
 - **THEN** no payout pot, direct balance, or creator-path balance is paid or flushed
 
 ### Requirement: Protocol claimable balance
-All quote-denominated protocol revenue SHALL accrue to one global pool-agnostic ledger, including milestone service fees, quote-fee protocol shares, and graduation protocol proceeds. Only the current configurable protocol recipient SHALL be able to pull the full global balance. The protocol administrator SHALL have no claim authority unless it is also the configured recipient. Accrual events SHALL retain pool, source, amount, and active configuration version attribution. No per-pool protocol claim path SHALL exist.
+All quote-denominated protocol revenue SHALL accrue to one global pool-agnostic ledger, including milestone service fees, quote-fee protocol shares, and graduation protocol proceeds. The protocol SHALL additionally track the exact subset of that global ledger still backed by PoolManager quote claims: milestone service fees SHALL increase both totals, while raw-ETH-backed quote-fee and graduation revenue SHALL increase only the global ledger. Only the current configurable protocol recipient SHALL be able to pull the full global balance. A claim SHALL zero both totals before interaction, redeem exactly the captured claim-backed subset, and transfer the complete captured global balance; it SHALL NOT redeem claims backing payout pots or rely on ambient ETH reserved for another liability. The protocol administrator SHALL have no claim authority unless it is also the configured recipient. Accrual events SHALL retain pool, source, amount, and active configuration version attribution. No per-pool protocol claim path SHALL exist.
 
 #### Scenario: Every protocol source accrues globally
 - **WHEN** graduation, quote-fee collection, or milestone harvest creates protocol revenue
@@ -93,8 +93,16 @@ All quote-denominated protocol revenue SHALL accrue to one global pool-agnostic 
 - **THEN** one global balance contains their sum while events preserve source pools
 
 #### Scenario: Current recipient claims globally
-- **WHEN** the configured recipient claims a non-zero balance
-- **THEN** the entire global balance is transferred and reset before transfer
+- **WHEN** the configured recipient claims a non-zero balance containing raw-backed and claim-backed sources
+- **THEN** both protocol counters are reset before interaction, exactly the claim-backed subset is redeemed, and the entire global balance is transferred
+
+#### Scenario: Protocol backing classes remain explicit
+- **WHEN** milestone service fees coexist with quote-fee or graduation protocol revenue
+- **THEN** the claim-backed subset equals only the unredeemed service-fee value and never exceeds the global protocol ledger
+
+#### Scenario: Protocol claim leaves payout backing intact
+- **WHEN** the recipient claims while one or more payout pots remain claim-backed
+- **THEN** the claim redeems no pot backing and every pot remains fully covered
 
 #### Scenario: Unauthorized protocol claim is rejected
 - **WHEN** any address other than the current recipient attempts a claim

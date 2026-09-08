@@ -8,15 +8,15 @@
 
 ## 2. Append-only plugin registry
 
-- [ ] 2.1 Implement `PayoutPluginRegistry` with 256 stable indices and immutable plugin address, take, gas limit, codehash, and role plus reversible suspension; verify `PayoutPluginRegistry.t.sol` covers “Registration appends at a stable index”, “Registered terms cannot change”, “Registry is bounded to one word”, and “Suspension preserves identity”.
+- [x] 2.1 Implement `PayoutPluginRegistry` with 256 stable indices and immutable plugin address, take, gas limit, codehash, and role plus reversible suspension; verify `PayoutPluginRegistry.t.sol` covers “Registration appends at a stable index”, “Registered terms cannot change”, “Registry is bounded to one word”, and “Suspension preserves identity”.
 - [ ] 2.2 Enforce controller-only mutation, duplicate/invalid/code-identity/proxy-like rejection, selectable-role rules, and execution-time hook-global guard checks before registry-only mutation; verify registry tests cover “Unauthorized registry mutation is rejected” and “Registry mutation is blocked during payout delivery” and plan tests cover invalid non-payout entries.
 - [ ] 2.3 Implement suspension/reactivation and permanent codehash-mismatch resolution for historical plans, redirecting current share and existing carry to creator-path entitlement; verify tests cover “Suspended value redirects to the creator”, “Reactivation affects later allocations only”, and “Codehash mismatch permanently redirects value”.
 
 ## 3. Typed governance and global economics
 
 - [ ] 3.1 Implement `ProtocolController` with distinct administrator and protocol recipient authorities and two-step propose/accept administrator transfer; verify `EconomicGovernance.t.sol` covers “Administrator and recipient are independent”, “Administrator transfer requires acceptance”, “Unauthorized acceptance is rejected”, and “Administrator has no implicit claim right”.
-- [ ] 3.2 Implement typed schedule/cancel/execute operations whose identity binds action, complete parameters, controller, chain ID, and salt and whose ready timestamp is captured at scheduling; verify tests cover “Scheduled operation can be cancelled” and “Operation identity binds complete parameters”.
-- [ ] 3.3 Implement zero initial delay and delayed delay updates under the old captured delay; verify tests cover “Zero-delay update can execute immediately”, “Positive delay is enforced”, “Delay update uses the old delay”, and “Queued readiness does not change retroactively”.
+- [x] 3.2 Implement typed schedule/cancel/execute operations whose identity binds action, complete parameters, controller, chain ID, and salt and whose ready timestamp is captured at scheduling; verify tests cover “Scheduled operation can be cancelled” and “Operation identity binds complete parameters”.
+- [x] 3.3 Implement zero initial delay and delayed delay updates under the old captured delay; verify tests cover “Zero-delay update can execute immediately”, “Positive delay is enforced”, “Delay update uses the old delay”, and “Queued readiness does not change retroactively”.
 - [ ] 3.4 Implement controller-authorized complete economic-config replacement and recipient updates with monotonically increasing versions; verify tests cover “Valid update affects every pool prospectively”, “Prior accrual is not repartitioned”, and “Recipient update transfers unclaimed entitlement”.
 - [ ] 3.5 Emit complete governance/economic attribution and reject direct hook or registry setters from non-controller callers; verify event and authorization tests pass for every typed action.
 

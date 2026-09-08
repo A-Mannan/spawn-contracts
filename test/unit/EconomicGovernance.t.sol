@@ -54,8 +54,8 @@ contract EconomicGovernanceTest is Test {
         registry = new PayoutPluginRegistry(address(this));
         controller = new ProtocolController(ADMINISTRATOR, RECIPIENT, registry, address(target));
         registry.proposeAdministrator(address(controller));
-        vm.prank(address(controller));
-        registry.acceptAdministrator();
+        vm.prank(ADMINISTRATOR);
+        controller.acceptRegistryAdministration();
         assertEq(registry.administrator(), address(controller), "registry authority is controller");
     }
 

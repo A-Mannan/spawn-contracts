@@ -69,9 +69,9 @@
 
 ## 10. Reference buyback and helper composition
 
-- [ ] 10.1 Implement hook-authenticated `BuybackAndBurnPlugin` bound to the source pool, spending only delivered ETH through its own bounded cold PoolManager swap and burning every token received; verify `BuybackPlugin.t.sol` covers “Buyback spends only delivered ETH” and “Buyback burns acquired tokens”.
+- [x] 10.1 Implement hook-authenticated `BuybackAndBurnPlugin` bound to the source pool, spending only delivered ETH through its own bounded cold PoolManager swap and burning every token received; verify `BuybackPlugin.t.sol` covers “Buyback spends only delivered ETH” and “Buyback burns acquired tokens”.
 - [ ] 10.2 Make failed bounded buy/burn atomic so the hook records the entire attempted value as carry, and make zero delivery a no-op; verify tests cover “Failed buyback carries the entire share” and “Zero delivery performs no swap”.
-- [ ] 10.3 Implement `SwapAndFlushHelper` as a non-selectable utility that settles the user swap completely before a separate flush, cannot alter route or payout parameters, and forwards output/refunds/tip; verify `SwapAndFlushHelper.t.sol` covers “Opted-in caller swaps then flushes”, “Helper uses a separate flush unlock”, “Helper cannot alter routing”, and “Helper forwards the tip”.
+- [x] 10.3 Implement `SwapAndFlushHelper` as a non-selectable utility that settles the user swap completely before a separate flush, cannot alter route or payout parameters, and forwards output/refunds/tip; verify `SwapAndFlushHelper.t.sol` covers “Opted-in caller swaps then flushes”, “Helper uses a separate flush unlock”, “Helper cannot alter routing”, and “Helper forwards the tip”.
 - [ ] 10.4 Preserve a settled swap when any later plugin delivery fails by recording carry instead of reverting helper execution; verify “Plugin failure does not undo the settled swap”.
 - [ ] 10.5 Bootstrap the canonical plan with only the buyback plugin at `floor(2 * WAD / 9)` and creator remainder; verify tests cover “Canonical bits select intended destinations”, “Canonical economics match their declared baseline”, “Preset naming cannot change identity”, and “Preset bit changes alter identity”.
 

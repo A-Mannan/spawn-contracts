@@ -59,6 +59,26 @@ contract LockHarness {
         return TransientLock.settlementInFlight(poolId);
     }
 
+    function enterPayoutDelivery() external {
+        TransientLock.enterPayoutDelivery();
+    }
+
+    function exitPayoutDelivery() external {
+        TransientLock.exitPayoutDelivery();
+    }
+
+    function payoutDeliveryInFlight() external view returns (bool) {
+        return TransientLock.payoutDeliveryInFlight();
+    }
+
+    function callbackWorkSuppressedFor(PoolId other) external view returns (bool) {
+        return TransientLock.callbackWorkSuppressed(other);
+    }
+
+    function requireNoPayoutDelivery() external view {
+        TransientLock.requireNoPayoutDelivery();
+    }
+
     // --- Suppression semantics: the callback skips instead of reverting ---
 
     /// @notice Outer settlement that performs a nested call which must *suppress*, not revert.
@@ -182,6 +202,46 @@ contract TransientLockTest is Test {
 
         assertTrue(h.heldFor(TransientLock.SETTLEMENT, PoolId.wrap(rawA)), "own pool held");
         assertFalse(h.heldFor(TransientLock.SETTLEMENT, PoolId.wrap(rawB)), "other pool clear");
+    }
+
+    // --- Global payout-delivery semantics ---
+
+    function test_payoutDeliveryBlocksProtectedOperationsAcrossPools() public {
+        harness.enterPayoutDelivery();
+
+        vm.expectRevert(TransientLock.PayoutDeliveryInFlight.selector);
+        harness.requireNoPayoutDelivery();
+        assertTrue(harness.callbackWorkSuppressedFor(POOL_A), "source pool callback suppressed");
+        assertTrue(harness.callbackWorkSuppressedFor(POOL_B), "other pool callback suppressed");
+    }
+
+    function test_payoutDeliveryRejectsGlobalReentry() public {
+        harness.enterPayoutDelivery();
+
+        vm.expectRevert(TransientLock.PayoutDeliveryInFlight.selector);
+        harness.enterPayoutDelivery();
+    }
+
+    function test_payoutDeliveryGuardIsReleasableAndReacquirable() public {
+        harness.enterPayoutDelivery();
+        assertTrue(harness.payoutDeliveryInFlight(), "global guard held");
+
+        harness.exitPayoutDelivery();
+        assertFalse(harness.payoutDeliveryInFlight(), "global guard clear");
+
+        harness.enterPayoutDelivery();
+        assertTrue(harness.payoutDeliveryInFlight(), "global guard reacquired");
+    }
+
+    function test_payoutDeliveryExitIsIdempotent() public {
+        harness.exitPayoutDelivery();
+        harness.exitPayoutDelivery();
+        assertFalse(harness.payoutDeliveryInFlight(), "global guard remains clear");
+    }
+
+    function test_callbackWorkRunsWhenGlobalGuardIsClear() public view {
+        assertFalse(harness.callbackWorkSuppressedFor(POOL_A), "source pool callback allowed");
+        assertFalse(harness.callbackWorkSuppressedFor(POOL_B), "other pool callback allowed");
     }
 
     // --- The lock does not leak across transactions ---

@@ -88,6 +88,11 @@ contract ProtocolController {
         return _economicConfig;
     }
 
+    /// @notice Complete the registry's two-step administrator handoff to this controller.
+    function acceptRegistryAdministration() external onlyAdministrator nonReentrantExecution {
+        registry.acceptAdministrator();
+    }
+
     function proposeAdministrator(address nextAdministrator) external onlyAdministrator nonReentrantExecution {
         if (nextAdministrator == address(0)) revert ZeroAddress();
         pendingAdministrator = nextAdministrator;

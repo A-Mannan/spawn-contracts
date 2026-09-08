@@ -39,6 +39,10 @@ contract LockHarness {
         TransientLock.enter(kind, poolId);
     }
 
+    function acquirePayoutDeliveryAndLeaveHeld() external {
+        TransientLock.enterPayoutDelivery();
+    }
+
     function enter(uint8 kind) external {
         TransientLock.enter(kind, poolId);
     }
@@ -260,6 +264,18 @@ contract TransientLockTest is Test {
         assertFalse(harness.held(TransientLock.SETTLEMENT), "clear at start of transaction");
         harness.acquireAndLeaveHeld(TransientLock.SETTLEMENT);
         assertTrue(harness.held(TransientLock.SETTLEMENT), "held for the rest of this transaction");
+    }
+
+    function test_payoutDeliveryClearsBetweenTransactions_first() public {
+        assertFalse(harness.payoutDeliveryInFlight(), "global guard clear at transaction start");
+        harness.acquirePayoutDeliveryAndLeaveHeld();
+        assertTrue(harness.payoutDeliveryInFlight(), "global guard held for this transaction");
+    }
+
+    function test_payoutDeliveryClearsBetweenTransactions_second() public {
+        assertFalse(harness.payoutDeliveryInFlight(), "global guard clear at transaction start");
+        harness.acquirePayoutDeliveryAndLeaveHeld();
+        assertTrue(harness.payoutDeliveryInFlight(), "global guard held for this transaction");
     }
 
     /// @dev A revert inside the guarded section must not strand the lock either, since the whole

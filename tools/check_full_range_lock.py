@@ -1,84 +1,261 @@
 #!/usr/bin/env python3
-"""Source-level assertion that the full-range position has no removal path.
+"""AST-level allowlist for mutations of the permanently locked full-range position."""
 
-The `graduation` spec requires "The system SHALL expose no code path, for any caller including the
-creator and the protocol, that removes or reduces liquidity from the full-range position." Runtime tests
-can only show that the paths we thought of are closed. This checks the stronger, structural claim: no
-`modifyLiquidity` call site in the hook combines a negative `liquidityDelta` with `FULL_RANGE_SALT`.
-
-Burning is legitimate elsewhere — curve positions at graduation, band positions at harvest and reclaim —
-so the check is specific to the full-range salt rather than banning negative deltas outright.
-
-Both halves of the hook are scanned. `MilestoneColdPaths` runs by DELEGATECALL in the hook's own storage,
-so a reducing call site there would reduce the hook's own full-range position; scanning only the hook
-would leave exactly the file that seeds the position unchecked.
-"""
-
-import re
+import argparse
+import json
+import os
 import sys
 
-# Every source file that executes in the hook's storage context. `MilestoneBase` is scanned too: both
-# halves inherit it, so a call site added there would reduce the hook's own position exactly as one in
-# either derived file would, and would otherwise escape this check entirely.
-SOURCES = ("src/MilestoneHook.sol", "src/MilestoneColdPaths.sol", "src/MilestoneBase.sol")
+REQUIRED_CONTRACTS = ("MilestoneBase", "MilestoneHook", "MilestoneColdPaths")
+SOURCE_ACTIVATED_CONTRACTS = ("MilestonePayoutPaths",)
+FULL_RANGE_SALT = "FULL_RANGE_SALT"
+KNOWN_NON_FULL_SALTS = ("bandSalt", "curvePositionSalt")
+POSITIVE_ALLOWLIST = {
+    ("MilestoneColdPaths", "_seedFullRange(PoolKey,PoolId,uint256,uint256,uint256)"),
+}
 
-# Files that must contain at least one call site, or the scan has gone vacuous and the path has moved.
-# `MilestoneBase` legitimately holds none: it declares the settlement primitives and the band-proceeds
-# routing, neither of which calls `modifyLiquidity`.
-MUST_HAVE_SITES = ("src/MilestoneHook.sol", "src/MilestoneColdPaths.sol")
-SALT = "FULL_RANGE_SALT"
+
+def artifact_path(out_dir: str, name: str) -> str:
+    return os.path.join(out_dir, f"{name}.sol", f"{name}.json")
+
+
+def walk(node):
+    if isinstance(node, dict):
+        yield node
+        for value in node.values():
+            yield from walk(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from walk(value)
+
+
+def canonical_type(parameter: dict) -> str:
+    value = parameter.get("typeDescriptions", {}).get("typeString", "<unknown>")
+    for prefix in ("struct ", "enum ", "contract "):
+        if value.startswith(prefix):
+            return value[len(prefix) :].split()[0]
+    return value.replace(" storage pointer", "").replace(" storage ref", "")
+
+
+def signature(function: dict) -> str:
+    parameters = function.get("parameters", {}).get("parameters", [])
+    return f"{function.get('name', '<anonymous>')}({','.join(canonical_type(item) for item in parameters)})"
+
+
+def declaration_values(function: dict) -> dict[int, dict]:
+    values = {}
+    for node in walk(function.get("body", {})):
+        if node.get("nodeType") != "VariableDeclarationStatement":
+            continue
+        declarations = [item for item in node.get("declarations", []) if item]
+        initial = node.get("initialValue")
+        if len(declarations) == 1 and initial is not None:
+            values[declarations[0]["id"]] = initial
+    return values
+
+
+def resolve_local(expression: dict, values: dict[int, dict], seen=None) -> dict:
+    if seen is None:
+        seen = set()
+    while expression.get("nodeType") == "Identifier":
+        declaration = expression.get("referencedDeclaration")
+        if declaration not in values or declaration in seen:
+            break
+        seen.add(declaration)
+        expression = values[declaration]
+    return expression
+
+
+def callee_name(call: dict) -> str | None:
+    expression = call.get("expression", {})
+    if expression.get("nodeType") == "Identifier":
+        return expression.get("name")
+    if expression.get("nodeType") == "MemberAccess":
+        return expression.get("memberName")
+    return None
+
+
+def salt_kind(expression: dict, values: dict[int, dict]) -> str:
+    expression = resolve_local(expression, values)
+    if expression.get("nodeType") == "Identifier" and expression.get("name") == FULL_RANGE_SALT:
+        return "full"
+    if expression.get("nodeType") == "FunctionCall" and callee_name(expression) in KNOWN_NON_FULL_SALTS:
+        return "other"
+    return "unknown"
+
+
+def delta_kind(expression: dict, values: dict[int, dict]) -> str:
+    expression = resolve_local(expression, values)
+    node_type = expression.get("nodeType")
+    if node_type == "Literal" and expression.get("kind") == "number":
+        value = int(expression.get("value", "0"), 0)
+        return "zero" if value == 0 else "positive"
+    if node_type == "UnaryOperation" and expression.get("operator") == "-":
+        return "negative"
+    if node_type == "FunctionCall" and expression.get("kind") == "typeConversion":
+        inner = expression.get("arguments", [])
+        if len(inner) != 1:
+            return "unknown"
+        inner_kind = delta_kind(inner[0], values)
+        if inner_kind != "unknown":
+            return inner_kind
+        inner_type = inner[0].get("typeDescriptions", {}).get("typeString", "")
+        if inner_type.startswith("uint"):
+            return "positive"
+    type_string = expression.get("typeDescriptions", {}).get("typeString", "")
+    if type_string.startswith("uint"):
+        return "positive"
+    return "unknown"
+
+
+def modify_params(call: dict, values: dict[int, dict]) -> tuple[dict, dict] | None:
+    arguments = call.get("arguments", [])
+    if len(arguments) < 2:
+        return None
+    params = resolve_local(arguments[1], values)
+    if params.get("nodeType") != "FunctionCall" or params.get("kind") != "structConstructorCall":
+        return None
+    names = params.get("names", [])
+    arguments = params.get("arguments", [])
+    if not names or len(names) != len(arguments):
+        return None
+    fields = dict(zip(names, arguments))
+    if "liquidityDelta" not in fields or "salt" not in fields:
+        return None
+    return fields["liquidityDelta"], fields["salt"]
+
+
+def is_modify_liquidity(call: dict) -> bool:
+    expression = call.get("expression", {})
+    if call.get("nodeType") != "FunctionCall" or expression.get("nodeType") != "MemberAccess":
+        return False
+    if expression.get("memberName") != "modifyLiquidity":
+        return False
+    receiver_type = expression.get("expression", {}).get("typeDescriptions", {}).get("typeString", "")
+    return receiver_type == "contract IPoolManager"
+
+
+def line_number(source: bytes, source_range: str) -> int:
+    start = int(source_range.split(":", 1)[0])
+    return source[:start].count(b"\n") + 1
+
+
+def check_contract(out_dir: str, src_dir: str, contract: str):
+    artifact_name = artifact_path(out_dir, contract)
+    source_name = os.path.join(src_dir, f"{contract}.sol")
+    try:
+        with open(artifact_name) as handle:
+            artifact = json.load(handle)
+        with open(source_name, "rb") as handle:
+            source = handle.read()
+    except FileNotFoundError as error:
+        print(f"check_full_range_lock: missing required file {error.filename}", file=sys.stderr)
+        return None
+
+    ast = artifact.get("ast")
+    if not ast:
+        print(f"check_full_range_lock: {artifact_name} has no AST", file=sys.stderr)
+        return None
+    definition = next(
+        (
+            node
+            for node in ast.get("nodes", [])
+            if node.get("nodeType") == "ContractDefinition" and node.get("name") == contract
+        ),
+        None,
+    )
+    if definition is None:
+        print(f"check_full_range_lock: {contract} not found in its artifact AST", file=sys.stderr)
+        return None
+
+    sites = []
+    for function in definition.get("nodes", []):
+        if function.get("nodeType") != "FunctionDefinition" or not function.get("body"):
+            continue
+        values = declaration_values(function)
+        for call in walk(function["body"]):
+            if not is_modify_liquidity(call):
+                continue
+            location = f"{source_name}:{line_number(source, call['src'])}"
+            params = modify_params(call, values)
+            if params is None:
+                sites.append((location, signature(function), "unknown-salt", "unknown"))
+                continue
+            delta, salt = params
+            sites.append((location, signature(function), salt_kind(salt, values), delta_kind(delta, values)))
+    return sites
 
 
 def main() -> int:
-    total_sites = 0
-    violations = []
-    salt_sites = 0
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out-dir", default="out")
+    parser.add_argument("--src-dir", default="src")
+    args = parser.parse_args()
 
-    for source in SOURCES:
-        with open(source) as handle:
-            text = handle.read()
+    contracts = list(REQUIRED_CONTRACTS)
+    pending = []
+    for contract in SOURCE_ACTIVATED_CONTRACTS:
+        if os.path.isfile(os.path.join(args.src_dir, f"{contract}.sol")):
+            contracts.append(contract)
+        else:
+            pending.append(contract)
 
-        # Each modifyLiquidity call site, from the call through its closing paren-ish region.
-        sites = [m.start() for m in re.finditer(r"poolManager\.modifyLiquidity\(", text)]
-        if not sites and source in MUST_HAVE_SITES:
-            print(f"check_full_range_lock: no modifyLiquidity call sites found in {source}", file=sys.stderr)
-            print("check_full_range_lock: the check would pass vacuously; is the path still there?", file=sys.stderr)
+    all_sites = []
+    for contract in contracts:
+        sites = check_contract(args.out_dir, args.src_dir, contract)
+        if sites is None:
             return 1
-        total_sites += len(sites)
-
-        for start in sites:
-            block = text[start : start + 900]
-            end = block.find(");")
-            if end != -1:
-                block = block[:end]
-
-            uses_full_range_salt = SALT in block
-            # A negative delta is written either as a literal `-int256(...)`/`-1` or via a named negative.
-            reduces = re.search(r"liquidityDelta:\s*-", block) is not None
-
-            if uses_full_range_salt:
-                salt_sites += 1
-                if reduces:
-                    line = text[:start].count("\n") + 1
-                    violations.append(f"{source}:{line}")
-
-    # The salt has to appear at some call site, or the position is never created and the scan above
-    # proves nothing. This is the same anti-vacuity guard as the empty-sites check, one level down.
-    if salt_sites == 0:
-        print(f"check_full_range_lock: no modifyLiquidity call site uses {SALT}", file=sys.stderr)
-        print("check_full_range_lock: the full-range position is never created; did it move?", file=sys.stderr)
+        all_sites.extend((contract, *site) for site in sites)
+    if not all_sites:
+        print("check_full_range_lock: no modifyLiquidity sites found; check would pass vacuously", file=sys.stderr)
         return 1
 
-    for location in violations:
-        print(f"FAIL {location}: reduces liquidity on the full-range position", file=sys.stderr)
+    violations = []
+    positive_sites = []
+    zero_sites = []
+    for contract, location, function, salt, delta in all_sites:
+        if salt == "other":
+            continue
+        if salt != "full":
+            violations.append(f"{location}: cannot prove modifyLiquidity salt is not {FULL_RANGE_SALT}")
+            continue
+        if delta == "zero":
+            zero_sites.append(location)
+        elif delta == "positive":
+            positive_sites.append((contract, function, location))
+            if (contract, function) not in POSITIVE_ALLOWLIST:
+                violations.append(f"{location}: positive {FULL_RANGE_SALT} mutation outside graduation seed")
+        elif delta == "negative":
+            violations.append(f"{location}: negative {FULL_RANGE_SALT} mutation is forbidden")
+        else:
+            violations.append(f"{location}: cannot prove {FULL_RANGE_SALT} liquidityDelta sign")
 
+    allowed_found = {(contract, function) for contract, function, _ in positive_sites}
+    missing = POSITIVE_ALLOWLIST - allowed_found
+    extras = len(positive_sites) - len(allowed_found)
+    for contract, function in sorted(missing):
+        violations.append(f"missing graduation seed allowlist site {contract}.{function}")
+    if extras:
+        violations.append("graduation seed appears more than once; exactly one positive full-range mutation is allowed")
+    if not zero_sites:
+        violations.append("missing zero-delta full-range fee collection site")
+
+    for violation in violations:
+        print(f"FAIL {violation}", file=sys.stderr)
     if violations:
-        print("check_full_range_lock: the full-range position must have no removal path", file=sys.stderr)
+        print(
+            "check_full_range_lock: only zero-delta collection and the single graduation seed may use "
+            f"{FULL_RANGE_SALT}",
+            file=sys.stderr,
+        )
         return 1
 
+    suffix = ""
+    if pending:
+        suffix = f"; pending source not present: {', '.join(pending)}"
     print(
-        f"check_full_range_lock: OK, {total_sites} modifyLiquidity site(s) across {len(SOURCES)} file(s), "
-        f"{salt_sites} on the full range, none reduces it"
+        f"check_full_range_lock: OK, {len(all_sites)} modifyLiquidity site(s), "
+        f"{len(zero_sites)} zero-delta collection site(s), one graduation seed, no other full-range mutation{suffix}"
     )
     return 0
 

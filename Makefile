@@ -3,7 +3,7 @@
 # Task groups referenced below are from
 # openspec/changes/add-milestone-launchpad/tasks.md
 
-.PHONY: all build test test-unit test-fork test-invariant deep size size-gate-selftest lock-check layout-check fmt fmt-check clean deps pins release-check
+.PHONY: all build test test-unit test-fork test-invariant deep size size-gate-selftest structural-gate-selftest lock-check layout-check fmt fmt-check clean deps pins release-check
 
 SIZE_LIMIT ?= 24576
 FIXTURE_DIR := .sizegate-fixture
@@ -66,14 +66,17 @@ size:
 lock-check:
 	python3 tools/check_full_range_lock.py
 
-# Proves the two delegatecall halves share one storage layout, slot for slot, and that the satellite
-# exposes no entry point a direct caller could reach. MilestoneColdPaths runs in the hook's storage, so a
-# layout drift would silently corrupt state with no revert; both checks reject that in CI. Needs the
-# build artifacts, so it builds src/ first (cheap if already built).
+# Proves every delegatecall implementation shares the base layout and exposes no unguarded mutating
+# entry point. MilestonePayoutPaths joins both checks as soon as its source exists; a missing artifact
+# then fails rather than silently skipping the new satellite.
 layout-check:
 	forge build --skip 'test/**' --skip 'script/**'
 	python3 tools/check_storage_layout.py
 	python3 tools/check_cold_path_guards.py
+
+# Focused mutation tests for the AST-backed structural gates.
+structural-gate-selftest:
+	python3 -m unittest discover -s tools/tests -p 'test_*.py' -v
 
 # Proves the gate actually fails on an oversized contract, rather than passing vacuously.
 # Generates a throwaway contract larger than the limit, gates it, then cleans up.
@@ -110,6 +113,6 @@ clean:
 	rm -rf $(FIXTURE_DIR)
 
 # Task 14.4: the full release gate.
-release-check: pins fmt-check build size size-gate-selftest lock-check layout-check test-unit test-invariant
+release-check: pins fmt-check build size size-gate-selftest structural-gate-selftest lock-check layout-check test-unit test-invariant
 	@echo "release-check: unit + invariant suites and the size gate all passed."
 	@echo "release-check: run 'make test-fork' separately with BASE_RPC_URL set."

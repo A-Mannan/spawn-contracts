@@ -30,6 +30,7 @@ EIP170_LIMIT = 24576
 PRODUCTION_CONTRACTS = (
     "MilestoneHook",
     "MilestoneColdPaths",
+    "MilestonePayoutPaths",
     "MilestoneToken",
     "RevenueNFT",
     "LaunchSupport",

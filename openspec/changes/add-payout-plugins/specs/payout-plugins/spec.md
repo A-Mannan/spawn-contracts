@@ -5,7 +5,7 @@ Define immutable launch-selected payout destinations and permissionless cold set
 ## ADDED Requirements
 
 ### Requirement: Append-only payout-plugin registry
-The protocol SHALL reference one registry whose plugin indices, addresses, fixed takes, gas limits, and roles remain stable after registration. The registry SHALL contain at most 256 entries, SHALL reject duplicate or invalid registrations, and SHALL permit only the protocol administrator to append entries or change suspension status. Suspension SHALL be reversible without changing the entry's index or terms. New launches SHALL NOT select a suspended entry; an existing plan's current share and carry for a suspended entry SHALL route to the creator sink until reactivation. Reactivation SHALL restore the immutable destination for later allocations but SHALL NOT recover value already redirected.
+The protocol SHALL reference one registry whose plugin indices, addresses, fixed takes, gas limits, and roles remain stable after registration. The registry SHALL contain at most 256 entries, SHALL reject duplicate or invalid registrations, and SHALL permit mutations only through the typed ProtocolController. Immediately before any registry-only mutation, the controller SHALL query the hook's protocol-global payout-delivery guard and SHALL revert while delivery is in flight. Suspension SHALL be reversible without changing the entry's index or terms. New launches SHALL NOT select a suspended entry; an existing plan's current share and carry for a suspended entry SHALL route to the creator sink until reactivation. Runtime codehash mismatch SHALL permanently redirect that attempt's current share plus all carry to the creator path without calling the entry; restoring code or appending a replacement SHALL NOT replay redirected value. Reactivation SHALL restore the immutable destination for later allocations but SHALL NOT recover value already redirected.
 
 #### Scenario: Registration appends at a stable index
 - **WHEN** the administrator registers a valid plugin
@@ -34,6 +34,14 @@ The protocol SHALL reference one registry whose plugin indices, addresses, fixed
 #### Scenario: Reactivation affects later allocations only
 - **WHEN** a suspended entry is reactivated after value was redirected
 - **THEN** later plan allocations use the entry again and prior redirection is not reversed
+
+#### Scenario: Registry mutation is blocked during payout delivery
+- **WHEN** a typed registry operation executes while the hook-global payout guard is held
+- **THEN** the controller's execution reverts before the registry changes
+
+#### Scenario: Codehash mismatch permanently redirects value
+- **WHEN** an enabled entry's live codehash differs while it has a current share or carry
+- **THEN** the entry is not called, its complete attempted amount credits the creator path, its carry clears, and later code restoration cannot replay that amount
 
 ### Requirement: Protocol administration and delayed updates
 The protocol SHALL maintain a configurable administrator distinct from the configurable protocol revenue recipient. Only the administrator SHALL control registry registration and suspension, economic configuration, revenue-recipient updates, and governance-delay updates. Administrator transfer SHALL use a two-step propose-and-accept process in which only the pending administrator can accept. Administrative configuration changes SHALL be typed, scheduled, cancellable before execution, and executable only after the active delay. The initial delay SHALL be zero seconds and MAY later change through the same delayed mechanism; already scheduled operations SHALL retain their original readiness. The protocol SHALL support a multisig as administrator without assuming signer policy on chain. The administrator SHALL have no implicit right to claim protocol revenue.
@@ -114,7 +122,7 @@ Each launch SHALL store the exact signed 256-bit payout plan. A set bit SHALL se
 - **THEN** they produce identical on-chain plan data
 
 ### Requirement: Isolated harvest payout pots and attribution
-Each pool SHALL have an isolated payout pot containing net milestone proceeds not yet allocated by a flush. A harvest SHALL record pool, milestone index, and gross quote amount; deduct the active global service-fee percentage into the global protocol ledger; and credit the exact remainder to only that pool's pot. Multiple milestones MAY aggregate in one pot while their event history remains reconstructible. Pot backing MAY be raw ETH or native PoolManager claims and SHALL remain solvent. The protocol SHALL NOT maintain an on-chain per-milestone tranche ledger.
+Each pool SHALL have an isolated payout pot containing net milestone proceeds not yet allocated by a flush. A harvest SHALL record pool, milestone index, and gross quote amount; deduct the active global service-fee percentage into the global protocol ledger; and credit the exact remainder to only that pool's pot. Multiple milestones MAY aggregate in one pot while their event history remains reconstructible. The hook SHALL maintain exact aggregate counters for payout pots, plugin carry, creator-path entitlement, direct creator claims, and global protocol claims, updated atomically with their component ledgers. Outside active payout-pot redemption, aggregate pots SHALL be covered by redeemable quote claims, while carry plus creator-path plus direct creator plus protocol liabilities SHALL be covered by raw ETH; combined raw ETH and claims SHALL cover their sum. The protocol SHALL NOT maintain an on-chain per-milestone tranche ledger.
 
 #### Scenario: Gross harvest is attributable
 - **WHEN** a band is harvested
@@ -136,8 +144,16 @@ Each pool SHALL have an isolated payout pot containing net milestone proceeds no
 - **WHEN** a harvest accrues while PoolManager settlement is in flight
 - **THEN** its pot is backed by claims without requiring premature ETH redemption
 
+#### Scenario: Aggregate liabilities equal component ledgers
+- **WHEN** harvest, flush, failure, redirect, or claim changes any payout liability
+- **THEN** each aggregate counter equals the sum of its recorded component ledgers
+
+#### Scenario: Custody classes cover their liabilities
+- **WHEN** no payout-pot redemption unlock is active
+- **THEN** redeemable quote claims cover aggregate pots, raw ETH covers all carry and claimable ledgers, and combined custody covers total ETH liabilities
+
 ### Requirement: Permissionless whole-pot cold flush
-Any address SHALL be able to flush one pool. A flush SHALL remove the complete newly accrued pot from available accounting before external calls, redeem it exactly once in its own PoolManager unlock, and perform delivery outside all swap callbacks. The flusher tip SHALL equal the floor of 1% of the newly redeemed post-service-fee pot. Plan takes SHALL apply to the remaining 99%. Previously failed carry SHALL be retried without another tip. The protocol SHALL expose no multi-pool batch-flush entry point.
+Any address SHALL be able to flush one pool. A flush SHALL remove the complete newly accrued pot from available accounting before external calls, redeem it exactly once in its own PoolManager unlock, and perform delivery outside all swap callbacks. The flusher tip SHALL equal the floor of 1% of the newly redeemed post-service-fee pot. An ordinary flush SHALL transfer that tip before plugin delivery and failure of that transfer SHALL revert the complete flush atomically. Plan takes SHALL apply to the remaining 99%. Previously failed carry SHALL be retried without another tip. The protocol SHALL expose no multi-pool batch-flush entry point.
 
 #### Scenario: Any address can flush one pool
 - **WHEN** an arbitrary caller requests a flush for a valid pool
@@ -167,12 +183,16 @@ Any address SHALL be able to flush one pool. A flush SHALL remove the complete n
 - **WHEN** neither new pot nor carry exists
 - **THEN** the call performs no unlock or value transfer
 
+#### Scenario: Ordinary flusher tip failure is atomic
+- **WHEN** an ordinary flush cannot transfer the 1% tip to its immediate caller
+- **THEN** the complete flush reverts with pot, carry, liabilities, plugin state, events, and transfers unchanged
+
 #### Scenario: Ordinary swaps do not flush
 - **WHEN** a trader uses an ordinary router
 - **THEN** no pot is redeemed and no payout plugin is invoked
 
 ### Requirement: Stipended and failure-isolated plugin delivery
-A flush SHALL process selected destinations in ascending registry-index order. Each active plugin SHALL receive plain ETH equal only to its current computed share plus its own previous carry, under its registered gas limit. Revert, gas exhaustion, or malformed execution by one plugin SHALL preserve its attempted value in a per-pool, per-entry carry ledger and SHALL NOT block later destinations. Successful delivery SHALL clear that carry and SHALL NOT be replayable. Delivery events SHALL make successful, carried, and redirected values reconcilable.
+A flush SHALL process selected destinations in ascending registry-index order. Each active plugin SHALL receive plain ETH equal only to its current computed share plus its own previous carry, under its registered gas limit. Plugin success SHALL be exactly the EVM `CALL` success bit for the void callback `onPayout(PoolId,address)`; the core SHALL ignore all returndata. A zero success bit from revert or gas exhaustion SHALL preserve the full attempted value in a per-pool, per-entry carry ledger and SHALL NOT block later destinations. The published constants SHALL be `CALL_FIXED_GAS = 15_000`, `POST_CALL_GAS = 100_000`, `FINALIZE_GAS = 100_000`, and `MAX_PLUGIN_CALL_GAS = 500_000`, and registration SHALL require `1 <= callGas <= MAX_PLUGIN_CALL_GAS`. At each actual call boundary, `remainingCalls` SHALL include the current call and every unresolved later selected entry. After suspension/codehash resolution, zero-attempt filtering, carry clearing, liability effects, and callback calldata materialization, but before any uncovered call-specific setup, the core SHALL compute `reserve = remainingCalls * POST_CALL_GAS + FINALIZE_GAS` and `eip150Margin = (callGas + 62) / 63`, then require `gasleft() >= reserve + callGas + eip150Margin + CALL_FIXED_GAS`. Failed preflight SHALL revert the complete flush rather than become carry. Successful delivery SHALL clear carry and SHALL NOT be replayable. Delivery events SHALL make successful, carried, and redirected values reconcilable.
 
 #### Scenario: Plugins execute deterministically
 - **WHEN** multiple plugins are enabled
@@ -181,6 +201,18 @@ A flush SHALL process selected destinations in ascending registry-index order. E
 #### Scenario: Plugin receives only its allocation
 - **WHEN** an active plugin is called
 - **THEN** it receives plain ETH equal to its current share plus its own carry and cannot consume another share
+
+#### Scenario: Void callback success ignores returndata
+- **WHEN** a plugin's void callback returns with EVM CALL success and any empty, malformed, or non-empty returndata
+- **THEN** delivery succeeds, all returndata is ignored, and the attempted amount does not become carry
+
+#### Scenario: EIP-150 preflight preserves finalization gas
+- **WHEN** a plugin attempt reaches the call boundary
+- **THEN** the exact formula using `15_000` fixed gas, `100_000` per unresolved call, `100_000` finalization gas, and `(callGas + 62) / 63` EIP-150 margin passes before CALL
+
+#### Scenario: Insufficient preflight gas reverts the flush
+- **WHEN** gas at a plugin call boundary is below the published preflight formula
+- **THEN** the whole flush reverts and no attempted amount is misclassified as plugin carry
 
 #### Scenario: Reverting plugin does not block later plugins
 - **WHEN** one plugin reverts
@@ -203,31 +235,35 @@ A flush SHALL process selected destinations in ascending registry-index order. E
 - **THEN** tip, successful deliveries, creator value, redirects, and remaining carry equal all new pot and retried carry value
 
 ### Requirement: Creator payout entitlement
-The creator sink SHALL receive every post-tip amount not allocated to active selected plugins, including rounding dust and suspended-plugin redirects. The sink SHALL credit a separate per-pool creator-plugin ledger without pushing ETH to the holder during an arbitrary flush. Entitlement SHALL belong to the current RevenueNFT owner and SHALL remain distinct from the hook's direct creator-revenue ledger.
+The implicit mandatory creator sink SHALL receive every post-tip amount not allocated to active selected plugins, including rounding dust, suspended-plugin redirects, and codehash-mismatch redirects. The creator path SHALL credit a separate per-pool entitlement ledger without pushing ETH to the holder during an arbitrary flush. Entitlement SHALL belong to the current RevenueNFT owner and SHALL remain distinct from the hook's direct creator-revenue ledger. A creator-path claim SHALL authenticate the initiating owner, flush first, query RevenueNFT ownership again after every plugin interaction, and revert the complete call if ownership changed. It SHALL then attempt the complete entitlement including its self-flush tip. Failure of this final transfer SHALL NOT revert: the complete attempted amount SHALL be restored to creator-path entitlement and aggregate liability, an event SHALL identify pool, holder, attempted amount, and failure, and the call SHALL return explicit `(success, attemptedAmount)` observability.
 
 #### Scenario: Arbitrary flush records rather than pushes creator value
 - **WHEN** a third party flushes a pool
 - **THEN** the creator sink credits the pool ledger without transferring ETH to the NFT holder
 
 #### Scenario: Creator value follows NFT ownership
-- **WHEN** the RevenueNFT is transferred before creator-plugin value is claimed
+- **WHEN** the RevenueNFT is transferred before creator-path value is claimed
 - **THEN** the new holder gains the complete unpaid entitlement and the previous holder loses it
 
-#### Scenario: Creator-plugin and direct ledgers remain separate
+#### Scenario: Creator-path and direct ledgers remain separate
 - **WHEN** a flush credits creator remainder
 - **THEN** the hook's direct creator ledger is unchanged
 
 #### Scenario: Creator payout flushes first
-- **WHEN** the current NFT holder invokes creator-plugin payout
-- **THEN** the plugin first flushes the pool and then pays the complete resulting creator-plugin balance
+- **WHEN** the current NFT holder invokes creator-path payout
+- **THEN** the creator path first flushes the pool and then attempts the complete resulting entitlement
 
 #### Scenario: Creator self-flush preserves the tip
 - **WHEN** the NFT holder initiates creator payout
-- **THEN** the 1% tip is returned to that initiating external caller
+- **THEN** the 1% tip is included in that initiating holder's complete final transfer
+
+#### Scenario: Ownership change during plugins reverts payout
+- **WHEN** RevenueNFT ownership differs after plugin interactions from the owner authenticated at creator-payout entry
+- **THEN** the complete flush and payout revert before any creator-path transfer
 
 #### Scenario: Failed recipient transfer preserves entitlement
-- **WHEN** payment to the current holder fails
-- **THEN** their creator-plugin entitlement remains recoverable
+- **WHEN** the complete creator-path transfer to the current holder fails
+- **THEN** the call does not revert, the attempted amount including any self-flush tip is restored in full, and return data and an event report failure and attempted amount
 
 ### Requirement: Plugin reentrancy and drain protection
 Payout accounting SHALL follow checks-effects-interactions and use transaction-scoped reentrancy control. During plugin delivery, no plugin SHALL re-flush any pool, replay settlement, mutate a different pool, or reach direct creator revenue, global protocol revenue, another pool's pot, another plugin's carry, ladder inventory, or locked liquidity. Pool callbacks caused by an authorized reference plugin interaction SHALL suppress payout and ladder work. A failed nested interaction SHALL leave accounting recoverable, and the guard SHALL not persist across transactions.

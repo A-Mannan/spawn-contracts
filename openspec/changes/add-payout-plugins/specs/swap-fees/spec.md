@@ -24,7 +24,7 @@ Every pool SHALL charge the immutable template trading fee of 1% from initializa
 - **THEN** its key has no dynamic-fee flag and no mutable fee step exists
 
 ### Requirement: Fee routing waterfall
-Collected fees SHALL be routed per currency using one snapshot of the active global economic configuration. By default, quote fees SHALL route 75% to direct creator revenue and the exact remainder, initially 25%, to the global protocol ledger. The administrator MAY update the creator percentage after the configured timelock, subject to an immutable maximum of 90%; the protocol receives the exact remainder and updates SHALL apply to future collections for all pools. Token fees SHALL never reach a claimant, payout pot, payout plugin, or full-range position: while useful ladder capacity remains, the configured milestone-fund share, initially 20% and capped at 50%, SHALL fund future bands and the exact remainder SHALL burn; once no future permitted band can use inventory, 100% SHALL burn. No quote- or token-side LP fee carry SHALL exist and no collected fee SHALL compound liquidity.
+Collected fees SHALL be routed per currency using one snapshot of the active global economic configuration. By default, quote fees SHALL route 75% to direct creator revenue and the exact remainder, initially 25%, to the global protocol ledger. The administrator MAY update the creator percentage after the configured timelock, subject to an immutable maximum of 90%; the protocol receives the exact remainder and updates SHALL apply to future collections for all pools. Token fees SHALL never reach a claimant, payout pot, payout plugin, or full-range position. Let `perBand = floor(totalSupply * ladderSupplyShareWad / WAD / coreBandCount)`, `bandCap = perBand * bandInventoryCapMultiple`, `remainingExtensions = maxFeeFundedBands - feeFundedBandsCreated`, and `freeCapacity = max(remainingExtensions * bandCap - carriedInventory - milestoneFundAccrued, 0)`. While `remainingExtensions > 0`, collection SHALL add `min(floor(tokenFees * tokenMilestoneFundShareWad / WAD), freeCapacity)` to milestone funding and SHALL burn every other collected token; once `freeCapacity` is zero, 100% SHALL burn. This capacity counts only inventory available to still-undeployed fee-funded extension bands, never core-band inventory or already deployed bands. No quote- or token-side LP fee carry SHALL exist and no collected fee SHALL compound liquidity.
 
 #### Scenario: Default quote split is 75 25
 - **WHEN** quote fees are collected under the default configuration
@@ -107,6 +107,10 @@ While another permitted band can use inventory, the system SHALL divert the acti
 #### Scenario: Diversion stops at the cap
 - **WHEN** no future permitted band can use inventory
 - **THEN** no token fee enters milestone funding
+
+#### Scenario: Diversion is clamped to remaining extension capacity
+- **WHEN** the configured token-fund share exceeds positive free capacity for still-undeployed fee-funded extension bands
+- **THEN** exactly that free capacity enters milestone funding and every excess token burns in the same collection
 
 #### Scenario: Post-cap token fees burn entirely
 - **WHEN** token fees are collected after the ladder cap

@@ -18,7 +18,7 @@ contract ProtocolController {
     uint8 public constant ACTION_SET_DELAY = 5;
 
     IPayoutPluginRegistry public immutable registry;
-    IProtocolConfigurationTarget public immutable target;
+    IProtocolConfigurationTarget public target;
 
     address public administrator;
     address public pendingAdministrator;
@@ -34,6 +34,7 @@ contract ProtocolController {
     event OperationScheduled(bytes32 indexed operationId, uint8 indexed action, bytes32 indexed salt, uint64 readyAt);
     event OperationCancelled(bytes32 indexed operationId);
     event OperationExecuted(bytes32 indexed operationId);
+    event ProtocolTargetBound(address indexed target);
     event EconomicConfigUpdated(
         uint64 indexed version,
         uint64 harvestServiceFeeWad,
@@ -53,16 +54,22 @@ contract ProtocolController {
     error InvalidEconomicConfig();
     error ReentrantExecution();
     error PayoutDeliveryInFlight();
+    error TargetAlreadyBound();
+    error TargetNotBound();
+    error TargetHasNoCode();
 
     constructor(address administrator_, address protocolRecipient_, IPayoutPluginRegistry registry_, address target_) {
-        if (
-            administrator_ == address(0) || protocolRecipient_ == address(0) || address(registry_) == address(0)
-                || target_ == address(0)
-        ) revert ZeroAddress();
+        if (administrator_ == address(0) || protocolRecipient_ == address(0) || address(registry_) == address(0)) {
+            revert ZeroAddress();
+        }
         administrator = administrator_;
         protocolRecipient = protocolRecipient_;
         registry = registry_;
-        target = IProtocolConfigurationTarget(target_);
+        if (target_ != address(0)) {
+            if (target_.code.length == 0) revert TargetHasNoCode();
+            target = IProtocolConfigurationTarget(target_);
+            emit ProtocolTargetBound(target_);
+        }
         _economicConfig = EconomicConfig({
             harvestServiceFeeWad: 0.1e18,
             quoteCreatorShareWad: 0.75e18,
@@ -78,7 +85,10 @@ contract ProtocolController {
 
     modifier nonReentrantExecution() {
         if (_executionLock != 0) revert ReentrantExecution();
-        if (target.payoutDeliveryInFlight()) revert PayoutDeliveryInFlight();
+        IProtocolConfigurationTarget configuredTarget = target;
+        if (address(configuredTarget) != address(0) && configuredTarget.payoutDeliveryInFlight()) {
+            revert PayoutDeliveryInFlight();
+        }
         _executionLock = 1;
         _;
         _executionLock = 0;
@@ -86,6 +96,16 @@ contract ProtocolController {
 
     function economicConfig() external view returns (EconomicConfig memory) {
         return _economicConfig;
+    }
+
+    /// @notice Binds the mined hook after deployment, breaking the controller/hook constructor cycle.
+    /// @dev This is a one-time deployment action, not a governance-upgrade surface.
+    function bindTarget(address target_) external onlyAdministrator nonReentrantExecution {
+        if (address(target) != address(0)) revert TargetAlreadyBound();
+        if (target_ == address(0)) revert ZeroAddress();
+        if (target_.code.length == 0) revert TargetHasNoCode();
+        target = IProtocolConfigurationTarget(target_);
+        emit ProtocolTargetBound(target_);
     }
 
     /// @notice Complete the registry's two-step administrator handoff to this controller.
@@ -124,6 +144,7 @@ contract ProtocolController {
     {
         bytes32 operationId = hashRegisterPlugin(plugin, takeWad, gasLimit, role, salt);
         _consume(operationId);
+        _requireRegistryMutable();
         index = registry.registerPlugin(plugin, takeWad, gasLimit, role);
         emit OperationExecuted(operationId);
     }
@@ -149,6 +170,7 @@ contract ProtocolController {
     function executePluginSuspension(uint8 index, bool suspended, bytes32 salt) external nonReentrantExecution {
         bytes32 operationId = hashPluginSuspension(index, suspended, salt);
         _consume(operationId);
+        _requireRegistryMutable();
         registry.setPluginSuspended(index, suspended);
         emit OperationExecuted(operationId);
     }
@@ -175,7 +197,7 @@ contract ProtocolController {
         _validateEconomicConfig(config);
         if (config.version != _nextEconomicVersion()) revert InvalidEconomicConfig();
         _economicConfig = config;
-        target.setEconomicConfig(config);
+        _target().setEconomicConfig(config);
         emit EconomicConfigUpdated(
             config.version, config.harvestServiceFeeWad, config.quoteCreatorShareWad, config.tokenMilestoneFundShareWad
         );
@@ -202,7 +224,7 @@ contract ProtocolController {
         if (recipient == address(0)) revert ZeroAddress();
         address previous = protocolRecipient;
         protocolRecipient = recipient;
-        target.setProtocolRecipient(recipient);
+        _target().setProtocolRecipient(recipient);
         emit ProtocolRecipientUpdated(previous, recipient);
         emit OperationExecuted(operationId);
     }
@@ -279,6 +301,26 @@ contract ProtocolController {
                 || config.quoteCreatorShareWad > MAX_QUOTE_CREATOR_SHARE_WAD
                 || config.tokenMilestoneFundShareWad > MAX_TOKEN_MILESTONE_FUND_SHARE_WAD
         ) revert InvalidEconomicConfig();
+    }
+
+    /// @dev Asserted immediately before a registry-only mutation, which is where the specs place it.
+    ///
+    /// {nonReentrantExecution} already queries the guard, but only when a target exists — so an unbound
+    /// controller would append or suspend entries with the hook's delivery state never consulted at all.
+    /// Deployment binds the target before it registers anything, but that ordering was a property of the
+    /// script rather than of this contract; requiring it here makes the absence of a target a refusal
+    /// rather than a silently skipped check. Entry-mutating operations are the only ones that need it
+    /// stated separately: economics and recipient updates already reach {_target}, which refuses to
+    /// resolve an unbound target.
+    function _requireRegistryMutable() private view {
+        IProtocolConfigurationTarget configuredTarget = target;
+        if (address(configuredTarget) == address(0)) revert TargetNotBound();
+        if (configuredTarget.payoutDeliveryInFlight()) revert PayoutDeliveryInFlight();
+    }
+
+    function _target() private view returns (IProtocolConfigurationTarget configuredTarget) {
+        configuredTarget = target;
+        if (address(configuredTarget) == address(0)) revert TargetNotBound();
     }
 
     function _operationId(uint8 action, bytes memory parameters, bytes32 salt) private view returns (bytes32) {

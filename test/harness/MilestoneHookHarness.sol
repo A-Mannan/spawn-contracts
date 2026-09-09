@@ -9,6 +9,7 @@ import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {MilestoneHook} from "../../src/MilestoneHook.sol";
 import {RevenueNFT} from "../../src/RevenueNFT.sol";
 import {LaunchSupport} from "../../src/LaunchSupport.sol";
+import {LadderLib} from "../../src/libraries/LadderLib.sol";
 import {PoolState, ProtocolTemplate} from "../../src/types/LaunchTypes.sol";
 
 /// @notice Test-only subclass that records the ladder's *mid-transaction* state, which no external call
@@ -54,10 +55,20 @@ contract MilestoneHookHarness is MilestoneHook {
         LaunchSupport launchSupport_,
         ProtocolTemplate memory template_,
         address coldPaths_,
-        address protocolAdmin_,
+        address payoutPaths_,
+        address protocolController_,
         address protocolRecipient_
     )
-        MilestoneHook(poolManager_, revenueNft_, launchSupport_, template_, coldPaths_, protocolAdmin_, protocolRecipient_)
+        MilestoneHook(
+            poolManager_,
+            revenueNft_,
+            launchSupport_,
+            template_,
+            coldPaths_,
+            payoutPaths_,
+            protocolController_,
+            protocolRecipient_
+        )
     {}
 
     /// @notice Snapshots the live-band set before the harvest loop drains it, then runs the real path.
@@ -186,6 +197,30 @@ contract MilestoneHookHarness is MilestoneHook {
         state.nextBandIndex = coreBandCount;
         state.ladderInventoryRemaining = 0;
         state.carriedInventory = 0;
+    }
+
+    /// @notice Leaves exactly `freeCapacity` tokens of room in the fee-funded extension, one band open.
+    ///
+    /// @dev Third sibling of {forceLadderCappedOut}, for the clamp rather than the cap. Diversion is
+    /// clamped when the configured share of one collection exceeds what the remaining extensions can still
+    /// hold — and at the shipped template a single extension holds tens of millions of tokens, while a 1%
+    /// fee on the largest sell a unit pool can absorb is four orders of magnitude smaller. There is no
+    /// patient route to the boundary either: every way of driving `milestoneFundAccrued` that high deploys
+    /// the very bands that would consume it.
+    ///
+    /// So the three fields the clamp reads are set directly and nothing else is. `feeFundedBandsCreated`
+    /// leaves one extension open, carry is cleared so the extension's own capacity is the whole ceiling,
+    /// and `milestoneFundAccrued` is backed off from that ceiling by exactly the room the test asked for.
+    /// No band is marked, no balance moves, no ledger is touched, and token inventory is not an ETH
+    /// liability — so a diversion observed against this state is the production path clamping for the
+    /// production reason.
+    function forceExtensionCapacityRemaining(PoolId poolId, uint256 freeCapacity) external {
+        PoolState storage state = _pools[poolId];
+        state.feeFundedBandsCreated = maxFeeFundedBands - 1;
+        state.carriedInventory = 0;
+        uint256 ceiling = LadderLib.perBandInventory(state.totalSupply, ladderSupplyShareWad, coreBandCount)
+            * bandInventoryCapMultiple;
+        state.milestoneFundAccrued = ceiling - freeCapacity;
     }
 
     function _dispatchUnlock(bytes calldata data) internal override returns (bytes memory) {

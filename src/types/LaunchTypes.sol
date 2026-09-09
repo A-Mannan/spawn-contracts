@@ -16,22 +16,10 @@ enum Phase {
     GRADUATED
 }
 
-/// @notice Routing of a harvested milestone. Components sum to `WAD`.
-/// @dev The one economic choice left to a creator (design Decision 16). Bounds from the `token-launch`
-/// spec: `creatorWad <= 70%`, `buybackWad >= 10%`, `protocolWad >= 5%`.
-struct HarvestSplit {
-    uint64 creatorWad;
-    uint64 buybackWad;
-    uint64 protocolWad;
-    uint64 lpWad;
-}
-
 /// @notice Everything a creator signs, and the whole of what varies between launches.
 ///
-/// @dev design Decision 16 moved every launch-*shape* parameter into {ProtocolTemplate}: there is no
-/// geometry here, no supply split, no fee schedule and no anti-snipe window, because a creator cannot
-/// choose them. What remains is the creator's identity, token identity, the optional dev buy, and the
-/// harvest split.
+/// @dev Launch economics are selected only through the exact registry bitset in `payoutPlan`.
+/// Geometry, the static trading fee, graduation economics, and payout-plugin terms are protocol-defined.
 ///
 /// `creator` is *declared* rather than inferred, and the signature is checked against it. Recovery alone
 /// could not reject an altered configuration — it would simply yield some other address and attribute
@@ -48,8 +36,7 @@ struct LaunchConfig {
     string symbol;
     uint256 totalSupply;
     uint64 devBuyShareWad;
-    uint32 devBuyVestingSeconds;
-    HarvestSplit harvestSplit;
+    uint256 payoutPlan;
     uint256 deadline;
 }
 
@@ -65,10 +52,9 @@ struct LaunchConfig {
 /// anything changes in v1. The fields are unpacked into immutables by {MilestoneBase}, so reading them
 /// on the swap path costs no storage access.
 ///
-/// Both the hook and its delegatecall satellite must be constructed with the *same* template: an
-/// immutable resolves from the executing contract's own bytecode even under delegatecall, so a
-/// mismatch would make the two halves disagree at runtime. The Migration Plan asserts this at
-/// deployment.
+/// The hook and both delegatecall satellites must be constructed with the *same* template: an immutable
+/// resolves from the executing contract's own bytecode even under delegatecall, so a mismatch would make
+/// the three implementations disagree at runtime. Deployment verifies this parity before any launch.
 struct ProtocolTemplate {
     // --- Opening valuation (Decision 16) ---
     /// @dev Every launch opens at this ETH-denominated fully diluted valuation, whatever its supply.
@@ -91,25 +77,12 @@ struct ProtocolTemplate {
     uint64 lpSeedWad;
     uint64 proceedsCreatorWad;
     uint64 proceedsProtocolWad;
-    // --- Fees ---
-    uint24 baseFeeHundredthsBip;
-    /// @dev Two permanent step-downs, scaled to the band count (Decision 8, revised). A zero threshold
-    /// disables that step.
-    uint8 feeStepOneAtCompletions;
-    uint24 feeStepOneFee;
-    uint8 feeStepTwoAtCompletions;
-    uint24 feeStepTwoFee;
-    // --- Milestone fund ---
-    uint64 milestoneFundShareWad;
-    uint8 bandInventoryCapMultiple;
+    // --- Static trading fee ---
+    uint24 tradingFeeHundredthsBip;
     // --- Per-swap work caps (Decision 15, Decision 4 revised) ---
+    uint8 bandInventoryCapMultiple;
     uint8 maxDeploysPerSwap;
     uint8 maxHarvestsPerSwap;
-    // --- Harvest split defaults, published for front-ends; a launch may choose within Bounds. ---
-    uint64 defaultCreatorWad;
-    uint64 defaultBuybackWad;
-    uint64 defaultProtocolWad;
-    uint64 defaultLpWad;
 }
 
 /// @notice Per-pool protocol state, keyed by `PoolId` in the hook.
@@ -123,14 +96,11 @@ struct PoolState {
     address token;
     uint64 launchedAt;
     uint64 graduatedAt;
-    /// @dev Current base fee. Milestone completions step it down, permanently.
-    uint24 baseFeeHundredthsBip;
-    // --- Launch shape, derived at launch from the template and the supply ---
     uint256 totalSupply;
     int24 openingLevel;
     int24 farLevel;
-    uint32 devBuyVestingSeconds;
-    HarvestSplit harvestSplit;
+    /// @dev Exact immutable registry bitset selected by the creator.
+    uint256 payoutPlan;
     // --- Bonding curve progress ---
     /// @dev One bit per template curve position. Position 0 is set at genesis; the rest are set as the
     /// simulated swap path reaches them (Decision 15).
@@ -150,27 +120,18 @@ struct PoolState {
     uint256 ladderInventoryRemaining;
     uint256 carriedInventory;
     uint256 milestoneFundAccrued;
-    // --- Dev buy vesting, hook-held ---
-    uint256 devBuyTotal;
-    uint256 devBuyReleased;
     // --- Full-range position, code-locked ---
     uint128 fullRangeLiquidity;
     int24 fullRangeTickLower;
     int24 fullRangeTickUpper;
-    /// @dev The LP share of collected fees that could not yet be turned into liquidity, held in hook
-    /// custody until the other currency catches up. A full-range position takes both currencies in the
-    /// ratio spot implies, but fees arrive in whichever currency traders paid in — so the LP share of
-    /// one collection is generally lopsided even though the pair balances out over many. Carrying the
-    /// excess across collections is what lets all of it eventually compound; see design Decision 9.
-    uint256 pendingLpQuote;
-    uint256 pendingLpToken;
 }
 
 /// @notice Protocol-wide bounds every launch is validated against, plus the canonical template.
 ///
-/// @dev Declared as constants rather than storage so no governance action can widen them. What lives
-/// here after design Decision 16 is only what a launch can still *choose*: the dev buy and the harvest
-/// split. Everything else moved into {ProtocolTemplate}.
+/// @dev Declared as constants rather than storage so no governance action can widen them. The remaining
+/// launch-specific bounded choice is the immediate dev-buy share; payout-plan validity additionally
+/// depends on immutable registry entries and is checked by {LaunchSupport}. Everything else belongs to
+/// {ProtocolTemplate} or the controller's capped global economics.
 library Bounds {
     /// @notice Pool tick spacing, fixed protocol-wide rather than configurable.
     ///
@@ -215,19 +176,15 @@ library Bounds {
     /// @dev Against a thin nested book, a larger dev buy sweeps expensive bins and prices the creator's
     /// own entry (Decision 17).
     uint64 internal constant MAX_DEV_BUY_SHARE_WAD = 0.1e18;
-    uint32 internal constant MAX_DEV_BUY_VESTING_SECONDS = 365 days;
 
-    uint64 internal constant MAX_CREATOR_HARVEST_SHARE_WAD = 0.7e18;
-    uint64 internal constant MIN_BUYBACK_HARVEST_SHARE_WAD = 0.1e18;
-    /// @dev Retained from the pre-rework bounds: the buyback moves the price after every harvest, and
-    /// the design's Risks register measures that push against the next band's lower bound at this cap.
-    uint64 internal constant MAX_BUYBACK_HARVEST_SHARE_WAD = 0.4e18;
-    uint64 internal constant MIN_PROTOCOL_HARVEST_SHARE_WAD = 0.05e18;
-
-    /// @notice Fee routing on collection of quote-denominated fees: 60% LP, 30% creator, 10% protocol.
-    uint64 internal constant FEE_LP_SHARE_WAD = 0.6e18;
-    uint64 internal constant FEE_CREATOR_SHARE_WAD = 0.3e18;
-    uint64 internal constant FEE_PROTOCOL_SHARE_WAD = 0.1e18;
+    /// @notice Immutable static Uniswap v4 fee: 1% in hundredths of a bip.
+    uint24 internal constant TRADING_FEE_HUNDREDTHS_BIP = 10_000;
+    uint64 internal constant DEFAULT_HARVEST_SERVICE_FEE_WAD = 0.1e18;
+    uint64 internal constant DEFAULT_QUOTE_CREATOR_SHARE_WAD = 0.75e18;
+    uint64 internal constant DEFAULT_TOKEN_MILESTONE_FUND_SHARE_WAD = 0.2e18;
+    uint64 internal constant MAX_HARVEST_SERVICE_FEE_WAD = 0.2e18;
+    uint64 internal constant MAX_QUOTE_CREATOR_SHARE_WAD = 0.9e18;
+    uint64 internal constant MAX_TOKEN_MILESTONE_FUND_SHARE_WAD = 0.5e18;
 
     /// @notice The canonical protocol template (design Decision 16).
     ///
@@ -257,22 +214,11 @@ library Bounds {
         t.proceedsCreatorWad = 0.55e18;
         t.proceedsProtocolWad = 0.05e18;
 
-        t.baseFeeHundredthsBip = 10_000; // 1%
-        t.feeStepOneAtCompletions = 8;
-        t.feeStepOneFee = 5_000; // 0.5%
-        t.feeStepTwoAtCompletions = 16;
-        t.feeStepTwoFee = 2_500; // 0.25%
-
-        t.milestoneFundShareWad = 0.2e18;
+        t.tradingFeeHundredthsBip = TRADING_FEE_HUNDREDTHS_BIP;
         t.bandInventoryCapMultiple = 2;
 
         t.maxDeploysPerSwap = 8;
         t.maxHarvestsPerSwap = 8;
-
-        t.defaultCreatorWad = 0.6e18;
-        t.defaultBuybackWad = 0.2e18;
-        t.defaultProtocolWad = 0.1e18;
-        t.defaultLpWad = 0.1e18;
     }
 
     /// @notice The default per-launch configuration, used by tests and deployment scripts as the
@@ -287,8 +233,7 @@ library Bounds {
         config.symbol = symbol_;
         config.totalSupply = totalSupply_;
         config.devBuyShareWad = 0;
-        config.devBuyVestingSeconds = 0;
-        config.harvestSplit = HarvestSplit({creatorWad: 0.6e18, buybackWad: 0.2e18, protocolWad: 0.1e18, lpWad: 0.1e18});
+        config.payoutPlan = 0;
         config.deadline = type(uint256).max;
     }
 }

@@ -4,20 +4,35 @@ pragma solidity 0.8.26;
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
+import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {HookMiner} from "v4-periphery/src/utils/HookMiner.sol";
 
+import {BuybackAndBurnPlugin} from "../src/BuybackAndBurnPlugin.sol";
 import {LaunchSupport} from "../src/LaunchSupport.sol";
 import {MilestoneColdPaths} from "../src/MilestoneColdPaths.sol";
 import {MilestoneHook} from "../src/MilestoneHook.sol";
+import {MilestonePayoutPaths} from "../src/MilestonePayoutPaths.sol";
+import {PayoutPluginRegistry} from "../src/PayoutPluginRegistry.sol";
+import {ProtocolController} from "../src/ProtocolController.sol";
 import {RevenueNFT} from "../src/RevenueNFT.sol";
-import {ProtocolTemplate} from "../src/types/LaunchTypes.sol";
+import {SwapAndFlushHelper} from "../src/SwapAndFlushHelper.sol";
+import {IPayoutFlusher} from "../src/interfaces/IPayoutPlugin.sol";
+import {Bounds, ProtocolTemplate} from "../src/types/LaunchTypes.sol";
+import {EconomicConfig, PAYOUT_WAD, PluginEntry, PluginRole} from "../src/types/PayoutTypes.sol";
 
 /// @notice Every address one complete protocol deployment produces, plus the salt that placed the hook.
 struct Deployment {
     RevenueNFT nft;
+    PayoutPluginRegistry registry;
+    ProtocolController controller;
     LaunchSupport support;
     MilestoneColdPaths coldPaths;
+    MilestonePayoutPaths payoutPaths;
     MilestoneHook hook;
+    BuybackAndBurnPlugin buyback;
+    SwapAndFlushHelper helper;
+    uint8 buybackIndex;
+    uint256 canonicalPayoutPlan;
     bytes32 hookSalt;
 }
 
@@ -39,8 +54,22 @@ struct DeployParams {
     IPoolManager poolManager;
     address create2Deployer;
     bool selfIssuesCreate2;
+    address bootstrapAdministrator;
     address protocolAdmin;
     address protocolRecipient;
+}
+
+/// @notice The two read-only inputs to a deployment, bundled behind one memory pointer.
+///
+/// @dev Purely a `via_ir` accommodation, and a load-bearing one. The deployment chain is a sequence of
+/// small private steps that the IR optimiser inlines into a single frame, and each step that took the
+/// parameters and the template separately kept two live pointers there on top of the {Deployment} being
+/// filled in. Three simultaneous pointers put that frame one slot past the sixteen the Yul stack can
+/// reach; two do not. Nothing outside this library sees this type, and no public signature changed —
+/// splitting the steps further does not help, because inlining collapses them again.
+struct DeployInputs {
+    DeployParams p;
+    ProtocolTemplate template;
 }
 
 /// @title LaunchpadDeploy
@@ -65,6 +94,10 @@ library LaunchpadDeploy {
             | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
     );
 
+    uint64 internal constant CANONICAL_BUYBACK_TAKE_WAD = uint64((2 * PAYOUT_WAD) / 9);
+    uint32 internal constant CANONICAL_BUYBACK_GAS_LIMIT = 500_000;
+    bytes32 internal constant CANONICAL_BUYBACK_SALT = keccak256("MILESTONE_CANONICAL_BUYBACK_V1");
+
     /// @notice The hook's constructor arguments, encoded as the salt is mined against them.
     ///
     /// @dev Migration Plan step 3: the satellite's address and the template are constructor arguments and
@@ -77,7 +110,14 @@ library LaunchpadDeploy {
         returns (bytes memory)
     {
         return abi.encode(
-            p.poolManager, d.nft, d.support, template, address(d.coldPaths), p.protocolAdmin, p.protocolRecipient
+            p.poolManager,
+            d.nft,
+            d.support,
+            template,
+            address(d.coldPaths),
+            address(d.payoutPaths),
+            address(d.controller),
+            p.protocolRecipient
         );
     }
 
@@ -90,12 +130,41 @@ library LaunchpadDeploy {
         return abi.encodePacked(type(MilestoneHook).creationCode, hookArgs(d, p, template));
     }
 
+    function verifyMiningInputs(Deployment memory d, DeployParams memory p, ProtocolTemplate memory template)
+        internal
+        view
+    {
+        require(address(p.poolManager) != address(0), "mine: pool manager");
+        require(p.create2Deployer != address(0), "mine: create2 deployer");
+        require(address(d.nft).code.length != 0, "mine: revenue nft");
+        require(address(d.registry).code.length != 0, "mine: registry");
+        require(address(d.controller).code.length != 0, "mine: controller");
+        require(address(d.support).code.length != 0, "mine: launch support");
+        require(address(d.coldPaths).code.length != 0, "mine: cold paths");
+        require(address(d.payoutPaths).code.length != 0, "mine: payout paths");
+        require(address(d.support.payoutPluginRegistry()) == address(d.registry), "mine: support registry");
+        require(address(d.controller.registry()) == address(d.registry), "mine: controller registry");
+        require(address(d.coldPaths.poolManager()) == address(p.poolManager), "mine: cold pool manager");
+        require(address(d.payoutPaths.poolManager()) == address(p.poolManager), "mine: payout pool manager");
+        require(address(d.coldPaths.revenueNFT()) == address(d.nft), "mine: cold revenue nft");
+        require(address(d.payoutPaths.revenueNFT()) == address(d.nft), "mine: payout revenue nft");
+        require(address(d.coldPaths.launchSupport()) == address(d.support), "mine: cold launch support");
+        require(address(d.payoutPaths.launchSupport()) == address(d.support), "mine: payout launch support");
+        require(d.coldPaths.protocolController() == address(d.controller), "mine: cold controller");
+        require(d.payoutPaths.protocolController() == address(d.controller), "mine: payout controller");
+        bytes32 templateHash = keccak256(abi.encode(template));
+        require(d.coldPaths.templateHash() == templateHash, "mine: cold template");
+        require(d.payoutPaths.templateHash() == templateHash, "mine: payout template");
+        require(d.controller.protocolRecipient() == p.protocolRecipient, "mine: protocol recipient");
+    }
+
     /// @notice Migration Plan step 3, mining half: the salt whose address encodes exactly the six flags.
     function mineHookSalt(Deployment memory d, DeployParams memory p, ProtocolTemplate memory template)
         internal
         view
         returns (address predicted, bytes32 salt)
     {
+        verifyMiningInputs(d, p, template);
         (predicted, salt) = HookMiner.find(
             p.create2Deployer, REQUIRED_FLAGS, type(MilestoneHook).creationCode, hookArgs(d, p, template)
         );
@@ -120,38 +189,114 @@ library LaunchpadDeploy {
         internal
         returns (Deployment memory d)
     {
+        _requireParams(p);
+
+        DeployInputs memory inputs = DeployInputs({p: p, template: template});
+        _deployCore(d, inputs);
+        _deployHook(d, inputs);
+        _bootstrapCanonicalComponents(d, inputs);
+    }
+
+    /// @dev The direct execution principal must own bootstrap administration while all deterministic setup
+    /// runs. Under `forge script --broadcast`, cheatcode interception emits each creation and call from the
+    /// configured broadcast signer. In the direct dry-run path no interception exists, so the contract that
+    /// issues CREATE2 is also the caller seen by the registry and controller.
+    function _requireParams(DeployParams memory p) private pure {
         require(address(p.poolManager) != address(0), "deploy: pool manager");
         require(p.create2Deployer != address(0), "deploy: create2 deployer");
+        require(p.bootstrapAdministrator != address(0), "deploy: bootstrap admin");
+        require(p.protocolAdmin != address(0), "deploy: protocol admin");
+        require(p.protocolRecipient != address(0), "deploy: protocol recipient");
+        if (p.selfIssuesCreate2) {
+            require(p.bootstrapAdministrator == p.create2Deployer, "deploy: bootstrap executor");
+        }
+    }
 
-        // --- Step 1: the revenue NFT and the launch-support helper ---
+    // Split in two purely for the Yul stack. Each satellite's creation bytecode is a large inline
+    // expression, and holding both alongside the governance deployments in one frame puts `via_ir` over
+    // its 16-slot limit. The split is not cosmetic: recombining these reintroduces a build failure.
+    function _deployCore(Deployment memory d, DeployInputs memory i) private {
+        _deployGovernance(d, i.p);
+        _deploySatellites(d, i);
+    }
+
+    /// @dev Bootstrap owns both governance contracts only long enough to complete deterministic setup.
+    function _deployGovernance(Deployment memory d, DeployParams memory p) private {
+        d.registry = new PayoutPluginRegistry(p.bootstrapAdministrator);
+        d.controller = new ProtocolController(p.bootstrapAdministrator, p.protocolRecipient, d.registry, address(0));
         d.nft = new RevenueNFT();
-        d.support = new LaunchSupport();
+        d.support = new LaunchSupport(d.registry);
+    }
 
-        // --- Step 2: the satellite, before the hook, because the hook's constructor rejects a
-        // codeless target and because its address is part of what the salt is mined against ---
-        d.coldPaths = new MilestoneColdPaths(p.poolManager, d.nft, d.support, template);
+    function _deploySatellites(Deployment memory d, DeployInputs memory i) private {
+        d.coldPaths = new MilestoneColdPaths(i.p.poolManager, d.nft, d.support, i.template, address(d.controller));
+        d.payoutPaths = new MilestonePayoutPaths(i.p.poolManager, d.nft, d.support, i.template, address(d.controller));
+    }
 
-        // --- Step 3: mine, then deploy the hook at the mined address ---
+    function _deployHook(Deployment memory d, DeployInputs memory i) private {
+        _mineAndCreateHook(d, i);
+        verifyImmutables(d, i.p, i.template);
+        _wireNftMinter(d);
+    }
+
+    /// @dev Mining and creation share one frame because the salt is only meaningful against the exact
+    /// initcode that follows it; wiring is deliberately outside, since it is the first irreversible step.
+    function _mineAndCreateHook(Deployment memory d, DeployInputs memory i) private {
         address predicted;
-        (predicted, d.hookSalt) = mineHookSalt(d, p, template);
-        d.hook = MilestoneHook(payable(_create2(p, d.hookSalt, hookInitcode(d, p, template))));
+        (predicted, d.hookSalt) = mineHookSalt(d, i.p, i.template);
+        d.hook = MilestoneHook(payable(_create2(i.p, d.hookSalt, hookInitcode(d, i.p, i.template))));
         require(address(d.hook) == predicted, "deploy: hook address mismatch");
-
-        // The flags again, now against the deployed contract's own declaration rather than against this
-        // library's constant. The pre-deployment check proves the address matches what we asked for; this
-        // proves what we asked for matches what the hook says it needs. Both run before any wiring.
         Hooks.validateHookPermissions(IHooks(address(d.hook)), d.hook.getHookPermissions());
+    }
 
-        // --- Step 4: the two halves agree, and the hook points at the satellite we just deployed ---
-        verifyImmutables(d, p, template);
-
-        // --- Step 5: wire the authorised minter and confirm the fee recipient ---
+    /// @dev {RevenueNFT.setMinter} is one-way, so it runs only after {verifyImmutables} has proved the
+    /// hook is the one this deployment intended.
+    function _wireNftMinter(Deployment memory d) private {
         d.nft.setMinter(address(d.hook));
         require(d.nft.minter() == address(d.hook), "deploy: minter not wired");
-        // The recipient is a constructor argument, so it is already set; {MilestoneHook.setProtocolRecipient}
-        // exists for later changes and is gated on the admin, who is not necessarily the deployer. Asserted
-        // rather than re-set, because a deployment that has to move it has already been mined wrong.
-        require(d.hook.protocolRecipient() == p.protocolRecipient, "deploy: recipient not set");
+    }
+
+    // Split three ways for the Yul stack: each `new` expression is a large inline initcode literal, and
+    // holding two of them alongside the deployment and parameter pointers overruns `via_ir`'s 16-slot
+    // window. Recombining these reintroduces a build failure, so the split is structural, not cosmetic.
+    function _bootstrapCanonicalComponents(Deployment memory d, DeployInputs memory i) private {
+        _deployCanonicalComponents(d, i.p);
+        _completeBootstrapWiring(d, i.p);
+        verifyConfiguration(d, i.p, i.template, false);
+    }
+
+    function _deployCanonicalComponents(Deployment memory d, DeployParams memory p) private {
+        d.buyback = new BuybackAndBurnPlugin(p.poolManager, address(d.hook), TickMath.MIN_SQRT_PRICE + 1);
+        d.helper = new SwapAndFlushHelper(p.poolManager, IPayoutFlusher(address(d.hook)));
+    }
+
+    /// @dev Bind the controller before handing it registry authority, then register the canonical entry
+    /// through the same typed, guard-aware governance path every later append uses. With the initial zero
+    /// delay the schedule and execution may share this bootstrap transaction, while operation identity still
+    /// binds the complete terms. The empty registry makes the resulting stable index deterministically zero.
+    function _completeBootstrapWiring(Deployment memory d, DeployParams memory p) private {
+        d.controller.bindTarget(address(d.hook));
+        d.registry.proposeAdministrator(address(d.controller));
+        d.controller.acceptRegistryAdministration();
+
+        d.controller.scheduleRegisterPlugin(
+            address(d.buyback),
+            CANONICAL_BUYBACK_TAKE_WAD,
+            CANONICAL_BUYBACK_GAS_LIMIT,
+            PluginRole.PAYOUT,
+            CANONICAL_BUYBACK_SALT
+        );
+        d.buybackIndex = d.controller.executeRegisterPlugin(
+            address(d.buyback),
+            CANONICAL_BUYBACK_TAKE_WAD,
+            CANONICAL_BUYBACK_GAS_LIMIT,
+            PluginRole.PAYOUT,
+            CANONICAL_BUYBACK_SALT
+        );
+        require(d.buybackIndex == 0, "deploy: canonical index");
+        d.canonicalPayoutPlan = uint256(1) << d.buybackIndex;
+
+        d.controller.proposeAdministrator(p.protocolAdmin);
     }
 
     /// @notice Migration Plan step 4. A mismatch here does not revert at deployment or at launch — it
@@ -172,16 +317,96 @@ library LaunchpadDeploy {
     {
         require(address(d.hook.poolManager()) == address(p.poolManager), "verify: hook pool manager");
         require(address(d.coldPaths.poolManager()) == address(p.poolManager), "verify: satellite pool manager");
+        require(address(d.payoutPaths.poolManager()) == address(p.poolManager), "verify: payout pool manager");
         require(address(d.hook.revenueNFT()) == address(d.nft), "verify: hook revenue nft");
         require(address(d.coldPaths.revenueNFT()) == address(d.nft), "verify: satellite revenue nft");
+        require(address(d.payoutPaths.revenueNFT()) == address(d.nft), "verify: payout revenue nft");
         require(address(d.hook.launchSupport()) == address(d.support), "verify: hook launch support");
         require(address(d.coldPaths.launchSupport()) == address(d.support), "verify: satellite launch support");
+        require(address(d.payoutPaths.launchSupport()) == address(d.support), "verify: payout launch support");
 
         require(d.hook.coldPaths() == address(d.coldPaths), "verify: coldPaths target");
+        require(d.hook.payoutPaths() == address(d.payoutPaths), "verify: payoutPaths target");
         require(d.hook.coldPaths().code.length != 0, "verify: satellite has no code");
+        require(d.hook.payoutPaths().code.length != 0, "verify: payout has no code");
+
+        require(address(d.support.payoutPluginRegistry()) == address(d.registry), "verify: support registry");
+        require(address(d.hook.payoutPluginRegistry()) == address(d.registry), "verify: hook registry");
+        require(address(d.coldPaths.payoutPluginRegistry()) == address(d.registry), "verify: cold registry");
+        require(address(d.payoutPaths.payoutPluginRegistry()) == address(d.registry), "verify: payout registry");
+        require(address(d.controller.registry()) == address(d.registry), "verify: controller registry");
 
         require(keccak256(abi.encode(d.hook.template())) == keccak256(abi.encode(template)), "verify: hook template");
-        require(d.hook.protocolAdmin() == p.protocolAdmin, "verify: protocol admin");
+        require(d.coldPaths.templateHash() == keccak256(abi.encode(template)), "verify: cold template");
+        require(d.payoutPaths.templateHash() == keccak256(abi.encode(template)), "verify: payout template");
+        require(d.hook.protocolController() == address(d.controller), "verify: protocol controller");
+        require(d.coldPaths.protocolController() == address(d.controller), "verify: cold controller");
+        require(d.payoutPaths.protocolController() == address(d.controller), "verify: payout controller");
+        require(d.hook.protocolRecipient() == p.protocolRecipient, "verify: protocol recipient");
+    }
+
+    function verifyConfiguration(
+        Deployment memory d,
+        DeployParams memory p,
+        ProtocolTemplate memory template,
+        bool administrationAccepted
+    ) internal view {
+        verifyImmutables(d, p, template);
+        require(address(d.controller.target()) == address(d.hook), "verify: controller target");
+        require(d.controller.protocolRecipient() == p.protocolRecipient, "verify: controller recipient");
+        require(d.controller.governanceDelay() == 0, "verify: governance delay");
+        require(d.registry.administrator() == address(d.controller), "verify: registry authority");
+        address expectedAdministrator = administrationAccepted ? p.protocolAdmin : p.bootstrapAdministrator;
+        address expectedPendingAdministrator = administrationAccepted ? address(0) : p.protocolAdmin;
+        require(d.controller.administrator() == expectedAdministrator, "verify: controller administrator");
+        require(d.controller.pendingAdministrator() == expectedPendingAdministrator, "verify: pending administrator");
+
+        EconomicConfig memory controllerConfig = d.controller.economicConfig();
+        EconomicConfig memory hookConfig = d.hook.economicConfig();
+        require(
+            keccak256(abi.encode(controllerConfig)) == keccak256(abi.encode(hookConfig)), "verify: economics parity"
+        );
+        require(
+            controllerConfig.harvestServiceFeeWad == Bounds.DEFAULT_HARVEST_SERVICE_FEE_WAD,
+            "verify: harvest service fee"
+        );
+        require(
+            controllerConfig.quoteCreatorShareWad == Bounds.DEFAULT_QUOTE_CREATOR_SHARE_WAD,
+            "verify: quote creator share"
+        );
+        require(
+            controllerConfig.tokenMilestoneFundShareWad == Bounds.DEFAULT_TOKEN_MILESTONE_FUND_SHARE_WAD,
+            "verify: token fund share"
+        );
+        require(controllerConfig.version == 1, "verify: economic version");
+        require(
+            d.controller.MAX_HARVEST_SERVICE_FEE_WAD() == Bounds.MAX_HARVEST_SERVICE_FEE_WAD, "verify: harvest fee cap"
+        );
+        require(
+            d.controller.MAX_QUOTE_CREATOR_SHARE_WAD() == Bounds.MAX_QUOTE_CREATOR_SHARE_WAD,
+            "verify: quote creator cap"
+        );
+        require(
+            d.controller.MAX_TOKEN_MILESTONE_FUND_SHARE_WAD() == Bounds.MAX_TOKEN_MILESTONE_FUND_SHARE_WAD,
+            "verify: token fund cap"
+        );
+
+        require(d.registry.entryCount() == 1, "verify: registry entry count");
+        require(d.buybackIndex == 0, "verify: canonical index");
+        require(d.canonicalPayoutPlan == uint256(1) << d.buybackIndex, "verify: canonical plan");
+        PluginEntry memory entry = d.registry.entry(d.buybackIndex);
+        require(entry.plugin == address(d.buyback), "verify: canonical plugin");
+        require(entry.takeWad == CANONICAL_BUYBACK_TAKE_WAD, "verify: canonical take");
+        require(entry.gasLimit == CANONICAL_BUYBACK_GAS_LIMIT, "verify: canonical gas");
+        require(entry.codeHash == address(d.buyback).codehash, "verify: canonical codehash");
+        require(entry.role == PluginRole.PAYOUT && !entry.suspended, "verify: canonical state");
+        require(d.registry.isSelectable(d.buybackIndex), "verify: canonical selectable");
+
+        require(address(d.buyback.poolManager()) == address(p.poolManager), "verify: buyback pool manager");
+        require(d.buyback.hook() == address(d.hook), "verify: buyback hook");
+        require(d.buyback.sqrtPriceLimitX96() == TickMath.MIN_SQRT_PRICE + 1, "verify: buyback limit");
+        require(address(d.helper.poolManager()) == address(p.poolManager), "verify: helper pool manager");
+        require(address(d.helper.hook()) == address(d.hook), "verify: helper hook");
     }
 
     /// @dev The two `CREATE2` issuers {HookMiner} distinguishes. Mining is done against

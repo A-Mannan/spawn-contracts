@@ -2,7 +2,7 @@
 pragma solidity 0.8.26;
 
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
-import {HarvestSplit, LaunchConfig} from "../types/LaunchTypes.sol";
+import {LaunchConfig} from "../types/LaunchTypes.sol";
 
 /// @title LaunchSignature
 /// @notice EIP-712 hashing, signer recovery, and CREATE2 salt derivation for signed-config launches.
@@ -38,13 +38,8 @@ library LaunchSignature {
     bytes32 private constant _DOMAIN_NAME_HASH = keccak256("MilestoneLaunchpad");
     bytes32 private constant _DOMAIN_VERSION_HASH = keccak256("1");
 
-    bytes32 private constant _HARVEST_SPLIT_TYPEHASH =
-        keccak256("HarvestSplit(uint64 creatorWad,uint64 buybackWad,uint64 protocolWad,uint64 lpWad)");
-
-    /// @dev EIP-712 requires referenced struct types to follow the primary type in alphabetical order,
-    /// which for a single reference means `HarvestSplit` is appended verbatim.
     bytes32 private constant _LAUNCH_CONFIG_TYPEHASH = keccak256(
-        "LaunchConfig(address creator,string name,string symbol,uint256 totalSupply,uint64 devBuyShareWad,uint32 devBuyVestingSeconds,HarvestSplit harvestSplit,uint256 deadline)HarvestSplit(uint64 creatorWad,uint64 buybackWad,uint64 protocolWad,uint64 lpWad)"
+        "LaunchConfig(address creator,string name,string symbol,uint256 totalSupply,uint64 devBuyShareWad,uint256 payoutPlan,uint256 deadline)"
     );
 
     /// @notice Thrown when a relayed launch arrives after its signature's deadline.
@@ -89,8 +84,7 @@ library LaunchSignature {
                 keccak256(bytes(config.symbol)),
                 config.totalSupply,
                 config.devBuyShareWad,
-                config.devBuyVestingSeconds,
-                harvestSplitHash(config.harvestSplit)
+                config.payoutPlan
             )
         );
     }
@@ -105,16 +99,9 @@ library LaunchSignature {
                 keccak256(bytes(config.symbol)),
                 config.totalSupply,
                 config.devBuyShareWad,
-                config.devBuyVestingSeconds,
-                harvestSplitHash(config.harvestSplit),
+                config.payoutPlan,
                 config.deadline
             )
-        );
-    }
-
-    function harvestSplitHash(HarvestSplit memory split) internal pure returns (bytes32) {
-        return keccak256(
-            abi.encode(_HARVEST_SPLIT_TYPEHASH, split.creatorWad, split.buybackWad, split.protocolWad, split.lpWad)
         );
     }
 

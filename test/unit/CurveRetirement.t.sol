@@ -73,7 +73,7 @@ contract CurveRetirementTest is LaunchpadTest {
         uint256 expectedProtocol = proceeds - lpSeed - expectedCreator;
 
         uint256 creator_ = hook.creatorClaimable(poolId);
-        uint256 protocol_ = hook.protocolClaimable(poolId);
+        uint256 protocol_ = hook.protocolClaimable();
 
         // Approximate in the specified direction. Each of the 32 burns rounds against the hook by up to a
         // wei, so the credits are dust-short of the balance rather than over it — dust the hook retains,
@@ -103,7 +103,7 @@ contract CurveRetirementTest is LaunchpadTest {
         assertLt(state.carriedInventory, curveSupply, "and is fee-scale, well under the curve's own share");
     }
 
-    // --- Scenario: Token inventory and curve token fees become ladder inventory ---
+    // --- Scenario (graduation): Curve tokens become ladder inventory ---
 
     /// @dev The reachable shape of this scenario. Graduation triggers at the far level and every curve
     /// position *ends* at the far level, so reaching it means the simulation crossed every start and the

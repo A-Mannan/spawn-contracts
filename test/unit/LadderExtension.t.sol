@@ -187,8 +187,8 @@ contract LadderExtensionTest is GraduatedFeeFixture {
     }
 
     /// @dev The point of the extension is that it produces *bands*, not a different instrument, so the
-    /// harvest path must treat one exactly as it treats a core band: same completion, same four-way split,
-    /// same pull-based credit.
+    /// harvest path must treat one exactly as it treats a core band: same completion, same gross
+    /// attribution, same service fee, same pot credit. Nothing about being fee-funded changes the routing.
     function test_aFeeFundedBandHarvestsAndRoutesLikeACoreBand() public {
         _exhaustCoreLadder();
         _accrue();
@@ -196,7 +196,9 @@ contract LadderExtensionTest is GraduatedFeeFixture {
         _buyInto(first);
 
         uint256 creatorBefore = hook.creatorClaimable(poolId);
-        uint256 protocolBefore = hook.protocolClaimable(poolId);
+        uint256 protocolBefore = hook.protocolClaimable();
+        uint256 backedBefore = hook.protocolClaimBacked();
+        uint256 potBefore = hook.payoutPot(poolId);
 
         vm.recordLogs();
         _buyToLevel(RUNUP_BUDGET, _bandUpper(first) + BEYOND);
@@ -208,19 +210,20 @@ contract LadderExtensionTest is GraduatedFeeFixture {
         assertTrue(hook.bandCompleted(poolId, first), "and recorded as completed");
         assertEq(hook.poolState(poolId).completedMilestones, 1, "one milestone, from a fee-funded band");
 
-        Routed memory r = _routedOf(logs, uint32(first));
+        Funded memory f = _fundedOf(logs, uint32(first));
+        assertEq(f.grossQuote, proceeds, "the gross funded is what the burn released");
+        assertEq(f.serviceFee + f.netQuote, f.grossQuote, "fee plus net is the whole gross");
         assertEq(
-            r.creatorAmount + r.buybackQuote + r.protocolAmount + r.lpAmount,
-            proceeds,
-            "the four shares account for every wei of the proceeds"
+            f.serviceFee,
+            (f.grossQuote * hook.economicConfig().harvestServiceFeeWad) / WAD,
+            "at the active service-fee percentage"
         );
-        assertEq(r.creatorAmount, (proceeds * template.defaultCreatorWad) / WAD, "creator share at its wad");
-        assertEq(r.protocolAmount, (proceeds * template.defaultProtocolWad) / WAD, "protocol share at its wad");
-        assertGt(r.buybackQuote, 0, "the buyback spent");
-        assertGt(r.tokensBurned, 0, "and burned what it bought");
+        assertEq(f.economicVersion, hook.economicConfig().version, "under the active configuration version");
 
-        assertEq(hook.creatorClaimable(poolId) - creatorBefore, r.creatorAmount, "credited, not pushed");
-        assertEq(hook.protocolClaimable(poolId) - protocolBefore, r.protocolAmount, "likewise the protocol");
+        assertEq(hook.payoutPot(poolId) - potBefore, f.netQuote, "the exact remainder reached this pool's pot");
+        assertEq(hook.protocolClaimable() - protocolBefore, f.serviceFee, "the fee reached the global ledger");
+        assertEq(hook.protocolClaimBacked() - backedBefore, f.serviceFee, "as a claim-backed subset");
+        assertEq(hook.creatorClaimable(poolId), creatorBefore, "and direct creator revenue is untouched");
     }
 
     function test_theExtensionContinuesBandAfterBand() public {
@@ -375,12 +378,11 @@ contract LadderExtensionTest is GraduatedFeeFixture {
 
     // --- Log decoding ---
 
-    struct Routed {
-        uint256 creatorAmount;
-        uint256 buybackQuote;
-        uint256 tokensBurned;
-        uint256 protocolAmount;
-        uint256 lpAmount;
+    struct Funded {
+        uint256 grossQuote;
+        uint256 serviceFee;
+        uint256 netQuote;
+        uint64 economicVersion;
     }
 
     /// @notice The level bounds the {MilestoneBase.BandDeployed} log for `index` reported.
@@ -404,15 +406,15 @@ contract LadderExtensionTest is GraduatedFeeFixture {
         revert("no MilestoneHarvested for index");
     }
 
-    /// @notice The {MilestoneBase.HarvestRouted} log for `index`.
-    function _routedOf(Vm.Log[] memory logs, uint32 index) private pure returns (Routed memory r) {
+    /// @notice The {MilestoneBase.PayoutPotFunded} log for `index`.
+    function _fundedOf(Vm.Log[] memory logs, uint32 index) private pure returns (Funded memory f) {
         for (uint256 i = 0; i < logs.length; i++) {
-            if (logs[i].topics[0] != MilestoneBase.HarvestRouted.selector) continue;
+            if (logs[i].topics[0] != MilestoneBase.PayoutPotFunded.selector) continue;
             if (uint32(uint256(logs[i].topics[2])) != index) continue;
-            (r.creatorAmount, r.buybackQuote, r.tokensBurned, r.protocolAmount, r.lpAmount) =
-                abi.decode(logs[i].data, (uint256, uint256, uint256, uint256, uint256));
-            return r;
+            (f.grossQuote, f.serviceFee, f.netQuote, f.economicVersion) =
+                abi.decode(logs[i].data, (uint256, uint256, uint256, uint64));
+            return f;
         }
-        revert("no HarvestRouted for index");
+        revert("no PayoutPotFunded for index");
     }
 }

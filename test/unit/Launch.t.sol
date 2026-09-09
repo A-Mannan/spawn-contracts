@@ -10,9 +10,15 @@ import {PoolId} from "v4-core/src/types/PoolId.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {MilestoneBase} from "../../src/MilestoneBase.sol";
 import {MilestoneToken} from "../../src/MilestoneToken.sol";
+import {IPayoutPlugin} from "../../src/interfaces/IPayoutPlugin.sol";
 import {LadderLib} from "../../src/libraries/LadderLib.sol";
 import {Bounds, LaunchConfig, Phase, WAD} from "../../src/types/LaunchTypes.sol";
+import {PluginRole} from "../../src/types/PayoutTypes.sol";
 import {LaunchpadTest} from "../Fixtures.sol";
+
+contract LaunchPayoutPlugin is IPayoutPlugin {
+    function onPayout(PoolId, address) external payable {}
+}
 
 /// @notice Unit tests for tasks 4.2 - 4.5: the launch entry point, its initialisation guard, NFT
 /// wiring, and event completeness.
@@ -67,7 +73,7 @@ contract LaunchTest is LaunchpadTest {
         assertEq(hook.poolState(id).ladderInventoryRemaining, expected, "the ladder share is reserved");
     }
 
-    // --- Scenario: Launch identity is unique per pool ---
+    // --- Scenario: Launch identity is isolated ---
 
     /// @dev Distinct pool ids and distinct creators are proved in `LaunchSignature.t.sol`. The half
     /// asserted here is isolation: no state of one launch is readable or mutable from the other.
@@ -81,7 +87,7 @@ contract LaunchTest is LaunchpadTest {
         assertEq(hook.poolState(b).curveDeployed, 1, "B holds only its genesis position");
     }
 
-    // --- Scenario: Full supply is held by the hook ---
+    // --- Scenario: Protocol initially receives the full minted supply ---
 
     /// @dev The scenario is written as "the hook's token balance equals the total supply", which is
     /// literally true only at token construction — `MilestoneToken.t.sol` asserts it there. By the time
@@ -108,24 +114,30 @@ contract LaunchTest is LaunchpadTest {
         assertGt(inPool, (perPosition * 99) / 100, "and draws all but dust of it");
     }
 
-    // --- Scenario: Pool uses a dynamic fee ---
+    // --- Scenario: Pool has no dynamic-fee flag ---
+    // --- Scenario: Pool uses static one percent ---
 
-    function test_poolUsesADynamicFee() public {
-        (, PoolKey memory k,) = _launchDirect(_freshConfig());
+    function test_poolUsesStaticOnePercentWithoutDynamicFlag() public {
+        (PoolId id, PoolKey memory k,) = _launchDirect(_freshConfig());
 
-        assertTrue(LPFeeLibrary.isDynamicFee(k.fee), "key carries the dynamic fee flag");
+        assertEq(k.fee, Bounds.TRADING_FEE_HUNDREDTHS_BIP, "static one percent key");
+        assertFalse(LPFeeLibrary.isDynamicFee(k.fee), "no dynamic fee flag");
+        assertEq(_baseFeeOf(id), Bounds.TRADING_FEE_HUNDREDTHS_BIP, "manager records one percent");
     }
 
-    /// @dev A dynamic-fee pool opens at fee 0, so the launch must push the template's base fee
-    /// explicitly. Nothing else does: the milestone step-down only ever lowers it from here.
-    function test_baseFeeIsSetAtLaunch() public {
-        (PoolId id,,) = _launchDirect(_freshConfig());
+    // --- Scenario: Pool is tradable at launch ---
 
-        assertEq(_baseFeeOf(id), template.baseFeeHundredthsBip, "base fee pushed to the template's");
-        assertEq(hook.poolState(id).baseFeeHundredthsBip, template.baseFeeHundredthsBip, "recorded base fee");
+    function test_poolIsTradableAtLaunch() public {
+        (PoolId id, PoolKey memory k, MilestoneToken t) = _launchDirect(_freshConfig());
+        uint256 before = t.balanceOf(address(router));
+
+        router.swapToLimit(k, true, -int256(1 ether), _sqrtAtLevel(_levelOf(id) + 50));
+
+        assertGt(t.balanceOf(address(router)), before, "launch liquidity serves an immediate buy");
+        assertTrue(hook.curvePositionDeployed(id, 0), "genesis position is live");
     }
 
-    // --- Scenario: Pool initialization is restricted to the launch path ---
+    // --- Scenario: Pool initialization is restricted ---
 
     function test_externalInitializeIsRejected() public {
         (, PoolKey memory k,) = _launchDirect(_freshConfig());
@@ -145,7 +157,7 @@ contract LaunchTest is LaunchpadTest {
         PoolKey memory forged = PoolKey({
             currency0: CurrencyLibrary.ADDRESS_ZERO,
             currency1: Currency.wrap(address(rogue)),
-            fee: LPFeeLibrary.DYNAMIC_FEE_FLAG,
+            fee: Bounds.TRADING_FEE_HUNDREDTHS_BIP,
             tickSpacing: Bounds.POOL_TICK_SPACING,
             hooks: IHooks(HOOK_ADDR)
         });
@@ -166,7 +178,7 @@ contract LaunchTest is LaunchpadTest {
 
         assertEq(nft.ownerOf(nft.tokenIdOf(id)), creator, "creator owns the stream");
         assertEq(hook.creatorClaimable(id), 0, "starts empty");
-        assertEq(hook.protocolClaimable(id), 0, "protocol starts empty");
+        assertEq(hook.protocolClaimable(), 0, "global protocol ledger starts empty");
     }
 
     // --- Scenario: Geometry is not configurable ---
@@ -188,6 +200,18 @@ contract LaunchTest is LaunchpadTest {
             (bool ok,) = HOOK_ADDR.call(abi.encodeWithSignature(sigs[i], raw, uint8(3)));
             assertFalse(ok, "configuration is immutable after launch");
         }
+    }
+
+    // --- Scenario: Harvest percentages are not configurable ---
+    // --- Scenario: Preset names are absent ---
+
+    function test_launchStoresOnlyTheExactPayoutPlan() public {
+        LaunchConfig memory config = _freshConfig();
+        config.payoutPlan = 0;
+        (PoolId id,,) = _launchDirect(config);
+
+        assertEq(hook.payoutPlan(id), config.payoutPlan, "exact bitset stored");
+        assertEq(hook.poolState(id).payoutPlan, config.payoutPlan, "no preset or percentage expansion");
     }
 
     // --- Scenario: Band ticks are computable by any observer ---

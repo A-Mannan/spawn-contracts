@@ -18,7 +18,9 @@ contract ProbeTest is LaunchpadTest {
         emit log_named_int("graduationLevel", s.graduationLevel);
         emit log_named_uint("fullRangeLiquidity", s.fullRangeLiquidity);
         emit log_named_uint("creatorClaimable", hook.creatorClaimable(poolId));
-        emit log_named_uint("protocolClaimable", hook.protocolClaimable(poolId));
+        emit log_named_uint("protocolClaimable", hook.protocolClaimable());
+        emit log_named_uint("payoutPot", hook.payoutPot(poolId));
+        emit log_named_uint("creatorPathClaimable", hook.creatorPathClaimable(poolId));
         emit log_named_uint("carriedInventory", s.carriedInventory);
         emit log_named_uint("ladderRemaining", s.ladderInventoryRemaining);
         emit log_named_uint("hookEth", HOOK_ADDR.balance);

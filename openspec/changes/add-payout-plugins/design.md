@@ -223,10 +223,17 @@ There is no deployed production state to migrate. Implementation replaces the pr
 3. Refactor the hot harvest and lifecycle fee/graduation paths, then run layout, lock, build, and size gates before adding plugin delivery.
 4. Implement `MilestonePayoutPaths`, dedicated pot redemption, exact aggregate liability accounting, global transient delivery guard, carry, creator-path claiming, ownership rechecks, and callback suppression; extend all delegatecall guard/layout checks.
 5. Implement the authenticated buyback-and-burn plugin and non-selectable swap-and-flush helper; add adversarial mocks and focused unit/invariant coverage.
-6. Deploy controller and registry with the intended multisig administrator and initial zero delay. Register protocol-authored components in deterministic order, including the buyback fixed take, and publish the canonical bitset.
-7. Deploy `RevenueNFT`, `LaunchSupport`, lifecycle satellite, and payout satellite with final immutable dependencies. Constructor arguments and satellite addresses are now fixed inputs to hook initcode.
-8. Mine a new hook salt only after all immutable addresses and template values are final; deploy the hook with exactly the six required callback flags and static-fee pool behavior.
-9. Verify hook/satellite template hashes and dependency addresses, controller/registry authority, economics defaults/caps, entry indices/roles/code hashes/gas limits, canonical plan, and recipient independence. Then wire the NFT minter and one-shot plugin hook authentication.
+6. Deploy controller and registry under a bootstrap administrator with initial zero delay. The final
+   intended multisig is proposed after deterministic setup and accepts directly on the controller.
+7. Deploy `RevenueNFT`, `LaunchSupport`, lifecycle satellite, and payout satellite with final immutable
+   dependencies. Constructor arguments and satellite addresses are now fixed inputs to hook initcode.
+8. Mine a new hook salt only after all immutable addresses and template values are final; deploy the hook
+   with exactly the six required callback flags and static-fee pool behavior.
+9. Bind the controller target, hand registry administration to it, and register protocol-authored
+   components in deterministic order through typed zero-delay operations, including the buyback fixed take.
+   Verify hook/satellite template hashes and dependency addresses, controller/registry authority,
+   economics defaults/caps, entry indices/roles/code hashes/gas limits, canonical plan, recipient
+   independence, and NFT minter wiring; then publish the canonical bitset.
 10. Run local deployment dry-run, complete Base-fork lifecycle/adversarial campaigns, and a public-testnet rehearsal before mainnet publication.
 
 **Rollback:** Contracts and registry entries are non-upgradeable, pool plans are immutable, and the hook has no runtime rollback. Before any production launch, rollback is redeployment with corrected contracts and a newly mined hook. After pools exist, they continue under their original hook and plan; a defective payout entry can be suspended to redirect its current and carried value to creators, but its code or terms cannot be replaced at the same index. A new implementation requires a new registry/hook deployment and frontends must stop creating pools on the old system.

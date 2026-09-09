@@ -6,36 +6,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Uniswap v4 hook launchpad for Base. Its differentiator is the **milestone ladder**: protocol-owned,
 one-sided sell-limit bands at ascending market-cap levels, JIT-deployed as price approaches them and
-harvested automatically when price crosses a band's top, with proceeds routed per launch config. One
-deployed hook serves every launch; per-launch state is keyed by `PoolId`.
+harvested automatically when price crosses a band's top. Harvests fund isolated payout pots that are
+later delivered through each launch's immutable registry-index plan. One deployed hook serves every
+launch; per-launch state is keyed by `PoolId`.
 
 Three documents are normative. Read the relevant parts before changing behaviour:
 
-- **`DESIGN.md`** — product design: mechanisms, the launch-parameter bounds table (§9), and the risk
-  register (§10). Source comments cite it by section.
-- **`openspec/changes/add-milestone-launchpad/design.md`** — numbered implementation **Decisions 1–22**
-  plus a Risks register. Source comments cite these by number ("design Decision 13"). Where reality
-  forced a change, the decision carries an in-place *revision note* rather than being rewritten — keep
-  that convention. Decisions 15–22 came out of a planning review and several rework earlier ones:
-  **22 supersedes 14 outright**, and 1, 4, 5, 8, 9, 14 and 19 carry revision notes. Read a decision to
-  its end before citing it. If an implementation reveals a design issue, amend this document; don't
-  silently narrow the behaviour.
-- **`openspec/changes/add-milestone-launchpad/specs/*/spec.md`** — requirements expressed as named
+- **`DESIGN.md`** — the current product design, economics, custody model, and risk register.
+- **`openspec/changes/add-payout-plugins/design.md`** — numbered implementation decisions for the
+  replacement generation. It supersedes conflicting legacy launchpad guidance.
+- **`openspec/changes/add-payout-plugins/specs/*/spec.md`** — requirements expressed as named
   `#### Scenario:` blocks. Those names are the contract with the test suite (see Testing).
 
-**`openspec/changes/add-milestone-launchpad/tasks.md` is the work ledger.** Each task names the exact
-scenarios it must cover. Mark a task `- [x]` only when it is implemented *and* a passing test exists for
-every scenario it names. **84 of 85 boxes are ticked.** Groups 1–13 and 15–20 are done, and so is 14.4:
-the release check passed and is recorded in `openspec/reports/release-check-g14.md` — 474 tests
-across the three layers (436 unit, 18 invariant, 20 fork), all six gates green, `MilestoneHook` at 21,561
-bytes with 3,015 to spare. The one open box is **14.3**, the public-testnet rehearsal: it needs
-`BASE_SEPOLIA_RPC_URL`, a funded deployer key and the six addresses `script/Deploy.s.sol` reads from the
-environment, so it cannot be run from a sandbox. The `openspec` CLI is on PATH and the `/opsx:*` slash
+**`openspec/changes/add-payout-plugins/tasks.md` is the current work ledger.** Mark a task `- [x]` only
+when its behavior is implemented and every scenario it names has literal passing evidence. Do not infer
+completion from an earlier generation's reports. Fork and public-testnet boxes stay open until their RPC,
+address, and funded-credential prerequisites exist. The `openspec` CLI is on PATH and the `/opsx:*`
 commands drive this workflow.
 
-Some tasks still name scenarios the planning review renamed or deleted. Where a task and a spec disagree
-**the spec wins** — the drift is in `tasks.md` and is tracked as an outstanding correction, not a licence
-to change a spec to match a task.
+If a task and a spec disagree, **the spec wins**. Treat task drift as a ledger defect to correct, never as
+permission to weaken a requirement.
 
 ## Commands
 
@@ -66,12 +56,11 @@ Four custom gates matter as much as the tests, and CI runs all of them on every 
 - **`make size`** — EIP-170 gate over `src/` only. The hook has crossed the 24 KB limit twice during
   development; this is the leading structural risk in `design.md`, which is why the gate runs
   continuously rather than at release. `make size-gate-selftest` proves the gate isn't passing vacuously.
-- **`make layout-check`** — asserts `MilestoneHook` and `MilestoneColdPaths` share one storage layout
-  slot-for-slot (both compared against `MilestoneBase`, not against each other), and that every
-  state-changing entry point on the satellite carries `onlyDelegated`. **Run this after touching state
-  variables or adding a satellite entry point.**
+- **`make layout-check`** — asserts `MilestoneHook`, `MilestoneColdPaths`, and `MilestonePayoutPaths`
+  match `MilestoneBase` slot-for-slot and that every state-changing satellite entry carries
+  `onlyDelegated`. **Run this after touching state variables or adding a satellite entry point.**
 - **`make lock-check`** — source-level assertion that no `modifyLiquidity` call site combines a negative
-  `liquidityDelta` with `FULL_RANGE_SALT`, in either half of the hook.
+  `liquidityDelta` with `FULL_RANGE_SALT` anywhere in the three-implementation architecture.
 - **`make pins`** — verifies `lib/v4-core @ 5f00c84` and `lib/v4-periphery @ 9628c36`.
 
 `via_ir = true` is load-bearing (it is what fits the hook under EIP-170), so a cold build takes minutes.
@@ -79,33 +68,32 @@ Budget for that; don't assume a fast edit-compile loop.
 
 ## Architecture
 
-### The hook is two contracts sharing one storage layout
+### The hook and two satellites share one storage layout
 
-`MilestoneBase` (abstract) declares **all** shared state, the whole event/error surface, and the
-settlement primitives. `MilestoneHook` (the mined-address hook, swap path, ladder, harvest, claims) and
-`MilestoneColdPaths` (launch, graduation, fee collection and routing) both inherit it. The hook reaches
-the satellite by `DELEGATECALL`, so the satellite executes in the hook's storage, as the hook's address,
-with the original `msg.sender`.
+`MilestoneBase` declares **all** shared mutable state, events, errors, settlement primitives, economics,
+and liability counters. `MilestoneHook` owns callbacks, the hot swap path, ladder harvesting, and public
+wrappers. `MilestoneColdPaths` owns launch, graduation, fee collection, and unlock dispatch.
+`MilestonePayoutPaths` owns pot redemption, isolated plugin delivery, carry retry, and creator-path
+claims. Both satellites execute by immutable `DELEGATECALL`, in the hook's storage and address, with the
+original `msg.sender`.
 
 Consequences you must respect:
 
-- **Never declare a state variable in either derived contract.** Add it to `MilestoneBase`. A drift
-  writes one variable over another with no revert and no event; `make layout-check` is the only thing
-  standing between that and silent corruption.
-- Satellite entry points need `onlyDelegated`. Its immutables resolve from its *own* bytecode even under
-  delegatecall, so it must be constructed with the same pool manager / NFT / launch support / template as
-  the hook. `templateHash()` exists on both halves precisely so a deployment gate can prove the two
-  templates match (Migration Plan step 4) — a mismatch is invisible at runtime, since neither half reads
-  the other's copy.
-- `coldPaths` is immutable on the hook, and the hook's address is mined against initcode that includes
-  it — so replacing launch logic means deploying and re-mining a new hook. There is no upgrade path
-  anywhere in v1; the only mutable protocol state is `protocolRecipient`.
-- The swap path deliberately stays in the hook: the ladder runs inside `beforeSwap`, and an extra
-  `DELEGATECALL` per swap is a cost every trader would pay.
+- **Never declare mutable state in the hook or either satellite.** Add it to `MilestoneBase`; silent slot
+  aliasing is otherwise possible.
+- Every state-changing satellite entry needs `onlyDelegated`. Construct both satellites with the same
+  PoolManager, RevenueNFT, LaunchSupport, template, and controller dependencies as the hook, then verify
+  immutable parity before deployment.
+- `coldPaths` and `payoutPaths` are immutable inputs to hook initcode. Replacing either requires a newly
+  mined hook; there is no upgrade path.
+- The swap path stays in the hook. Harvesting only retires a band, records gross attribution, snapshots
+  economics, and funds claim-backed liabilities. Redemption and untrusted delivery are always cold.
+- Global mutable protocol policy is limited to the versioned economic tuple, protocol recipient,
+  registry suspension/append operations, timelock delay, and two-step administrator transfer through the
+  typed `ProtocolController`.
 
-`LaunchSupport` (token deployment, EIP-712 digest, config validation) and the `src/libraries/*` are
-external/internal libraries **for bytecode reasons**, not layering aesthetics. Moving logic back inline
-can break `make size`.
+`LaunchSupport` and `src/libraries/*` remain external/internal helpers for bytecode reasons. Moving logic
+back inline can break `make size`.
 
 ### `level = -tick` is the protocol's only coordinate
 
@@ -119,15 +107,18 @@ wrong price. Keep new arithmetic in level space and convert only at the pool bou
 
 A single-sided sell band is therefore a range strictly *below* the current tick, holding only `currency1`.
 
-### Everything launch-shaped lives in one immutable template
+### Immutable template, signed plan, global economics
 
-Decision 16: band geometry, curve shape, supply split, graduation split, base fee, both fee step-downs,
-the milestone-fund share and the per-swap work caps are all fields of `ProtocolTemplate`, fixed at
-protocol deployment and copied into immutables. A launch chooses only its metadata, supply, dev buy
-(≤10% of supply, ≤365 days vesting) and harvest split. `Bounds.defaultTemplate()` is the canonical
-published set of numbers — no protocol code path reads it, so the deployment script and the test fixtures
-cannot drift from each other. The constructor sanity-checks the template (`InvalidTemplate`) rather than
-trusting it.
+Band geometry, curve shape, supply split, the 40/55/5 graduation split, literal 1% trading fee, and
+per-swap work caps live in `ProtocolTemplate` and are immutable across the generation. A launch chooses
+only creator, metadata, supply, an immediate dev buy of at most 10%, an exact registry-index bitset, and
+deadline. The bitset is signed and CREATE2-bound; at most eight active payout entries may be selected and
+their immutable takes may total at most `WAD`. The creator is the mandatory arithmetic remainder.
+
+The versioned global `EconomicConfig` separately controls prospective distribution: 10% default harvest
+service fee, 75% default quote-fee creator share, and 20% default token-fee milestone-fund share, under
+immutable 20%/90%/50% caps. Governance cannot change pool geometry, the trading fee, graduation split,
+plugin terms, or a launched pool's plan.
 
 ### Lifecycle
 
@@ -173,63 +164,81 @@ into `carriedInventory` and the next band draws on it. Skipping is the specified
 makes the straddle deadlock unreachable, since a band that could neither deploy nor skip would ask v4 for
 a two-sided mint and revert `beforeSwap`, bricking every buy.
 
-`afterSwap` harvests every live band whose top the swap carried the price past, up to
-`maxHarvestsPerSwap`, then routes each four ways (creator / buyback / protocol / LP per the launch's
-`harvestSplit`) and applies any fee step-down. Beyond the cap the remaining live bands stay live and
-settle on a later swap.
+`afterSwap` harvests every live band whose top the swap crossed, up to `maxHarvestsPerSwap`. Each
+harvest retires the band, records gross quote attribution, applies one global economics snapshot, credits
+the claim-backed protocol service-fee subset, and funds the source pool's claim-backed payout pot. It
+performs no plugin call, buyback, donation, redemption, or ETH transfer. Remaining live bands settle on
+a later swap.
 
-### Custody: real balances, except mid-swap
+### Custody and liability classes
 
-Decision 2 is direct custody — the hook holds real ERC20 and ETH. **Decision 13 is the exception that
-trips people up:** anything collected from the pool *while a swap is in flight* is minted as an ERC-6909
-claim (`poolManager.mint`), never `take`n. v4 collects a swapper's input after `swap` returns, so inside
-`afterSwap` the manager is short by exactly the amount of the swap in progress — and a band completes
-precisely when a buy has consumed its whole inventory, so the shortfall is guaranteed, not incidental.
-Debits raised in the same frame (buyback input, LP donation) are paid by *burning* that claim.
-`_ensureEth` redeems claims to real ETH lazily, opening its own unlock, and the pull-payment entry points
-call it before paying. So "hook custody" is backed by raw ETH or by a claim depending on where the value
-came from, and claimants must not have to tell them apart.
+A completed-band burn runs inside `afterSwap`, before the crossing swapper settles input. Its positive
+quote delta therefore becomes a PoolManager ERC-6909 native claim rather than raw ETH. That claim backs
+two explicit liabilities: the active harvest service fee's contribution to `_protocolClaimBacked` and
+the net `_payoutPot[poolId]`. A non-empty flush zeros and redeems exactly the complete pot through
+`REDEEM_PAYOUT_POT`; a global protocol claim separately redeems exactly `_protocolClaimBacked` through
+`REDEEM_PROTOCOL_BACKING`. Carry-only flushes redeem nothing.
 
-### One claim ledger per party, ETH only
+Plugin carry, creator-path entitlement, direct creator revenue, and the non-claim-backed portion of global
+protocol revenue are backed by raw ETH. Aggregate counters move with their component ledgers.
+`_assertSolvent` checks claim backing against pot plus protocol-claim liabilities and raw ETH against all
+raw-backed liabilities; no claim path may treat another class's backing as free balance. Ladder inventory
+and the permanently locked full-range principal are separate token/liquidity reserves.
 
-Decision 21: creators and the protocol are paid in ETH and nothing else. `_creatorClaimable` and
-`_protocolClaimable` are the only ledgers — there are no token ledgers, no token claim entry points and
-no token claim events. Token-denominated fees never reach a claimant; they build walls and liquidity
-(see Fees below). Every accrual — curve proceeds, swap fees, harvests — lands in the same quote ledger,
-tagged by `AccrualSource` for off-chain attribution only.
+### Payout plans, flush, and creator paths
 
-All accrual is **pull-based bookkeeping** — nothing is ever pushed to a creator or the protocol during
-settlement, which is what makes a harvest independent of whether the recipient reverts on receive.
-Creator claims are gated on current `RevenueNFT` ownership (`tokenId == PoolId`), so unclaimed balance
-follows the NFT on transfer.
+The append-only `PayoutPluginRegistry` has stable indices 0–255. Registered address, take, stipend, role,
+and code hash are immutable; suspension is reversible. New launches may select at most eight currently
+active `PAYOUT` entries whose takes total at most `WAD`. Delivery rechecks suspension and runtime code
+identity. An inactive or codehash-invalid entry is never called: its current share and complete carry are
+permanently redirected to creator-path entitlement.
 
-### Fees: one static base, stepped down by milestones
+Anyone may call `flush(poolId)`. A new pot pays a floor-1% tip to the immediate caller, then allocates the
+post-tip amount to selected entries in ascending index order. Each plugin receives plain ETH at
+`onPayout(PoolId,address)` under its immutable gas stipend; only the EVM call-success bit matters and all
+returndata is ignored. Failure preserves the complete attempted value as carry without blocking later
+entries. Empty pot plus empty carry is a no-op, and carry-only retry neither redeems nor tips. The creator
+receives the exact post-tip remainder and arithmetic dust as ledger credit rather than an arbitrary-flush
+push.
 
-Decision 20 removed the anti-snipe decay and with it every `beforeSwap` fee override — that callback now
-always returns a zero fee. What remains is a static base fee (template default 1%) and **two permanent
-step-downs**, applied by `updateDynamicLPFee` at the harvest that crosses a completion threshold (8
-completions → 0.5%, 16 → 0.25%). `DYNAMIC_FEE_FLAG` in `PoolKey.fee` is retained *solely* so those
-step-downs can act; the flag is not part of the hook address.
+`claimCreatorPath(poolId)` is distinct from `claimCreator(poolId)`. It snapshots the RevenueNFT holder,
+flushes first, retains the self-flush tip for the final payment, rechecks ownership after plugin
+interactions, and attempts the complete creator-path entitlement. Recipient rejection restores the whole
+amount and returns an explicit failure result. `claimCreator` remains the NFT-gated direct path for
+raw-backed graduation and quote-fee revenue. `claimProtocol` pays the single global ledger only to the
+independently configurable protocol recipient; administrator status grants no claim right.
 
-Fee collection is permissionless (`collectFees`) and routes **per currency**. The quote side splits 60 LP
-/ 30 creator / 10 protocol. The token side goes 20% to the milestone fund — the next band's inventory —
-and the rest to full-range compounding, with **nothing** reaching a claimant. Diversion happens only on
-the token side, because funding a band from quote would mean buying token, and the `milestone-ladder`
-requirement that inventory accrue "with no swap performed and no price impact" rules that out; past the
-ladder cap there is no next band, so the whole token amount compounds. The LP share that cannot be paired
-at spot is carried in `pendingLpQuote`/`pendingLpToken` to the next collection rather than discarded.
+### Static fees and token routing
 
-### Other cross-cutting mechanisms
+Every `PoolKey` carries the literal 1% fee for its complete lifetime. There is no dynamic-fee flag,
+fee-step state, callback override, or governance action for trading fees. Permissionless `collectFees`
+uses a zero-delta `modifyLiquidity` only to realize the full-range position's accrual; it never changes
+that position's liquidity.
 
-- **Transient locks** (`src/libraries/TransientLock.sol`, Decision 7) have two semantics on purpose:
-  `enter`/`exit` *reject* re-entry (external entry points, where concurrency is always a bug); `held`
-  lets the swap callbacks *suppress* their own work (reverting there would abort the very harvest that
-  opened the lock).
-- **Position salts** are deterministic and the three families are disjoint by construction:
-  `FULL_RANGE_SALT` (a hash), band salts (top bit set), curve salts (indices in the low bits). Recompute,
-  never store.
-- **Every manager interaction routes through `unlockCallback`** dispatching on `UnlockAction`
-  (`GENESIS`, `GRADUATE`, `REDEEM_QUOTE`, `COLLECT_FEES`); unrecognised values fail closed.
+One versioned global economics snapshot routes each collection. Quote fees accrue 75% by default to the
+pool's direct creator ledger and the exact remainder to global protocol revenue, under the immutable 90%
+creator-share cap. Token fees may fund still-available fee-funded extension capacity using the default
+20% share and immutable 50% cap; every token not admitted to that capacity burns immediately. At zero
+remaining capacity, 100% burns. Collected fees never add liquidity, and there is no LP carry.
+
+### Governance and other cross-cutting mechanisms
+
+- **Typed governance:** `ProtocolController` queues only plugin registration/suspension, complete economic
+  tuple replacement, protocol-recipient replacement, and delay replacement. Operation identity binds the
+  action, complete parameters, controller, chain, and salt. Readiness is captured using the delay active
+  at scheduling, including for delay changes. The initial delay is zero and administrator transfer is
+  propose/accept; operationally the administrator is the intended multisig.
+- **Transient locks:** pool-scoped concern locks reject concurrent lifecycle/claim settlement. One separate
+  protocol-global payout-delivery guard covers untrusted plugin calls, blocks custody, lifecycle, claims,
+  governance execution, and registry mutation across every pool, and makes nested PoolManager callbacks
+  suppress protocol work rather than reverting a reference plugin's swap.
+- **Position salts:** `FULL_RANGE_SALT`, top-bit band salts, and low-index curve salts are disjoint and
+  recomputed rather than stored.
+- **Unlock dispatch:** manager interactions fail closed through typed actions: `GENESIS`, `GRADUATE`,
+  `REDEEM_QUOTE`, `COLLECT_FEES`, `REDEEM_PAYOUT_POT`, and `REDEEM_PROTOCOL_BACKING`.
+- **Plugin gas:** the payout satellite uses the published 15,000 fixed-call overhead, 100,000 per remaining
+  call, 100,000 finalization reserve, 500,000 stipend cap, and exact EIP-150 margin preflight. Insufficient
+  outer gas reverts the whole flush; it is not recorded as plugin failure.
 
 ## Testing
 
@@ -248,18 +257,17 @@ Conventions to follow when adding tests:
   says so — `// --- <claim>: derived, no scenario of its own ---` — so the header set stays a faithful
   index of the specs.
 - **Inherit the shared fixture, don't rebuild it.** `test/Fixtures.sol` defines `LaunchpadTest`: it
-  deploys the manager, NFT, `LaunchSupport`, the satellite and the hook, launches a default pool, and
-  exposes `_launchDirect` / `_launchRelayed` / `_launchRelayedSignedBy` / `_sign` plus level helpers.
-  `test/HarnessFixtures.sol` defines `HarnessLaunchpadTest`, which is the same wiring with the harness
-  artifact at the hook address (it overrides `_hookArtifact()`; the address encodes the permission flags,
-  so a harness cannot simply be `new`ed elsewhere).
-  `test/fork/ForkFixtures.sol` defines `BaseForkTest` / `BaseForkHarnessTest`, the same wiring again with
-  the *live* Base singleton as the manager: the fork suites inherit those, never `LaunchpadTest` directly.
+  deploys the manager, registry, controller, NFT, `LaunchSupport`, both satellites, and the hook; completes
+  the required authority/bootstrap wiring; launches a default pool; and exposes launch/signature/level
+  helpers. `test/HarnessFixtures.sol` defines `HarnessLaunchpadTest`, which uses the harness artifact at the
+  permission-encoded hook address. `test/fork/ForkFixtures.sol` provides the corresponding Base singleton
+  fixtures; fork suites inherit those rather than the local-manager fixture.
 - The hook must live at an address encoding its permission flags:
   `address(uint160((uint160(0xBEEF) << 20) | 15040))`, placed with
-  `deployCodeTo("MilestoneHook.sol:MilestoneHook", ctorArgs, HOOK_ADDR)`. Deploy `MilestoneColdPaths`
-  first (the hook's constructor rejects a codeless satellite), then `nft.setMinter(HOOK_ADDR)`. The
-  fixture already does all of this — this is here for when you need to understand it, not repeat it.
+  `deployCodeTo("MilestoneHook.sol:MilestoneHook", ctorArgs, HOOK_ADDR)`. Deploy and configure the registry,
+  controller, `LaunchSupport`, lifecycle satellite, and payout satellite before mining final hook initcode;
+  then bind the controller target, complete registry authority, and set the NFT minter. Fixture/bootstrap
+  helpers own this ordering—do not reproduce a partial two-contract setup in individual suites.
 - `TestRouter` (`test/Fixtures.sol:32`) stands in for a third-party integrator, driving the plainest
   `unlock`/`swap`/`settle` sequence an integrator would write. `swapToLimit` is what you want for large
   buys — a plain `swap` runs the price to the extreme, because nothing provides liquidity above the far
@@ -267,9 +275,8 @@ Conventions to follow when adding tests:
 - `test/harness/MilestoneHookHarness.sol` exposes internals and adds test-only `UnlockAction`s
   **numbered from 200** so they cannot collide with production ones; `_dispatchUnlock` delegates anything
   below 200 to `super`.
-- The fixture launches at `t = 0` and records `launchTime`. There is no anti-snipe window to warp past
-  any more (Decision 20), but every warp should still be computed from `launchTime` — see the gotcha
-  below.
+- The fixture launches at `t = 0` and records `launchTime`. Compute every warp from that absolute origin;
+  see the timestamp-optimization gotcha below.
 
 ### Gotchas that have cost real debugging time
 
@@ -277,20 +284,29 @@ Conventions to follow when adding tests:
   calls in the same test function collapse into one warp. Compute every warp from the fixture's absolute
   `launchTime` instead. See `test/Fixtures.sol:189` and `test/unit/DevBuy.t.sol:238`.
 - **Which currency a fee lands in depends on swap direction.** A buy (`zeroForOne == true`) pays its fee
-  in ETH/`currency0`; a sell pays in token/`currency1`. Any test that measures a fee *rate* should do it on
-  the sell side, because the harvest's LP share arrives as a `donate` of `currency0` only and is
-  indistinguishable from quote-side swap fees. Collect once before a measured swap to zero the accrual.
+  in ETH/`currency0`; a sell pays in token/`currency1`. Collection routes those independently under one
+  economics snapshot, so measure quote-ledger and token-fund/burn effects against the matching direction.
 - **A zero-accrual `collectFees` emits nothing at all** — both early returns precede the `FeesCollected`
   emit. That absence is the observable form of "collection with zero accrual is a no-op".
-- **Rounding dust is specified, not a bug.** Conservation requirements are written as "up to rounding dust
-  retained by the hook". Dust accrues to the protocol side, never against a user, and there is no sweep
-  function in v1. Assert `assertGe`/approximate equality where the specs say dust, not exact equality.
-- **A harvest's token-side residue is not a leak.** It goes to `carriedInventory` for the next band, so
-  assert against that rather than expecting the hook's token balance to fall to zero.
-- **A price-limited buy stops one level *above* its limit.** v4 leaves a `zeroForOne` swap that crosses an
-  initialised tick at `tickNext - 1`, so `_buyToLevel(budget, L)` ends at `L` or `L + 1` depending on
-  whether the target's tick was initialised. Assert `assertGe(_level(), L)`, never `assertEq`.
-  `test/Fixtures.sol:_graduate()` says the same thing about the far level.
+- **Rounding destinations are explicit.** Quote-fee subtraction remainder is protocol revenue, payout-plan
+  remainder and plugin-allocation dust belong to the creator path, and token-fee residue burns. Assert the
+  exact integer formulas instead of applying one generic dust tolerance to every source.
+- **A harvest's token-side residue is not a leak.** It goes to `carriedInventory` for the next band. Its
+  quote side first becomes claim-backed service-fee and payout-pot liabilities; it is not raw ETH until an
+  exact redemption action runs.
+- **A price-limited buy may stop at its target level or one level above it.** When a `zeroForOne` swap
+  crosses an initialized tick, v4 leaves spot at `tickNext - 1`, so `_buyToLevel(budget, L)` can end at
+  level `L` or `L + 1`. Assert `assertGe(_level(), L)`, not exact equality.
+- **A plugin revert is a successful flush outcome.** Its full attempted value becomes carry and later
+  entries still run. Ordinary tip rejection and insufficient outer-gas preflight instead revert the whole
+  flush atomically; creator self-claim rejection restores entitlement and returns `success == false`.
+- **Carry-only retries do not redeem or tip.** Tests should distinguish a new-pot flush from retrying the
+  existing bitmap and should prove one pot causes one exact redemption.
+- **Codehash mismatch and suspension redirect, not carry.** Current share plus previous carry moves
+  permanently to creator-path entitlement without calling the destination; reactivation is prospective.
+- **Plugin-driven PoolManager callbacks are intentionally quiet.** While the global payout guard is held,
+  callback work suppression—not a callback revert—keeps a reference buyback from recursively graduating,
+  deploying, or harvesting.
 - **`using StateLibrary for IPoolManager` in `test/Fixtures.sol` is file-scoped** and does not reach an
   inheriting suite (the fixture notes this at line 312). A suite that must read the manager directly —
   `getSlot0`, `getPositionLiquidity` at raw ticks — declares its own `using` directive; the fixture's own

@@ -1,93 +1,95 @@
 # CHANGES — v2 (pre-deployment, breaking)
 
-Four coordinated changes, one generation (`add-payout-plugins`). Nothing is deployed, so
-typehash, CREATE2 and storage breaks are free. Behaviour only is specified here — naming,
-signatures and file layout are the implementer's call.
+`add-payout-plugins` replaces the original pre-deployment artifact set. No production state exists, so
+signed-data, CREATE2, storage-layout, and deployment changes require a new mined hook rather than a
+migration.
 
-## 1. Payout plugins (milestone proceeds)
+## 1. Immutable payout plans
 
-Replace the hardcoded post-harvest split with a signed, immutable **payout plan** per launch:
+Each launch signs one exact `uint256 payoutPlan`. Set bits select stable indices in the append-only
+`PayoutPluginRegistry`; a plan may enable at most eight active `PAYOUT` entries and their fixed takes
+must sum to at most `WAD`. Plugin addresses, takes, gas limits, roles, and registered code hashes never
+change. Suspension is reversible, but a suspended or codehash-invalid destination redirects its current
+share and existing carry permanently to the creator path.
 
-- The plan is a **bitset, not percentages**: each registered plugin carries a fixed take; the
-  creator only chooses which are enabled. Enabled takes must total ≤100%; the **remainder
-  always goes to the creator**. Creator payout is the implicit sink, always on — untick
-  everything and the creator keeps 100% of the pot. The plan is salt-bound into the token
-  address and can never change. Per-launch free-form splits disappear.
-- The protocol service fee (template %) is taken natively at harvest into a **single global
-  protocol ledger** (one pool-agnostic claim path). The remainder accrues to a **per-pool pot**
-  (ETH-backed claims; mid-swap custody rules unchanged).
+The creator is the mandatory implicit remainder sink. An empty plan pays the creator 100%; arithmetic
+dust also belongs to the creator. Preset names are offchain only and do not participate in launch
+identity. The canonical plan selects buyback-and-burn with take `floor(2 * WAD / 9)`.
 
-**Delivery — permissionless flush, always cold, own unlock**: redeem the whole pot to ETH once,
-pay the caller a **flat template tip** (fixed %, no decay curve), then walk the plan. Plugins
-are called one at a time, gas-stipended, in try/catch — a failing plugin never blocks the
-others; its share **carries** to the next flush. Plugins receive plain ETH. No payout work ever
-runs inside a swap callback: delivery can bounce mid-swap, plugins need their own unlock,
-traders would conscript gas, and settlement must stay a side effect of swaps, never a
-precondition. Liveness: the tip, the creator's self-flushing payout path, and a swap-time flush
-helper.
+## 2. Harvest pots and asynchronous delivery
 
-**Creator money**: curve proceeds and the swap-fee share stay claimable directly from the hook's
-per-pool ledger — no flush involved. The pot share is paid by the creator-payout plugin, whose
-payout entry **flushes first, then pays**, with the tip passed back to whoever flushed — a
-creator claiming for themselves loses nothing. Multi-pool batching is an offchain multicall
-concern; the protocol ships no batch entry points.
+A completed milestone records gross quote proceeds, takes the active harvest service fee (10% by
+default), credits that fee to the single global protocol ledger, and credits the net amount to the
+source pool's payout pot. Both values remain backed by PoolManager quote claims while the crossing swap
+is in flight. Harvesting performs no destination call, buyback, donation, or ETH transfer.
 
-**Accounting**: harvest events record milestone index and gross amount — the attribution record
-for indexers. Plan shares apply **net of tip**; flush and plugin-ledger events carry settlement
-truth. On-chain per-milestone (tranche) accounting is deferred to the first plugin that needs
-per-milestone delivery — no history is lost, since plans are frozen at launch and such a plugin
-can only appear in plans created after it ships.
+Any address may later `flush(poolId)`. A non-empty flush redeems the complete new pot exactly once,
+pays the caller 1% of that net pot, and walks selected plugins in ascending index order. Carry-only
+flushes perform no redemption or additional tip. Plugin calls receive plain ETH through the fixed
+`onPayout(PoolId,address)` callback, use immutable gas stipends with an EIP-150 reserve preflight, and
+succeed solely from the EVM call-success bit; returndata is ignored.
 
-**Reference plugins** (protocol-authored, registered in the plugin registry): buyback-and-burn; LP
-compounding into in-range liquidity; creator payouts on demand; a same-transaction flush helper
-for opted-in swappers.
+A failed or gas-exhausting plugin preserves its complete attempted value as carry without blocking
+later entries. Creator value is recorded rather than pushed during arbitrary flushes. The RevenueNFT
+holder's `claimCreatorPath(poolId)` flushes first, retains the self-flush tip for the final payment,
+rechecks ownership after plugin interactions, and restores the complete entitlement if the recipient
+rejects ETH.
 
-## 2. Fee: flat 1% forever
+One protocol-global transient payout guard blocks same-pool and cross-pool reentry into custody,
+lifecycle, claims, governance execution, and registry mutation. Nested PoolManager callbacks suppress
+protocol work rather than reverting the reference buyback's swap.
 
-Delete both step-downs. The fee is the template's static base (1%) for the pool's lifetime: no
-dynamic-fee flag in the pool key, no step logic, no step events, no per-pool mutable fee.
+## 3. Explicit custody classes
 
-## 3. Remove dev buy vesting
+Payout pots and the claim-backed subset of global protocol revenue are backed by PoolManager quote
+claims. Plugin carry, creator-path entitlement, direct creator claims, and non-claim-backed protocol
+revenue are backed by raw ETH. Aggregate counters track every liability class, and exact redemption
+actions prevent creator or protocol claims from consuming pot, carry, ladder-inventory, or locked-LP
+reserves.
 
-The dev buy (still ≤10% of supply) executes **fully at launch**. Delete the vesting config
-field, all vesting state and math, the release entry point, and its bound.
+Direct creator revenue remains per pool and follows current RevenueNFT ownership. Protocol revenue is
+one global ledger paid only to the independently configurable protocol recipient. The administrator has
+no implicit claim right.
 
-## 4. Token fees: 80% burn, 20% milestone fund
+## 4. Global economics and governance
 
-The token side of fee routing becomes 80% burned (hook takes custody and burns — cold path) and
-20% milestone fund (diversion unchanged, only within ladder cap). Past the cap: 100% burn
-(confirm). Token-side full-range compounding disappears; audit the token-side carry for dead
-state (quote-side carry unaffected).
+The active versioned economic tuple contains:
 
-## Cross-cutting
+- harvest service fee: 10% default, immutable 20% cap;
+- quote-fee creator share: 75% default, immutable 90% cap; the protocol receives the remainder;
+- token-fee milestone-fund share: 20% default, immutable 50% cap; excess tokens burn.
 
-- **Plugin registry instead of a baked whitelist**: an append-only registry of plugins and
-  their fixed takes, referenced by the hook through a single immutable address. **Adding a
-  plugin is a registry entry — no new template, no re-mined hook, no new generation.**
-  Entries are never removed or reordered — plans index positions, so shifting them would
-  redirect existing pools to the wrong plugin — but a plugin can be **suspended**: new plans
-  cannot enable it, and a suspended plugin's share reverts to the creator remainder.
-  Addresses and takes never change after registration, so a signed plan keeps its meaning
-  forever. Word size caps the registry at 256 plugins. A canonical default bitset mirrors
-  today's routing, pinned as an equivalence test.
-- **Presets are offchain-only**: named default bitsets ("classic", "buyback-max", …) live in
-  docs/frontend. Signatures bind the bitset, never the preset name.
-- **Gates**: expect the hook to shrink (size); layout gate (all new state in the shared base);
-  full release check.
-- **Specs** (openspec `add-payout-plugins`): deltas to `milestone-ladder`, `revenue-claims`
-  (global protocol ledger), `swap-fees` (flat fee), `token-launch` (plan, no vesting); new
-  `payout-plugins` capability (immutability, flush liveness, stipend, carry, tip, pot
-  isolation, drain protection, bitset plan, remainder-to-creator).
-- **Tests**: rework the fee-step, dev-buy-vesting and harvest-routing suites.
+Updates apply prospectively to every pool and snapshot once per harvest or fee collection. The trading
+fee and 40/55/5 graduation split remain immutable. `ProtocolController` exposes only typed delayed
+operations, binds operation identity to complete parameters/controller/chain/salt, starts with a
+zero-second delay, and uses the old delay for queued delay changes. Administrator transfer is two-step;
+administrator and protocol recipient remain independent.
 
-## Follow-up generations (not this change)
+## 5. Static fees, immediate dev buy, and no compounding
 
-1. **Lottery plugin** (hold: per-pool pot, snapshot → merkle → pull claims).
-2. **Community-gated creator pay** (hold: per-milestone tranches delivered via plugin metadata;
-   majority vote per tranche; offchain snapshot + optimistic challenge). Ships the tranche
-   ledger with it.
+Every pool uses a literal 1% Uniswap v4 fee for its complete lifetime. There is no dynamic-fee flag,
+fee-step state, or governance path for the trading fee.
 
-## Open questions
+The optional creator dev buy remains capped at 10% of supply, executes completely during a creator-direct
+launch, and transfers tokens immediately. Relayed launches cannot execute it. No vesting state or release
+entry point remains.
 
-1. Past the ladder cap, token fees burn 100% — confirm.
-2. Flat tip percentage (~1%?) — a template value, picked at deployment.
+Quote fees split 75% to direct creator revenue and 25% to global protocol revenue under the active
+economic tuple. Token fees fund still-available extension capacity up to the active percentage and burn
+the remainder; at the cap they burn entirely. Collected fees never add full-range liquidity, and no LP
+fee carry exists. Graduation alone seeds the immutable 40% quote / 10% supply full-range position, which
+remains code-locked forever.
+
+## 6. Deployment and verification
+
+`MilestoneHook`, `MilestoneColdPaths`, and `MilestonePayoutPaths` share only `MilestoneBase` mutable
+storage. Both satellites are immutable delegatecall targets and must match the hook's PoolManager,
+RevenueNFT, LaunchSupport, controller, registry, and template dependencies. Deployment creates the
+registry, controller, NFT, support, and satellites first, finalizes every immutable address, then mines
+and deploys a new hook. Bootstrap then binds the controller, hands registry authority to it, registers the
+canonical buyback through a zero-delay typed operation, wires the NFT minter, and proposes the operational
+multisig. That exact pending multisig must call the controller directly to accept administration.
+
+Required evidence includes formatting, compilation, pins, EIP-170 size, storage-layout and delegated-entry
+guards, full-range lock checks, literal OpenSpec scenario coverage, unit/invariant/fork suites where an
+RPC is available, and the release gate. Public-testnet rehearsal remains environment-dependent.

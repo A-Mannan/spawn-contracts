@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {BaseHook} from "v4-periphery/src/utils/BaseHook.sol";
+import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {BitMath} from "v4-core/src/libraries/BitMath.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
@@ -9,21 +10,22 @@ import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.s
 import {Position} from "v4-core/src/libraries/Position.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {BalanceDelta, BalanceDeltaLibrary} from "v4-core/src/types/BalanceDelta.sol";
+import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/src/types/BeforeSwapDelta.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {MilestoneBase} from "./MilestoneBase.sol";
 import {MilestoneColdPaths} from "./MilestoneColdPaths.sol";
-import {MilestoneToken} from "./MilestoneToken.sol";
+import {MilestonePayoutPaths} from "./MilestonePayoutPaths.sol";
 import {RevenueNFT} from "./RevenueNFT.sol";
 import {LaunchSupport} from "./LaunchSupport.sol";
 import {CurveLib} from "./libraries/CurveLib.sol";
-import {FeeLib} from "./libraries/FeeLib.sol";
 import {LadderLib} from "./libraries/LadderLib.sol";
 import {Orientation} from "./libraries/Orientation.sol";
 import {TransientLock} from "./libraries/TransientLock.sol";
-import {HarvestSplit, LaunchConfig, Phase, PoolState, ProtocolTemplate, WAD} from "./types/LaunchTypes.sol";
+import {LaunchConfig, Phase, PoolState, ProtocolTemplate, Bounds} from "./types/LaunchTypes.sol";
+import {EconomicConfig} from "./types/PayoutTypes.sol";
 
 /// @title MilestoneHook
 /// @notice The protocol core: one deployed hook serving every launch, holding per-pool state keyed by
@@ -56,13 +58,6 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
 
-    /// @dev Price limit for the harvest buyback: the lowest value `swap` accepts, so an exact-input buy
-    /// is bounded by its budget rather than by a price. See {_buyBackAndBurn}.
-    uint160 private constant _BUYBACK_PRICE_LIMIT = TickMath.MIN_SQRT_PRICE + 1;
-
-    /// @notice Address permitted to change {protocolRecipient}. Set at construction, never changed.
-    address public immutable protocolAdmin;
-
     /// @notice The delegatecall target holding the launch, graduation, and fee-collection paths.
     ///
     /// @dev Immutable, so the split cannot become an upgrade hatch: Decision 10's "the only mutable
@@ -70,25 +65,29 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
     /// deploying a new hook at a newly mined address, exactly as changing any other logic would.
     address public immutable coldPaths;
 
+    /// @notice Delegatecall target for asynchronous payout-pot settlement.
+    address public immutable payoutPaths;
+
     constructor(
         IPoolManager poolManager_,
         RevenueNFT revenueNft_,
         LaunchSupport launchSupport_,
         ProtocolTemplate memory template_,
         address coldPaths_,
-        address protocolAdmin_,
+        address payoutPaths_,
+        address protocolController_,
         address protocolRecipient_
-    ) BaseHook(poolManager_) MilestoneBase(revenueNft_, launchSupport_, template_) {
-        if (protocolAdmin_ == address(0)) revert ZeroAddress();
+    ) BaseHook(poolManager_) MilestoneBase(revenueNft_, launchSupport_, template_, protocolController_) {
         if (protocolRecipient_ == address(0)) revert ZeroAddress();
 
         // A `DELEGATECALL` to an address with no code succeeds and returns nothing, so an unset or
         // mistyped target would surface as a launch that silently does nothing rather than as a failed
         // deployment. Checked here, once, where it is cheap.
         if (coldPaths_.code.length == 0) revert NotAContract(coldPaths_);
+        if (payoutPaths_.code.length == 0) revert NotAContract(payoutPaths_);
 
         coldPaths = coldPaths_;
-        protocolAdmin = protocolAdmin_;
+        payoutPaths = payoutPaths_;
         protocolRecipient = protocolRecipient_;
     }
 
@@ -96,13 +95,12 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
     /// @dev Exactly the flag set the `token-launch` spec requires, and nothing more. Notably absent:
     /// - `afterAddLiquidity` / `afterRemoveLiquidity`: the before-guards already reject every
     ///   non-hook liquidity operation, so an after-callback would only add surface.
-    /// - donate callbacks: the protocol never observes donations, only makes them.
+    /// - donation callbacks: the protocol has no donation path and does not observe third-party donations.
     /// - the four return-delta flags: settlement goes through `take`/`settle`/claims, so the hook never
     ///   rewrites a swap's deltas.
     ///
-    /// The dynamic fee is *not* encoded here — it lives in `PoolKey.fee` as
-    /// `LPFeeLibrary.DYNAMIC_FEE_FLAG`, not in the hook address. It is retained solely for the
-    /// milestone step-down (Decision 20).
+    /// Pool fees are not encoded in the hook address. Every launched `PoolKey` uses the immutable
+    /// literal 1% fee and no dynamic-fee capability.
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
             beforeInitialize: true,
@@ -124,12 +122,17 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
 
     // --- Protocol administration: the entire privileged surface (Decision 10) ---
 
-    /// @notice Updates the protocol fee recipient.
-    /// @dev Deliberately cannot reach pool liquidity, ladder inventory, launch configuration, or any
-    /// creator balance. Already-accrued protocol balances stay claimable by the new recipient, which
-    /// is the same current-holder rule the creator NFT uses.
+    /// @notice Atomically replaces the complete economic tuple.
+    function setEconomicConfig(EconomicConfig calldata config) external {
+        TransientLock.requireNoPayoutDelivery();
+        if (msg.sender != protocolController) revert NotProtocolController();
+        _setEconomicConfig(config);
+    }
+
+    /// @notice Updates the recipient of the global protocol ledger.
     function setProtocolRecipient(address recipient) external {
-        if (msg.sender != protocolAdmin) revert NotProtocolAdmin();
+        TransientLock.requireNoPayoutDelivery();
+        if (msg.sender != protocolController) revert NotProtocolController();
         if (recipient == address(0)) revert ZeroAddress();
 
         protocolRecipient = recipient;
@@ -138,8 +141,8 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
 
     // --- Claim entry points ---
     //
-    // Both are quote-denominated, and that is the whole ledger (Decision 21): token-denominated fees are
-    // routed to the milestone fund and to full-range compounding, so no claimant ever holds one.
+    // Both are quote-denominated. Token-denominated fees fund the next usable milestone and burn the
+    // remainder, so no claimant ever holds one.
 
     /// @notice Claims the creator's accrued ETH for a pool, payable to the current revenue NFT holder.
     ///
@@ -150,6 +153,7 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
     /// The balance is zeroed *before* the transfer, so even a recipient that re-enters finds nothing
     /// left to claim. The transient lock is belt-and-braces on top of that ordering.
     function claimCreator(PoolId poolId) external returns (uint256 amount) {
+        TransientLock.requireNoPayoutDelivery();
         TransientLock.enter(TransientLock.CLAIM, poolId);
 
         address holder = revenueNFT.ownerOf(revenueNFT.tokenIdOf(poolId));
@@ -158,8 +162,10 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
         amount = _creatorClaimable[poolId];
         if (amount != 0) {
             _creatorClaimable[poolId] = 0;
-            _ensureEth(amount);
+            _totalCreatorLiability -= amount;
+            _ensureDirectCreatorEth(amount);
             _sendEth(holder, amount);
+            _assertSolvent();
         }
 
         emit CreatorClaimed(poolId, holder, amount);
@@ -167,23 +173,26 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
         TransientLock.exit(TransientLock.CLAIM, poolId);
     }
 
-    /// @notice Claims the protocol's accrued ETH for a pool, payable to {protocolRecipient}.
-    function claimProtocol(PoolId poolId) external returns (uint256 amount) {
-        TransientLock.enter(TransientLock.CLAIM, poolId);
+    /// @notice Claims the complete global protocol ETH ledger to {protocolRecipient}.
+    function claimProtocol() external returns (uint256 amount) {
+        TransientLock.requireNoPayoutDelivery();
 
         address recipient = protocolRecipient;
         if (msg.sender != recipient) revert NotProtocolRecipient(msg.sender);
 
-        amount = _protocolClaimable[poolId];
+        amount = _protocolClaimable;
+        uint256 claimBacked = _protocolClaimBacked;
         if (amount != 0) {
-            _protocolClaimable[poolId] = 0;
-            _ensureEth(amount);
+            _protocolClaimable = 0;
+            _protocolClaimBacked = 0;
+            if (claimBacked != 0) {
+                poolManager.unlock(abi.encode(uint8(UnlockAction.REDEEM_PROTOCOL_BACKING), claimBacked));
+            }
             _sendEth(recipient, amount);
+            _assertSolvent();
         }
 
-        emit ProtocolClaimed(poolId, recipient, amount);
-
-        TransientLock.exit(TransientLock.CLAIM, poolId);
+        emit ProtocolClaimed(recipient, amount);
     }
 
     /// @notice Entry point the manager calls back into while unlocked.
@@ -244,6 +253,42 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
         return ret;
     }
 
+    function _delegatePayoutPathCall(bytes memory payload) private returns (bytes memory) {
+        (bool ok, bytes memory ret) = payoutPaths.delegatecall(payload);
+        if (!ok) {
+            assembly ("memory-safe") {
+                revert(add(ret, 0x20), mload(ret))
+            }
+        }
+        return ret;
+    }
+
+    /// @notice Delivers the complete payout pot and retries carry without touching the swap path.
+    function flush(PoolId poolId) external {
+        _delegatePayoutPathCall(abi.encodeCall(MilestonePayoutPaths.flush, (poolId)));
+    }
+
+    /// @notice Flushes first and then claims creator-path entitlement for the current NFT holder.
+    function claimCreatorPath(PoolId poolId) external returns (bool success, uint256 attemptedAmount) {
+        (success, attemptedAmount) = abi.decode(
+            _delegatePayoutPathCall(abi.encodeCall(MilestonePayoutPaths.claimCreatorPath, (poolId))), (bool, uint256)
+        );
+    }
+
+    /// @notice Source pool identity consumed by authenticated payout plugins.
+    function payoutPool(PoolId poolId) external view returns (PoolKey memory key, address token) {
+        PoolState storage state = _pools[poolId];
+        if (state.phase == Phase.NONE) revert NotInBondingCurvePhase(poolId, Phase.NONE);
+        token = state.token;
+        key = PoolKey({
+            currency0: CurrencyLibrary.ADDRESS_ZERO,
+            currency1: Currency.wrap(token),
+            fee: tradingFeeHundredthsBip,
+            tickSpacing: Bounds.POOL_TICK_SPACING,
+            hooks: IHooks(address(this))
+        });
+    }
+
     // --- Launch (design Decision 19) ---
 
     /// @notice Launches a token from a creator-signed configuration. Anyone may relay it.
@@ -300,47 +345,6 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
         _delegateColdPath();
     }
 
-    // --- Dev buy vesting ---
-
-    /// @notice Releases whatever dev-buy tokens have vested to the creator.
-    ///
-    /// @dev Linear over the configured duration, measured from launch. The tokens stay in hook custody
-    /// until released, so a vesting creator holds no transferable balance early. Creator-only: the
-    /// schedule exists to bind the creator, so letting anyone else trigger it would be harmless but
-    /// letting anyone else *receive* it would not, and gating the caller keeps the two inseparable.
-    ///
-    /// The creator here is the launch's recorded creator — the recovered signer of a relayed launch —
-    /// never the relayer.
-    function releaseDevBuy(PoolId poolId) external returns (uint256 amount) {
-        PoolState storage state = _pools[poolId];
-        if (msg.sender != state.creator) revert NotCreator(poolId, msg.sender);
-
-        amount = releasableDevBuy(poolId);
-        if (amount == 0) return 0;
-
-        state.devBuyReleased += amount;
-        MilestoneToken(state.token).transfer(state.creator, amount);
-
-        emit DevBuyReleased(poolId, state.creator, amount);
-    }
-
-    /// @notice Dev-buy tokens vested and not yet released.
-    function releasableDevBuy(PoolId poolId) public view returns (uint256) {
-        PoolState storage state = _pools[poolId];
-        if (state.devBuyTotal == 0) return 0;
-
-        uint32 duration = state.devBuyVestingSeconds;
-        uint256 vested;
-
-        if (duration == 0 || block.timestamp >= uint256(state.launchedAt) + duration) {
-            vested = state.devBuyTotal;
-        } else {
-            vested = (state.devBuyTotal * (block.timestamp - state.launchedAt)) / duration;
-        }
-
-        return vested - state.devBuyReleased;
-    }
-
     // --- Hook callbacks ---
 
     /// @inheritdoc BaseHook
@@ -364,10 +368,9 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
     }
 
     /// @inheritdoc BaseHook
-    /// @dev Three jobs, in order: close the graduation limbo if the price has left the curve behind
-    /// (Decision 18), then mint every position this swap's own price path will reach (Decision 15).
-    /// There is no third — Decision 20 removed the anti-snipe override, so the returned fee is always
-    /// "no override" and the pool charges its stored base fee.
+    /// @dev Two jobs, in order: close the graduation limbo if the price has left the curve behind, then
+    /// mint every position this swap's own price path will reach. The hook never overrides the fee; the
+    /// pool charges its literal static 1% fee for the complete lifecycle.
     ///
     /// Deployment happens here rather than in `afterSwap` for one reason: it must be *this* swap that
     /// fills what is minted. v4 reads the pool's liquidity after `beforeSwap` returns, so a position
@@ -391,7 +394,7 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
 
         // Nothing to do for a pool that is not ours, and nothing to do while one of the protocol's own
         // settlement paths is mid-flight (Decision 7).
-        if (phase != Phase.NONE && !TransientLock.settlementInFlight(poolId)) {
+        if (phase != Phase.NONE && !TransientLock.callbackWorkSuppressed(poolId)) {
             if (phase == Phase.BONDING_CURVE && _currentLevel(poolId) >= state.farLevel) {
                 _delegateColdPathCall(abi.encodeCall(MilestoneColdPaths.graduateWhileUnlocked, (key)));
                 phase = Phase.GRADUATED;
@@ -499,7 +502,7 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
             sqrtPriceX96: sqrtPriceX96,
             amountRemaining: params.amountSpecified,
             sqrtPriceLimitX96: params.sqrtPriceLimitX96,
-            feePips: state.baseFeeHundredthsBip
+            feePips: tradingFeeHundredthsBip
         });
 
         uint256 live = state.deployedBands & ~state.completedBands;
@@ -721,18 +724,18 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
     /// settle on the next swap that ends above them. Because band levels ascend with index, the first
     /// band whose top the price has *not* reached ends the loop — nothing above it can have completed.
     ///
-    /// The level is read once, before any routing. Each harvest's buyback is a market buy that pushes
-    /// the price further up, and deciding completion on the pre-routing level is what keeps a buyback
-    /// from harvesting a band the market itself never reached.
+    /// The level is read once before retiring any band. Harvest accounting only funds the asynchronous
+    /// payout pot, so no destination work can influence completion inside this callback.
     function _harvestAfterSwap(PoolKey calldata key) private {
         PoolId poolId = key.toId();
         PoolState storage state = _pools[poolId];
 
         if (state.phase != Phase.GRADUATED) return;
-        // Suppress the hook's own work while a settlement is already in flight (Decision 7). v4 skips
-        // both swap callbacks when the hook is itself the swapper, so the nested buyback cannot reach
-        // here in the first place; this keeps the guarantee ours rather than borrowed from that.
-        if (TransientLock.settlementInFlight(poolId)) return;
+        // Suppress protocol work while pool-scoped settlement or protocol-global payout delivery is in
+        // flight. A plugin may legitimately swap through PoolManager and re-enter these callbacks; a
+        // callback revert would abort that swap, while normal work would expose lifecycle and custody
+        // paths during untrusted execution.
+        if (TransientLock.callbackWorkSuppressed(poolId)) return;
 
         uint256 live = state.deployedBands & ~state.completedBands;
         if (live == 0) return;
@@ -766,14 +769,10 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
         if (entered) TransientLock.exit(TransientLock.SETTLEMENT, poolId);
     }
 
-    /// @notice Burns one completed band, marks it complete, and routes its proceeds.
+    /// @notice Burns one completed band, marks it complete, and funds its payout pot.
     ///
-    /// @dev The band is marked complete *before* anything is routed, and routing is what performs the
-    /// nested buyback swap. So even if that swap somehow re-entered this path, the band it would try to
-    /// harvest is already recorded as finished: the transient lock is the guard, and this ordering is
-    /// what still holds if the guard is ever bypassed. It is also what makes "a completed band cannot be
-    /// harvested again" true for later swaps, and what makes a price that falls back afterwards unable
-    /// to un-complete anything — the bit is never cleared.
+    /// @dev The completion bit is set before accounting the proceeds. It is never cleared, so a completed
+    /// band cannot be harvested again even if price later falls back below it.
     function _harvestBand(
         PoolKey calldata key,
         PoolId poolId,
@@ -793,33 +792,7 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
         if (tokenResidue != 0) state.carriedInventory += tokenResidue;
 
         emit MilestoneHarvested(poolId, index, quote, tokenResidue, completed);
-
-        _applyFeeStep(key, poolId, state, completed);
-        _routeHarvest(key, poolId, state.token, index, quote);
-    }
-
-    /// @notice Steps the stored base fee down if this completion reached a template threshold.
-    ///
-    /// @dev design Decision 8, revised. The schedule is evaluated from the completion count rather than
-    /// accumulated step by step, so the fee is a pure function of how many milestones a pool has
-    /// completed — which is what makes "step-downs do not reverse" structural: the count only ever
-    /// rises, and a price that falls back changes nothing. The guard below adds the same property
-    /// arithmetically.
-    ///
-    /// Cannot revert, which a harvest requires. `updateDynamicLPFee` rejects only a non-dynamic pool, a
-    /// caller that is not the hook, or a fee above 100%: the pool carries `LPFeeLibrary.DYNAMIC_FEE_FLAG`
-    /// from launch, the hook is the caller, and the template's values are validated at construction.
-    function _applyFeeStep(PoolKey calldata key, PoolId poolId, PoolState storage state, uint32 completed) private {
-        uint24 current = state.baseFeeHundredthsBip;
-        uint24 stepped = FeeLib.steppedBaseFee(
-            current, feeStepOneAtCompletions, feeStepOneFee, feeStepTwoAtCompletions, feeStepTwoFee, completed
-        );
-        if (stepped >= current) return;
-
-        state.baseFeeHundredthsBip = stepped;
-        poolManager.updateDynamicLPFee(key, stepped);
-
-        emit BaseFeeStepped(poolId, completed, current, stepped);
+        _fundPayoutPot(poolId, index, quote);
     }
 
     /// @notice Burns a completed band's position and takes what it returns into hook custody.
@@ -863,116 +836,14 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
         _takeCurrency(key.currency1, address(this), tokenResidue);
     }
 
-    // --- Band proceeds routing ---
-    //
-    // The harvest holds its quote as an ERC-6909 claim rather than as real ETH (Decision 13), because it
-    // settles mid-swap, where the manager is short by the size of the swap in flight. Both the buyback's
-    // input and the LP donation are therefore paid by burning that claim.
-
-    /// @notice Splits a band's quote proceeds four ways and delivers each share to its destination.
-    ///
-    /// @dev The creator and protocol shares are *credited*, never pushed — a creator that cannot receive
-    /// ETH must not be able to block the swap that completed their milestone. The buyback share buys and
-    /// burns. The LP share compounds into the pool.
-    ///
-    /// The LP share takes the remainder rather than being computed from its own wad, so the four shares
-    /// sum to the proceeds exactly: integer division dust and any part of the buyback its swap could not
-    /// spend both compound instead of being stranded.
-    function _routeHarvest(PoolKey memory key, PoolId poolId, address token, uint32 index, uint256 quote) internal {
-        if (quote == 0) return;
-
-        HarvestSplit memory split = _pools[poolId].harvestSplit;
-        uint256 creatorAmount = (quote * split.creatorWad) / WAD;
-        uint256 protocolAmount = (quote * split.protocolWad) / WAD;
-        uint256 buybackShare = (quote * split.buybackWad) / WAD;
-
-        _accrueCreator(poolId, creatorAmount, AccrualSource.MILESTONE_HARVEST);
-        _accrueProtocol(poolId, protocolAmount, AccrualSource.MILESTONE_HARVEST);
-
-        (uint256 buybackQuote, uint256 tokensBurned) = _buyBackAndBurn(key, token, buybackShare);
-        uint256 lpAmount = _compoundLpShare(key, poolId, quote - creatorAmount - protocolAmount - buybackQuote);
-
-        emit HarvestRouted(poolId, index, creatorAmount, buybackQuote, tokensBurned, protocolAmount, lpAmount);
-    }
-
-    /// @notice Buys the launch token with the buyback share and burns everything it buys.
-    ///
-    /// @dev design Decision 6. The swap goes straight to the manager rather than through a fresh
-    /// `unlock`: the caller already runs inside one and v4 permits only one at a time, so a nested
-    /// `unlock` would revert. v4 also skips both swap callbacks when the hook is the swapper, so this
-    /// cannot recurse into the ladder or into another settlement.
-    ///
-    /// Exact-input, so the share is spent rather than a token amount targeted; the burn then reduces total
-    /// supply by whatever that bought. A zero share performs no swap at all, which is both the cheap path
-    /// and the behaviour the `milestone-ladder` spec requires.
-    function _buyBackAndBurn(PoolKey memory key, address token, uint256 quoteIn)
-        private
-        returns (uint256 spent, uint256 tokensBurned)
-    {
-        if (quoteIn == 0) return (0, 0);
-
-        // `swap` rejects a limit at or beyond the current price. Only reachable if the price has already
-        // run to the floor of tick space, where a buy would have nothing left to cross into anyway.
-        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(key.toId());
-        if (sqrtPriceX96 <= _BUYBACK_PRICE_LIMIT) return (0, 0);
-
-        BalanceDelta delta = poolManager.swap(
-            key,
-            IPoolManager.SwapParams({
-                zeroForOne: true,
-                amountSpecified: -int256(quoteIn),
-                sqrtPriceLimitX96: _BUYBACK_PRICE_LIMIT
-            }),
-            ""
-        );
-
-        // Quote in, token out: the first side is a debit, the second a credit. Guarded rather than cast
-        // blind so a partial fill or a zero-liquidity swap cannot produce a bad settlement pairing.
-        int128 owed0 = delta.amount0();
-        int128 credit1 = delta.amount1();
-        spent = owed0 < 0 ? uint256(uint128(-owed0)) : 0;
-        tokensBurned = credit1 > 0 ? uint256(uint128(credit1)) : 0;
-
-        _burnClaim(key.currency0, spent);
-        _takeCurrency(key.currency1, address(this), tokensBurned);
-
-        if (tokensBurned != 0) MilestoneToken(token).burn(tokensBurned);
-    }
-
-    /// @notice Compounds the LP share into the hook-owned full-range position.
-    ///
-    /// @dev design Decision 12. Band proceeds are quote-only — a completed band has sold all of its
-    /// token — while the full-range position straddles spot, so adding *principal* to it would take both
-    /// currencies, and sourcing the token side would mean a swap. The `milestone-ladder` scenario "A zero
-    /// buyback share performs no swap" rules that out: routing anything other than the buyback must not
-    /// swap.
-    ///
-    /// `donate` is what resolves it. The share is credited to the pool's in-range liquidity, which under
-    /// multi-band deployment is the full-range position plus at most one band straddling spot; a band
-    /// that has just been harvested sits at or below spot and holds no token, so the donation lands where
-    /// it is meant to. The value is folded into position liquidity by the fee-collection path, which is
-    /// the one place the protocol holds both currencies at once (Decision 9).
-    function _compoundLpShare(PoolKey memory key, PoolId poolId, uint256 amount) private returns (uint256) {
-        if (amount == 0) return 0;
-        // `donate` reverts with no in-range liquidity, and a harvest must never revert. Unreachable for a
-        // graduated pool: the template's LP seed puts a non-trivial full-range position in place and no
-        // code path removes it. If it were ever hit the share stays in hook custody.
-        if (poolManager.getLiquidity(poolId) == 0) return 0;
-
-        poolManager.donate(key, amount, 0, "");
-        _burnClaim(key.currency0, amount);
-
-        return amount;
-    }
-
     // --- Views ---
 
     /// @notice The protocol template this deployment was constructed with.
     ///
     /// @dev Reassembled from immutables, which are `internal` precisely so this is the only accessor:
-    /// twenty-six generated getters would cost roughly 1.3 KB in each half of the delegatecall pair.
-    /// There is no setter for any field, on either half — changing the template means redeploying the
-    /// protocol, and the satellite must be redeployed with the identical struct.
+    /// twenty-six generated getters would cost roughly 1.3 KB in every implementation. There is no setter
+    /// for any field; changing the template means redeploying the hook and both satellites with identical
+    /// constructor values.
     function template() external view returns (ProtocolTemplate memory t) {
         t.openingFdvWei = openingFdvWei;
         t.curvePositions = curvePositions;
@@ -987,19 +858,10 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
         t.lpSeedWad = lpSeedWad;
         t.proceedsCreatorWad = proceedsCreatorWad;
         t.proceedsProtocolWad = proceedsProtocolWad;
-        t.baseFeeHundredthsBip = baseFeeHundredthsBip;
-        t.feeStepOneAtCompletions = feeStepOneAtCompletions;
-        t.feeStepOneFee = feeStepOneFee;
-        t.feeStepTwoAtCompletions = feeStepTwoAtCompletions;
-        t.feeStepTwoFee = feeStepTwoFee;
-        t.milestoneFundShareWad = milestoneFundShareWad;
+        t.tradingFeeHundredthsBip = tradingFeeHundredthsBip;
         t.bandInventoryCapMultiple = bandInventoryCapMultiple;
         t.maxDeploysPerSwap = maxDeploysPerSwap;
         t.maxHarvestsPerSwap = maxHarvestsPerSwap;
-        t.defaultCreatorWad = defaultCreatorWad;
-        t.defaultBuybackWad = defaultBuybackWad;
-        t.defaultProtocolWad = defaultProtocolWad;
-        t.defaultLpWad = defaultLpWad;
     }
 
     function poolPhase(PoolId poolId) external view returns (Phase) {
@@ -1010,12 +872,82 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
         return _pools[poolId];
     }
 
+    function economicConfig() external view returns (EconomicConfig memory) {
+        return _economicConfig;
+    }
+
     function creatorClaimable(PoolId poolId) external view returns (uint256) {
         return _creatorClaimable[poolId];
     }
 
-    function protocolClaimable(PoolId poolId) external view returns (uint256) {
-        return _protocolClaimable[poolId];
+    function protocolClaimable() external view returns (uint256) {
+        return _protocolClaimable;
+    }
+
+    function protocolClaimBacked() external view returns (uint256) {
+        return _protocolClaimBacked;
+    }
+
+    function payoutPlan(PoolId poolId) external view returns (uint256) {
+        return _pools[poolId].payoutPlan;
+    }
+
+    function payoutPot(PoolId poolId) external view returns (uint256) {
+        return _payoutPot[poolId];
+    }
+
+    function pluginCarry(PoolId poolId, uint8 index) external view returns (uint256) {
+        return _pluginCarry[poolId][index];
+    }
+
+    function carryBitmap(PoolId poolId) external view returns (uint256) {
+        return _carryBitmap[poolId];
+    }
+
+    function creatorPathClaimable(PoolId poolId) external view returns (uint256) {
+        return _creatorPathClaimable[poolId];
+    }
+
+    function aggregateLiabilities()
+        external
+        view
+        returns (
+            uint256 payoutPotLiability,
+            uint256 pluginCarryLiability,
+            uint256 creatorPathLiability,
+            uint256 directCreatorLiability,
+            uint256 protocolLiability,
+            uint256 protocolClaimBacking
+        )
+    {
+        return (
+            _totalPayoutPotLiability,
+            _totalPluginCarryLiability,
+            _totalCreatorPathLiability,
+            _totalCreatorLiability,
+            _protocolClaimable,
+            _protocolClaimBacked
+        );
+    }
+
+    function totalLiabilities() external view returns (uint256) {
+        return _totalLiabilities();
+    }
+
+    function nativeBacking() external view returns (uint256) {
+        return _nativeBacking();
+    }
+
+    function claimBacking() external view returns (uint256) {
+        return _claimBacking();
+    }
+
+    function claimBackedLiabilities() external view returns (uint256) {
+        return _claimBackedLiabilities();
+    }
+
+    function rawEthLiabilities() external view returns (uint256) {
+        return _rawEthLiabilities();
     }
 
     /// @notice Whether band `index` has been minted for this pool.
@@ -1055,7 +987,9 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
         return CurveLib.positionStart(state.openingLevel, state.farLevel, curvePositions, index);
     }
 
-    /// @notice Accepts native ETH. Required because custody is direct: curve proceeds, harvest
-    /// proceeds, and fee shares all arrive as native ETH taken from the pool manager (Decision 2).
+    /// @notice Accepts native ETH for raw-backed liabilities and exact claim redemptions.
+    /// @dev Graduation proceeds and collected quote fees arrive as raw ETH. Harvest quote first becomes a
+    /// PoolManager claim and reaches this balance only through `REDEEM_PAYOUT_POT` or
+    /// `REDEEM_PROTOCOL_BACKING`. Plugin failures and creator-path credits remain raw-backed thereafter.
     receive() external payable {}
 }

@@ -2,9 +2,11 @@
 pragma solidity 0.8.26;
 
 import {MilestoneToken} from "./MilestoneToken.sol";
+import {IPayoutPluginRegistry} from "./interfaces/IPayoutPluginRegistry.sol";
 import {LaunchConfigLib} from "./libraries/LaunchConfigLib.sol";
 import {LaunchSignature} from "./libraries/LaunchSignature.sol";
-import {LaunchConfig} from "./types/LaunchTypes.sol";
+import {LaunchConfig, WAD} from "./types/LaunchTypes.sol";
+import {PluginEntry} from "./types/PayoutTypes.sol";
 
 /// @title LaunchSupport
 /// @notice Stateless launch-time helpers, kept outside the hook purely to free bytecode.
@@ -29,6 +31,19 @@ import {LaunchConfig} from "./types/LaunchTypes.sol";
 /// from construction. An observer computes the address from this address, the salt, and the initcode;
 /// none of the three needs protocol state.
 contract LaunchSupport {
+    uint256 private constant _MAX_SELECTED_PLUGINS = 8;
+
+    IPayoutPluginRegistry public immutable payoutPluginRegistry;
+
+    error ZeroRegistry();
+    error TooManyPayoutPlugins(uint256 count);
+    error PayoutTakesAboveWad(uint256 totalTakeWad);
+
+    constructor(IPayoutPluginRegistry payoutPluginRegistry_) {
+        if (address(payoutPluginRegistry_) == address(0)) revert ZeroRegistry();
+        payoutPluginRegistry = payoutPluginRegistry_;
+    }
+
     /// @notice Deploys a launch token at a deterministic address with its entire supply minted to
     /// `recipient`.
     ///
@@ -56,11 +71,30 @@ contract LaunchSupport {
         return address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(this), salt, initCodeHash)))));
     }
 
-    /// @notice Reverts unless the configuration satisfies every protocol bound.
-    /// @dev Errors surface with `LaunchConfigLib` selectors, so callers and tests see the specific bound
-    /// that failed rather than a generic rejection.
-    function validate(LaunchConfig calldata config) external pure {
+    /// @notice Reverts unless the configuration and every selected payout entry are valid now.
+    /// @dev The exact registry resolver is immutable, so every launch interprets a bit at the same stable
+    /// index. Iterating by shifting the full-width word handles index 255 without narrowing.
+    function validate(LaunchConfig calldata config) external view {
         LaunchConfigLib.validate(config);
+
+        uint256 remaining = config.payoutPlan;
+        uint256 index;
+        uint256 selected;
+        uint256 totalTakeWad;
+        while (remaining != 0) {
+            if (remaining & 1 != 0) {
+                selected += 1;
+                if (selected > _MAX_SELECTED_PLUGINS) revert TooManyPayoutPlugins(selected);
+
+                PluginEntry memory entry = payoutPluginRegistry.resolveSelectable(uint8(index));
+                totalTakeWad += entry.takeWad;
+                if (totalTakeWad > WAD) revert PayoutTakesAboveWad(totalTakeWad);
+            }
+            remaining >>= 1;
+            unchecked {
+                ++index;
+            }
+        }
     }
 
     // --- Observer helpers for the signed-launch flow (design Decision 19) ---

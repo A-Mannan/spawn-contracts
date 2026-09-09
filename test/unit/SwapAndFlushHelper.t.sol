@@ -11,7 +11,7 @@ import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {MilestoneToken} from "../../src/MilestoneToken.sol";
 import {SwapAndFlushHelper} from "../../src/SwapAndFlushHelper.sol";
 import {IPayoutFlusher} from "../../src/interfaces/IPayoutPlugin.sol";
-import {MockPayoutHook, MockPoolManager} from "../mocks/PayoutReferenceMocks.sol";
+import {MockPayoutHook, MockPoolManager, SwitchablePayoutPlugin} from "../mocks/PayoutReferenceMocks.sol";
 
 contract SwapAndFlushHelperTest is Test {
     using PoolIdLibrary for PoolKey;
@@ -132,15 +132,22 @@ contract SwapAndFlushHelperTest is Test {
     // --- Scenario: Plugin failure does not undo the settled swap ---
 
     function test_pluginFailureDoesNotUndoSettledSwap() public {
-        // The hook models plugin failure as successful flush completion with carry. The helper observes
-        // only the narrow `flush(poolId)` success and therefore cannot reinterpret or reroute the carry.
-        hook.configureFlush(0, false);
+        uint256 attemptedShare = 7 ether;
+        SwitchablePayoutPlugin plugin = new SwitchablePayoutPlugin();
+        plugin.setShouldRevert(true);
+        hook.configurePluginFailure(address(plugin), attemptedShare);
+        uint256 hookBefore = address(hook).balance;
 
         vm.prank(USER);
         helper.swapAndFlush{value: INPUT}(_request());
 
+        assertTrue(hook.pluginCallAttempted(), "plugin delivery attempted");
+        assertTrue(hook.pluginCallFailed(), "plugin delivery failed");
+        assertEq(hook.pluginCarry(), attemptedShare, "complete failed share carried");
+        assertEq(address(hook).balance, hookBefore, "failed share remains backed");
         assertEq(manager.swapCount(), 1, "settled swap remains complete");
         assertEq(token.balanceOf(USER), OUTPUT, "output remains delivered");
+        assertEq(address(helper).balance, 0, "helper retains no native value");
         assertTrue(hook.flushCalled(), "failure-isolated flush returned successfully");
     }
 }

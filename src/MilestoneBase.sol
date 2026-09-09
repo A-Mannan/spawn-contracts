@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {IERC6909Claims} from "v4-core/src/interfaces/external/IERC6909Claims.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {FullMath} from "v4-core/src/libraries/FullMath.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
-import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {BalanceDelta, BalanceDeltaLibrary} from "v4-core/src/types/BalanceDelta.sol";
 import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
@@ -14,27 +15,29 @@ import {LaunchSupport} from "./LaunchSupport.sol";
 import {CurveLib} from "./libraries/CurveLib.sol";
 import {LadderLib} from "./libraries/LadderLib.sol";
 import {Orientation} from "./libraries/Orientation.sol";
-import {Phase, PoolState, ProtocolTemplate, WAD} from "./types/LaunchTypes.sol";
+import {TransientLock} from "./libraries/TransientLock.sol";
+import {IPayoutPluginRegistry, IProtocolControllerIdentity} from "./interfaces/IPayoutPluginRegistry.sol";
+import {Bounds, Phase, PoolState, ProtocolTemplate, WAD} from "./types/LaunchTypes.sol";
+import {EconomicConfig} from "./types/PayoutTypes.sol";
 
 /// @title MilestoneBase
 /// @notice Storage layout, the protocol template, the event and error surface, and the settlement
-/// primitives shared by {MilestoneHook} and {MilestoneColdPaths}.
+/// primitives shared by {MilestoneHook}, {MilestoneColdPaths}, and {MilestonePayoutPaths}.
 ///
-/// @dev This contract exists for one reason: {MilestoneColdPaths} runs by DELEGATECALL from the hook,
-/// so it executes against the *hook's* storage. Both contracts therefore have to agree on the layout
-/// to the slot. Inheriting the declarations from a single place makes them agree by construction
-/// rather than by review — the only way to break it is to declare a state variable in one of the two
-/// derived contracts, which `make layout-check` rejects in CI.
+/// @dev Both satellites run by DELEGATECALL from the hook, so they execute against the *hook's* storage.
+/// All three contracts therefore have to agree on the layout to the slot. Inheriting the declarations
+/// from a single place makes them agree by construction; `make layout-check` rejects mutable state in a
+/// derived implementation.
 ///
 /// The {ProtocolTemplate} is unpacked into immutables here rather than held in storage, so reading
 /// geometry on the swap path costs nothing. Immutables resolve from the *executing* contract's own
-/// bytecode even under delegatecall, so both halves must be constructed with the same template; the
-/// Migration Plan asserts that at deployment, alongside the pool manager and NFT addresses.
+/// bytecode even under delegatecall, so all three implementations must be constructed with matching
+/// templates and dependencies; deployment verifies that parity explicitly.
 ///
-/// Also here: the just-in-time bonding curve deployment path, because both halves need it. The hook
-/// runs it from `beforeSwap` for ordinary buys, and the cold path runs it around the genesis dev buy —
-/// which is a hook self-swap, and v4 skips both swap callbacks when the hook is the swapper, so the
-/// dev buy would otherwise deploy nothing.
+/// Also here: the just-in-time bonding curve deployment path, because the hook and lifecycle satellite
+/// both need it. The hook runs it from `beforeSwap` for ordinary buys, and the cold path runs it around
+/// the genesis dev buy — which is a hook self-swap, and v4 skips both swap callbacks when the hook is the
+/// swapper, so the dev buy would otherwise deploy nothing.
 ///
 /// Marked `abstract` because it is never deployed on its own.
 abstract contract MilestoneBase is ImmutableState {
@@ -50,7 +53,9 @@ abstract contract MilestoneBase is ImmutableState {
         GENESIS,
         GRADUATE,
         REDEEM_QUOTE,
-        COLLECT_FEES
+        COLLECT_FEES,
+        REDEEM_PAYOUT_POT,
+        REDEEM_PROTOCOL_BACKING
     }
 
     /// @notice Which mechanism produced an accrual. Emitted for off-chain attribution only; routing
@@ -78,13 +83,18 @@ abstract contract MilestoneBase is ImmutableState {
     /// 24 KB budget. It holds no authority; see {LaunchSupport}.
     LaunchSupport public immutable launchSupport;
 
+    /// @notice Exact append-only resolver whose stable indices launch plans bind.
+    IPayoutPluginRegistry public immutable payoutPluginRegistry;
+
+    /// @notice Sole authority allowed to replace economics or the protocol recipient.
+    address public immutable protocolController;
+
     // --- The protocol template (design Decision 16), unpacked into immutables ---
     //
     // `internal` rather than `public` deliberately. Twenty-six generated getters is roughly 1.3 KB of
-    // pure accessor bytecode, and every byte of it would be duplicated across both halves of the
-    // delegatecall pair — against a 24 KB limit that design.md names as the leading structural risk.
-    // {MilestoneHook.template} returns the whole struct in one call, which is what an integrator
-    // wants anyway.
+    // pure accessor bytecode, and every byte of it would be duplicated across the three implementations
+    // against an EIP-170 limit that design.md names as the leading structural risk. {MilestoneHook.template}
+    // returns the whole struct in one call, which is what an integrator wants anyway.
 
     uint256 internal immutable openingFdvWei;
     uint16 internal immutable curvePositions;
@@ -99,60 +109,71 @@ abstract contract MilestoneBase is ImmutableState {
     uint64 internal immutable lpSeedWad;
     uint64 internal immutable proceedsCreatorWad;
     uint64 internal immutable proceedsProtocolWad;
-    uint24 internal immutable baseFeeHundredthsBip;
-    uint8 internal immutable feeStepOneAtCompletions;
-    uint24 internal immutable feeStepOneFee;
-    uint8 internal immutable feeStepTwoAtCompletions;
-    uint24 internal immutable feeStepTwoFee;
-    uint64 internal immutable milestoneFundShareWad;
+    uint24 internal immutable tradingFeeHundredthsBip;
     uint8 internal immutable bandInventoryCapMultiple;
     uint8 internal immutable maxDeploysPerSwap;
     uint8 internal immutable maxHarvestsPerSwap;
-    uint64 internal immutable defaultCreatorWad;
-    uint64 internal immutable defaultBuybackWad;
-    uint64 internal immutable defaultProtocolWad;
-    uint64 internal immutable defaultLpWad;
 
     /// @notice A digest of the whole template, computed once at construction.
     ///
-    /// @dev Exposed by {templateHash} on both halves. Held as a digest of the constructor argument rather
-    /// than reassembled from the twenty-six immutables on demand: the reassembling form compiled to 1.2 KB
-    /// in *each* half of the delegatecall pair, which is bytecode neither can spare, while this costs one
-    /// immutable read at runtime and a single keccak in initcode.
+    /// @dev Exposed by {templateHash} on the hook and both satellites. Held as a digest of the constructor
+    /// argument rather than reassembled from the immutables on demand: reassembly compiled to about 1.2 KB
+    /// in every implementation, while this costs one immutable read at runtime and a single keccak in
+    /// initcode.
     bytes32 internal immutable templateDigest;
 
     // --- Storage. Order is load-bearing: see the contract-level comment. ---
 
-    /// @notice Recipient of the protocol's share of harvests, fees, and curve proceeds.
-    /// @dev The only mutable protocol-level state in v1 (Decision 10).
+    /// @notice Recipient of the protocol's global revenue ledger.
+    /// @dev Mutable only through the typed protocol controller, alongside the versioned economic tuple.
     address public protocolRecipient;
 
     /// @notice Per-pool lifecycle state.
     mapping(PoolId poolId => PoolState) internal _pools;
 
-    /// @notice Creator's claimable ETH balance per pool, claimable by the current revenue NFT holder.
-    /// @dev Quote-denominated only. Decision 21 deleted the token ledgers: token fees are routed to
-    /// pool-facing destinations, so there is nothing left for a claimant to hold but ETH.
+    /// @notice Current complete economic tuple, replaced atomically by the protocol controller.
+    EconomicConfig internal _economicConfig;
+
+    mapping(PoolId poolId => uint256 amount) internal _payoutPot;
+    mapping(PoolId poolId => mapping(uint8 index => uint256 amount)) internal _pluginCarry;
+    mapping(PoolId poolId => uint256 bitmap) internal _carryBitmap;
+    mapping(PoolId poolId => uint256 amount) internal _creatorPathClaimable;
+
+    /// @notice Creator's direct claimable ETH balance per pool.
     mapping(PoolId poolId => uint256) internal _creatorClaimable;
 
-    /// @notice Protocol's claimable ETH balance per pool.
-    mapping(PoolId poolId => uint256) internal _protocolClaimable;
+    /// @notice Protocol's claimable ETH balance, aggregated globally across every pool.
+    uint256 internal _protocolClaimable;
+
+    /// @notice Exact subset of global protocol revenue still held as PoolManager native claims.
+    uint256 internal _protocolClaimBacked;
+
+    uint256 internal _totalCreatorLiability;
+    uint256 internal _totalPayoutPotLiability;
+    uint256 internal _totalPluginCarryLiability;
+    uint256 internal _totalCreatorPathLiability;
 
     /// @notice When each band index was minted, for observability.
     /// @dev With reclaim removed (Decision 22) nothing in the protocol reads this; it exists so an
     /// indexer can age a live band without replaying logs.
     mapping(PoolId poolId => mapping(uint256 index => uint64 deployedAt)) internal _bandDeployedAt;
 
+    event EconomicConfigSet(
+        uint64 indexed version,
+        uint64 harvestServiceFeeWad,
+        uint64 quoteCreatorShareWad,
+        uint64 tokenMilestoneFundShareWad
+    );
     event ProtocolRecipientSet(address indexed recipient);
 
     /// @notice Emitted whenever ETH accrues to the creator's claimable balance.
-    event CreatorAccrued(PoolId indexed poolId, uint256 amount, AccrualSource source);
+    event CreatorAccrued(PoolId indexed poolId, uint256 amount, AccrualSource source, uint64 economicVersion);
 
     /// @notice Emitted whenever ETH accrues to the protocol's claimable balance.
-    event ProtocolAccrued(PoolId indexed poolId, uint256 amount, AccrualSource source);
+    event ProtocolAccrued(PoolId indexed poolId, uint256 amount, AccrualSource source, uint64 economicVersion);
 
     event CreatorClaimed(PoolId indexed poolId, address indexed holder, uint256 amount);
-    event ProtocolClaimed(PoolId indexed poolId, address indexed recipient, uint256 amount);
+    event ProtocolClaimed(address indexed recipient, uint256 amount);
 
     /// @notice Emitted once per launch, carrying everything needed to reconstruct the pool's geometry
     /// off-chain without reading storage.
@@ -168,27 +189,55 @@ abstract contract MilestoneBase is ImmutableState {
         bytes32 configHash
     );
 
-    /// @notice Emitted alongside {Launched} with the launch's chosen routing.
-    event LaunchConfigured(
-        PoolId indexed poolId,
-        uint64 creatorWad,
-        uint64 buybackWad,
-        uint64 protocolWad,
-        uint64 lpWad,
-        uint64 devBuyShareWad,
-        uint32 devBuyVestingSeconds
-    );
+    /// @notice Emitted alongside {Launched} with the launch's exact immutable payout plan.
+    event LaunchConfigured(PoolId indexed poolId, uint256 payoutPlan, uint64 devBuyShareWad);
 
-    /// @notice Emitted when a launch includes a dev buy, recording what it cost and what it bought.
-    event DevBuyExecuted(PoolId indexed poolId, uint256 tokensBought, uint256 ethSpent, uint32 vestingSeconds);
+    /// @notice Emitted when a launch includes a dev buy, recording what it cost and delivered.
+    event DevBuyExecuted(PoolId indexed poolId, uint256 tokensBought, uint256 ethSpent);
 
     /// @notice Emitted when a relayed launch's dev buy was skipped because the relayer is not the creator.
     /// @dev The dev-buy share simply remains curve inventory, which is the specified outcome rather than
     /// an error — so it is recorded rather than reverted.
     event DevBuySkipped(PoolId indexed poolId, address indexed relayer, uint256 tokensRequested);
 
-    /// @notice Emitted when vested dev-buy tokens are released to the creator.
-    event DevBuyReleased(PoolId indexed poolId, address indexed creator, uint256 amount);
+    /// @notice Records the harvest pot funding after the active service fee is deducted.
+    event PayoutPotFunded(
+        PoolId indexed poolId,
+        uint32 indexed milestoneIndex,
+        uint256 grossQuote,
+        uint256 serviceFee,
+        uint256 netQuote,
+        uint64 economicVersion
+    );
+
+    event PayoutPotRedeemed(PoolId indexed poolId, uint256 amount);
+    event PayoutTipPaid(PoolId indexed poolId, address indexed flusher, uint256 amount);
+    event PluginPayoutDelivered(
+        PoolId indexed poolId,
+        uint8 indexed pluginIndex,
+        address indexed plugin,
+        uint256 currentShare,
+        uint256 previousCarry,
+        uint256 delivered
+    );
+    event PluginPayoutCarried(
+        PoolId indexed poolId,
+        uint8 indexed pluginIndex,
+        address indexed plugin,
+        uint256 currentShare,
+        uint256 previousCarry,
+        uint256 carried
+    );
+    event PluginPayoutRedirected(
+        PoolId indexed poolId,
+        uint8 indexed pluginIndex,
+        uint256 currentShare,
+        uint256 previousCarry,
+        uint256 redirected
+    );
+    event CreatorPathAccrued(PoolId indexed poolId, uint256 amount);
+    event CreatorPathClaimed(PoolId indexed poolId, address indexed holder, uint256 amount);
+    event CreatorPathClaimFailed(PoolId indexed poolId, address indexed holder, uint256 amount);
 
     /// @notice Emitted when a pool graduates, recording the split and the seeded position.
     event Graduated(
@@ -224,9 +273,10 @@ abstract contract MilestoneBase is ImmutableState {
     event BandSkipped(PoolId indexed poolId, uint32 indexed index, uint256 carriedInventory);
 
     /// @notice Emitted when a swap carried the price to a deployed band's top, completing the milestone.
-    /// @dev `quoteProceeds` is the burn's full quote credit, principal and accrued band fees together, so
-    /// it is the exact amount {HarvestRouted} then divides. `tokenResidue` is whatever token the position
-    /// still held, which is rounding dust for a band completed above its top.
+    /// @dev `quoteProceeds` is the burn's full quote credit, principal and accrued band fees together. It
+    /// is the gross amount from which {PayoutPotFunded} records the service fee and net pot.
+    /// `tokenResidue` is whatever token the position still held, which is rounding dust for a band
+    /// completed above its top.
     event MilestoneHarvested(
         PoolId indexed poolId,
         uint32 indexed index,
@@ -235,47 +285,29 @@ abstract contract MilestoneBase is ImmutableState {
         uint32 completedMilestones
     );
 
-    /// @notice Emitted alongside {MilestoneHarvested} with where each share of the proceeds went.
-    /// @dev The four amounts sum to the harvest's `quoteProceeds`. `buybackQuote` is what the nested swap
-    /// actually spent rather than what its share nominally was, and any shortfall is folded into
-    /// `lpAmount`, so the sum holds even when the swap fills partially.
-    event HarvestRouted(
-        PoolId indexed poolId,
-        uint32 indexed index,
-        uint256 creatorAmount,
-        uint256 buybackQuote,
-        uint256 tokensBurned,
-        uint256 protocolAmount,
-        uint256 lpAmount
-    );
-
     /// @notice Emitted when the permissionless path realises the full-range position's accrued swap fees.
     /// @dev The amounts are what the position had accrued, *before* any diversion or routing, so this event
     /// and {FeesRouted} together account for every wei.
     event FeesCollected(PoolId indexed poolId, address indexed caller, uint256 quoteFees, uint256 tokenFees);
 
-    /// @notice Emitted alongside {FeesCollected} with where the collected fees went.
+    /// @notice Records exactly where one fee collection went.
     ///
-    /// @dev `lpQuote`/`lpToken` are the LP share as routed, not the part that became liquidity this call:
-    /// what could not be paired at spot stays in `pendingLpQuote`/`pendingLpToken` for the next collection,
-    /// and `liquidityAdded` is what the pairing actually minted. There are no token-denominated creator or
-    /// protocol amounts, because Decision 21 routes the whole token side to the fund and the pool.
+    /// @dev `economicVersion` is the tuple the routing actually used, read once before any arithmetic.
+    /// Without it an indexer cannot attribute a split: governance replaces economics prospectively and a
+    /// collection lands under whichever version was live when its unlock ran, so the same pool can emit
+    /// two differently-proportioned routings with nothing on-chain to distinguish them.
     event FeesRouted(
         PoolId indexed poolId,
-        uint256 lpQuote,
-        uint256 lpToken,
         uint256 creatorQuote,
         uint256 protocolQuote,
         uint256 divertedToNextBand,
-        uint128 liquidityAdded
+        uint256 tokensBurned,
+        uint64 economicVersion
     );
 
-    /// @notice Emitted when a milestone completion steps the stored base fee down.
-    /// @dev Only emitted when the value actually changes, so its absence across a harvest is itself the
-    /// observable form of "the base fee is unchanged between thresholds".
-    event BaseFeeStepped(PoolId indexed poolId, uint32 completedMilestones, uint24 previousFee, uint24 newFee);
-
-    error NotProtocolAdmin();
+    error NotProtocolController();
+    error ControllerRegistryMismatch(address controllerRegistry, address supportRegistry);
+    error InvalidEconomicConfig();
     error ZeroAddress();
     error NotAContract(address target);
     error NotRevenueNftHolder(PoolId poolId, address caller);
@@ -293,6 +325,12 @@ abstract contract MilestoneBase is ImmutableState {
     error NotInBondingCurvePhase(PoolId poolId, Phase phase);
     error FarLevelNotReached(int24 currentLevel, int24 farLevel);
     error InvalidTemplate();
+    error Insolvent(uint256 backing, uint256 liabilities);
+    error ClaimBackingInsolvent(uint256 backing, uint256 liabilities);
+    error RawEthInsolvent(uint256 backing, uint256 liabilities);
+    error InvalidProtocolBacking(uint256 claimBacked, uint256 totalClaimable);
+    error InsufficientPayoutGas(uint256 available, uint256 required);
+    error RevenueNftOwnerChanged(PoolId poolId, address expected, address actual);
 
     /// @dev `ImmutableState`'s constructor argument is deliberately *not* supplied here. {MilestoneHook}
     /// gets it from `BaseHook`, which also validates the mined hook address; {MilestoneColdPaths} passes
@@ -301,19 +339,42 @@ abstract contract MilestoneBase is ImmutableState {
     /// The template is sanity-checked rather than trusted. It is set once, for the life of the protocol,
     /// and a zero band count or a supply split that does not partition the supply would not fail at
     /// deployment — it would fail at some pool's first harvest. Better here.
-    constructor(RevenueNFT revenueNft_, LaunchSupport launchSupport_, ProtocolTemplate memory template_) {
+    constructor(
+        RevenueNFT revenueNft_,
+        LaunchSupport launchSupport_,
+        ProtocolTemplate memory template_,
+        address protocolController_
+    ) {
         if (address(revenueNft_) == address(0)) revert ZeroAddress();
         if (address(launchSupport_) == address(0)) revert ZeroAddress();
+        if (protocolController_ == address(0)) revert ZeroAddress();
+        if (address(revenueNft_).code.length == 0) revert NotAContract(address(revenueNft_));
+        if (address(launchSupport_).code.length == 0) revert NotAContract(address(launchSupport_));
+        if (protocolController_.code.length == 0) revert NotAContract(protocolController_);
 
         revenueNFT = revenueNft_;
         launchSupport = launchSupport_;
+        payoutPluginRegistry = launchSupport_.payoutPluginRegistry();
+        protocolController = protocolController_;
+
+        // The two halves of the payout authority arrive independently — the resolver through launch
+        // support, the mutator as a bare address — and no runtime path ever reads one against the other.
+        // A mismatched pair would therefore validate launch plans against one registry while governance
+        // suspended entries in another, with no revert and no event to show for it. Proving the identity
+        // here is what makes the pairing an invariant of the deployment rather than a convention of the
+        // script that produced it.
+        address controllerRegistry = IProtocolControllerIdentity(protocolController_).registry();
+        if (controllerRegistry != address(payoutPluginRegistry)) {
+            revert ControllerRegistryMismatch(controllerRegistry, address(payoutPluginRegistry));
+        }
 
         if (
             template_.openingFdvWei == 0 || template_.curvePositions == 0 || template_.curvePositions > 32
                 || template_.curveSpanLevels <= 0 || template_.coreBandCount == 0 || template_.bandLevelSpacing <= 0
                 || template_.bandWidthLevels <= 0 || template_.bandWidthLevels >= template_.bandLevelSpacing
                 || template_.bandInventoryCapMultiple == 0 || template_.maxDeploysPerSwap == 0
-                || template_.maxHarvestsPerSwap == 0 || uint256(template_.coreBandCount) + template_.maxFeeFundedBands > 256
+                || template_.maxHarvestsPerSwap == 0 || template_.tradingFeeHundredthsBip != 10_000
+                || uint256(template_.coreBandCount) + template_.maxFeeFundedBands > 256
                 || uint256(template_.curveSupplyShareWad) + template_.ladderSupplyShareWad
                     + template_.fullRangeSupplyShareWad != WAD
                 || uint256(template_.lpSeedWad) + template_.proceedsCreatorWad + template_.proceedsProtocolWad != WAD
@@ -332,19 +393,17 @@ abstract contract MilestoneBase is ImmutableState {
         lpSeedWad = template_.lpSeedWad;
         proceedsCreatorWad = template_.proceedsCreatorWad;
         proceedsProtocolWad = template_.proceedsProtocolWad;
-        baseFeeHundredthsBip = template_.baseFeeHundredthsBip;
-        feeStepOneAtCompletions = template_.feeStepOneAtCompletions;
-        feeStepOneFee = template_.feeStepOneFee;
-        feeStepTwoAtCompletions = template_.feeStepTwoAtCompletions;
-        feeStepTwoFee = template_.feeStepTwoFee;
-        milestoneFundShareWad = template_.milestoneFundShareWad;
+        tradingFeeHundredthsBip = template_.tradingFeeHundredthsBip;
         bandInventoryCapMultiple = template_.bandInventoryCapMultiple;
         maxDeploysPerSwap = template_.maxDeploysPerSwap;
         maxHarvestsPerSwap = template_.maxHarvestsPerSwap;
-        defaultCreatorWad = template_.defaultCreatorWad;
-        defaultBuybackWad = template_.defaultBuybackWad;
-        defaultProtocolWad = template_.defaultProtocolWad;
-        defaultLpWad = template_.defaultLpWad;
+
+        _economicConfig = EconomicConfig({
+            harvestServiceFeeWad: 0.1e18,
+            quoteCreatorShareWad: 0.75e18,
+            tokenMilestoneFundShareWad: 0.2e18,
+            version: 1
+        });
 
         templateDigest = keccak256(abi.encode(template_));
     }
@@ -365,34 +424,109 @@ abstract contract MilestoneBase is ImmutableState {
         return bytes32(_BAND_SALT_TAG | index);
     }
 
-    // --- Claim ledger ---
+    // --- Direct revenue ledgers and payout-pot funding ---
     //
-    // Accrual and payout are deliberately separate. Every routing path credits a balance here and
-    // returns; nothing is ever pushed to a creator or to the protocol during settlement. That is what
-    // makes a harvest independent of whether the recipient is an EOA, a contract that reverts on
-    // receive, or a contract that would try to re-enter.
+    // Graduation and quote-fee routing credit the raw-backed creator or global protocol ledger and return;
+    // neither recipient is pushed value during settlement. Harvest quote instead funds the claim-backed
+    // protocol subset and source pool's payout pot; asynchronous delivery later records creator-path
+    // entitlement and plugin carry as separate raw-backed liabilities.
 
-    /// @notice Credits the creator's claimable balance for a pool.
-    /// @dev Internal-only: there is no external accrual entry point, so no caller can inflate a
-    /// balance. Callers are the graduation split, the fee waterfall, and harvest routing.
+    /// @notice Credits the direct creator claimable balance for a pool.
+    /// @dev Internal-only: there is no external accrual entry point, so no caller can inflate a balance.
+    /// Callers are the graduation split and quote-fee routing; payout-plan value uses the separate creator
+    /// path ledger.
     function _accrueCreator(PoolId poolId, uint256 amount, AccrualSource source) internal {
         if (amount == 0) return;
 
         _creatorClaimable[poolId] += amount;
-        emit CreatorAccrued(poolId, amount, source);
+        _totalCreatorLiability += amount;
+        emit CreatorAccrued(poolId, amount, source, _economicConfig.version);
     }
 
-    /// @notice Credits the protocol's claimable balance for a pool.
+    /// @notice Credits the global protocol claimable balance.
     function _accrueProtocol(PoolId poolId, uint256 amount, AccrualSource source) internal {
         if (amount == 0) return;
 
-        _protocolClaimable[poolId] += amount;
-        emit ProtocolAccrued(poolId, amount, source);
+        _protocolClaimable += amount;
+        emit ProtocolAccrued(poolId, amount, source, _economicConfig.version);
+    }
+
+    function _fundPayoutPot(PoolId poolId, uint32 index, uint256 grossQuote) internal {
+        if (grossQuote == 0) return;
+
+        EconomicConfig memory economics = _economicConfig;
+        uint256 serviceFee = FullMath.mulDiv(grossQuote, economics.harvestServiceFeeWad, WAD);
+        uint256 netQuote = grossQuote - serviceFee;
+
+        if (serviceFee != 0) {
+            _protocolClaimable += serviceFee;
+            _protocolClaimBacked += serviceFee;
+            emit ProtocolAccrued(poolId, serviceFee, AccrualSource.MILESTONE_HARVEST, economics.version);
+        }
+        if (netQuote != 0) {
+            _payoutPot[poolId] += netQuote;
+            _totalPayoutPotLiability += netQuote;
+        }
+
+        _assertSolvent();
+        emit PayoutPotFunded(poolId, index, grossQuote, serviceFee, netQuote, economics.version);
+    }
+
+    function _setEconomicConfig(EconomicConfig calldata config) internal {
+        EconomicConfig memory current = _economicConfig;
+        if (
+            current.version == type(uint64).max || config.version != current.version + 1
+                || config.harvestServiceFeeWad > Bounds.MAX_HARVEST_SERVICE_FEE_WAD
+                || config.quoteCreatorShareWad > Bounds.MAX_QUOTE_CREATOR_SHARE_WAD
+                || config.tokenMilestoneFundShareWad > Bounds.MAX_TOKEN_MILESTONE_FUND_SHARE_WAD
+        ) revert InvalidEconomicConfig();
+
+        _economicConfig = config;
+        emit EconomicConfigSet(
+            config.version, config.harvestServiceFeeWad, config.quoteCreatorShareWad, config.tokenMilestoneFundShareWad
+        );
+    }
+
+    function _claimBackedLiabilities() internal view returns (uint256) {
+        return _totalPayoutPotLiability + _protocolClaimBacked;
+    }
+
+    function _rawEthLiabilities() internal view returns (uint256) {
+        if (_protocolClaimBacked > _protocolClaimable) {
+            revert InvalidProtocolBacking(_protocolClaimBacked, _protocolClaimable);
+        }
+        return _totalPluginCarryLiability + _totalCreatorPathLiability + _totalCreatorLiability
+            + (_protocolClaimable - _protocolClaimBacked);
+    }
+
+    function _totalLiabilities() internal view returns (uint256) {
+        return _claimBackedLiabilities() + _rawEthLiabilities();
+    }
+
+    function _claimBacking() internal view returns (uint256) {
+        return IERC6909Claims(address(poolManager)).balanceOf(address(this), 0);
+    }
+
+    function _nativeBacking() internal view returns (uint256) {
+        return address(this).balance + _claimBacking();
+    }
+
+    function _assertSolvent() internal view {
+        uint256 claimBacking = _claimBacking();
+        uint256 claimLiabilities = _claimBackedLiabilities();
+        if (claimBacking < claimLiabilities) revert ClaimBackingInsolvent(claimBacking, claimLiabilities);
+
+        uint256 rawBacking = address(this).balance;
+        uint256 rawLiabilities = _rawEthLiabilities();
+        if (rawBacking < rawLiabilities) revert RawEthInsolvent(rawBacking, rawLiabilities);
+
+        uint256 backing = rawBacking + claimBacking;
+        uint256 liabilities = claimLiabilities + rawLiabilities;
+        if (backing < liabilities) revert Insolvent(backing, liabilities);
     }
 
     /// @dev Native ETH payout. Uses `call` rather than `transfer` so recipients are not bound to the
-    /// 2300-gas stipend, which would break contract holders of the revenue NFT. Safe because the
-    /// balance is already zeroed at this point.
+    /// 2300-gas stipend. Callers remove the source liability before entering this interaction.
     function _sendEth(address to, uint256 amount) internal {
         (bool ok,) = to.call{value: amount}("");
         if (!ok) revert EthTransferFailed(to, amount);
@@ -448,7 +582,7 @@ abstract contract MilestoneBase is ImmutableState {
     // ERC-6909 claims are the way out. Minting one converts the hook's credit into a persistent balance
     // *without moving any currency*, so it is always available; burning one converts it back into a credit
     // that offsets a debit in the same unlock. Value stays in the singleton, which is what claims are for,
-    // and the redemption to real currency is deferred to {_ensureEth} on a path that is not mid-swap.
+    // and exact redemption is deferred to a liability-class-specific unlock outside the active swap.
 
     /// @notice Converts a positive delta in `currency` into an ERC-6909 claim held by the hook.
     /// @dev Pure accounting: `mint` debits the delta and credits the claim, so nothing is transferred and
@@ -466,28 +600,28 @@ abstract contract MilestoneBase is ImmutableState {
         poolManager.burn(address(this), currency.toId(), amount);
     }
 
-    /// @notice Makes sure the hook holds at least `amount` of native ETH, redeeming claims if it does not.
-    ///
-    /// @dev The bridge between claim custody and the pull-payment paths, which owe real ETH. Accrued
-    /// balances are backed by whichever the value happened to arrive as — raw ETH from a graduation, a
-    /// claim from a harvest — and a claimant must not have to care which. Redeeming the shortfall rather
-    /// than the whole claim keeps a single claim funding many partial claims.
-    ///
-    /// Native quote is an orientation invariant, so the claim being redeemed is always currency0's.
-    function _ensureEth(uint256 amount) internal {
+    /// @notice Makes a direct creator claim's raw-ETH backing available without consuming another class.
+    /// @dev Direct creator revenue is always raw-backed. Ambient claims belong to payout pots or the exact
+    /// claim-backed protocol subset and are therefore unavailable to this path.
+    function _ensureDirectCreatorEth(uint256 amount) internal view {
+        uint256 required = amount + _totalCreatorLiability + _totalPluginCarryLiability + _totalCreatorPathLiability
+            + (_protocolClaimable - _protocolClaimBacked);
         uint256 held = address(this).balance;
-        if (held >= amount) return;
+        if (held < required) revert RawEthInsolvent(held, required);
+    }
 
-        poolManager.unlock(abi.encode(uint8(UnlockAction.REDEEM_QUOTE), amount - held));
+    /// @notice Whether untrusted plugin delivery currently suppresses protocol work.
+    function payoutDeliveryInFlight() external view returns (bool) {
+        return TransientLock.payoutDeliveryInFlight();
     }
 
     // --- Just-in-time bonding curve deployment (design Decisions 15 and 17) ---
 
     /// @notice Mints every undeployed curve position the incoming buy's simulated path will reach.
     ///
-    /// @dev Declared here rather than in {MilestoneHook} because both halves call it. The hook runs it
-    /// from `beforeSwap`; the cold path runs it around the genesis dev buy, which is a hook self-swap
-    /// and therefore invisible to the hook's own swap callbacks.
+    /// @dev Declared here rather than in {MilestoneHook} because the hook and lifecycle satellite both
+    /// call it. The hook runs it from `beforeSwap`; the cold path runs it around the genesis dev buy,
+    /// which is a hook self-swap and therefore invisible to the hook's own swap callbacks.
     ///
     /// The walk is exact. Curve positions all terminate at the far level, so the in-range liquidity at
     /// any level is the sum of the deployed positions whose start is at or below it — computable from
@@ -508,7 +642,7 @@ abstract contract MilestoneBase is ImmutableState {
         uint16 positions = curvePositions;
         int24 opening = state.openingLevel;
         int24 far = state.farLevel;
-        uint256 curveSupply = (state.totalSupply * curveSupplyShareWad) / WAD;
+        uint256 curveSupply = FullMath.mulDiv(state.totalSupply, curveSupplyShareWad, WAD);
 
         (uint160 sqrtPriceX96, int24 tick,,) = poolManager.getSlot0(poolId);
         uint256 index = CurveLib.firstPositionAbove(opening, far, positions, Orientation.toLevel(tick));
@@ -529,7 +663,7 @@ abstract contract MilestoneBase is ImmutableState {
             sqrtPriceX96: sqrtPriceX96,
             amountRemaining: amountSpecified,
             sqrtPriceLimitX96: sqrtPriceLimitX96,
-            feePips: state.baseFeeHundredthsBip
+            feePips: tradingFeeHundredthsBip
         });
 
         uint256 minted;

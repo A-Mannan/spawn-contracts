@@ -7,6 +7,7 @@ import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {MilestoneBase} from "../../src/MilestoneBase.sol";
 import {Bounds, LaunchConfig, Phase, PoolState, WAD} from "../../src/types/LaunchTypes.sol";
+import {EconomicConfig} from "../../src/types/PayoutTypes.sol";
 import {HarnessLaunchpadTest} from "../HarnessFixtures.sol";
 
 /// @notice Unit tests for task group 7 — the in-place graduation: what triggers it, how it splits what the
@@ -248,7 +249,7 @@ contract GraduationTest is HarnessLaunchpadTest {
         _buy(1 ether);
 
         assertEq(hook.poolState(poolId).graduatedAt, graduatedAt, "the transition is not re-run");
-        assertGe(_fullRangeLiquidity(), liquidityAfterFirst, "nothing re-minted");
+        assertEq(_fullRangeLiquidity(), liquidityAfterFirst, "nothing re-minted");
         assertEq(hook.creatorClaimable(poolId), creatorAfterFirst, "and nothing re-split");
     }
 
@@ -305,7 +306,30 @@ contract GraduationTest is HarnessLaunchpadTest {
         );
     }
 
-    // --- Scenario: Split allocations sum to the collected proceeds ---
+    // --- Scenario: Economic updates do not alter graduation split ---
+
+    function test_economicUpdatesDoNotAlterGraduationSplit() public {
+        EconomicConfig memory economics = EconomicConfig({
+            harvestServiceFeeWad: 0.2e18,
+            quoteCreatorShareWad: 0.9e18,
+            tokenMilestoneFundShareWad: 0.5e18,
+            version: 2
+        });
+        bytes32 salt = bytes32("graduation-economics");
+        vm.prank(PROTOCOL_ADMIN);
+        controller.scheduleEconomicConfig(economics, salt);
+        controller.executeEconomicConfig(economics, salt);
+
+        vm.recordLogs();
+        _graduate();
+        (uint256 proceeds, uint256 lpSeed, uint256 creatorQuote, uint256 protocolQuote) = _graduatedEvent();
+
+        assertEq(lpSeed, (proceeds * 0.4e18) / WAD, "40% locked LP seed");
+        assertEq(creatorQuote, (proceeds * 0.55e18) / WAD, "55% direct creator credit");
+        assertEq(protocolQuote, proceeds - lpSeed - creatorQuote, "5% global protocol remainder");
+    }
+
+    // --- Scenario: Graduation allocations conserve proceeds ---
 
     function test_splitAllocationsSumToProceeds() public {
         vm.recordLogs();
@@ -326,7 +350,7 @@ contract GraduationTest is HarnessLaunchpadTest {
         assertGt(hook.creatorClaimable(poolId), 0, "credited instead");
     }
 
-    // --- Scenario: Bonding curve proceeds creator share accrues ---
+    // --- Scenario: Bonding curve creator share accrues directly ---
 
     function test_creatorCanClaimAfterGraduation() public {
         uint256 before = creator.balance;
@@ -341,16 +365,19 @@ contract GraduationTest is HarnessLaunchpadTest {
         assertEq(hook.creatorClaimable(poolId), 0, "ledger cleared");
     }
 
+    // --- Scenario: Protocol graduation revenue accrues globally ---
+
     function test_protocolCanClaimAfterGraduation() public {
+        uint256 beforeAccrual = hook.protocolClaimable();
         _graduate();
 
-        uint256 owed = hook.protocolClaimable(poolId);
-        assertGt(owed, 0, "something accrued");
+        uint256 owed = hook.protocolClaimable() - beforeAccrual;
+        assertGt(owed, 0, "something accrued globally");
 
         uint256 before = PROTOCOL_RECIPIENT.balance;
         vm.prank(PROTOCOL_RECIPIENT);
-        assertEq(hook.claimProtocol(poolId), owed, "claimed in full");
-        assertEq(PROTOCOL_RECIPIENT.balance, before + owed, "paid in native ETH");
+        assertEq(hook.claimProtocol(), beforeAccrual + owed, "claimed the global ledger in full");
+        assertEq(PROTOCOL_RECIPIENT.balance, before + beforeAccrual + owed, "paid in native ETH");
     }
 
     /// @dev Custody must actually hold what the ledger promises, or a claim would revert — and under
@@ -359,7 +386,7 @@ contract GraduationTest is HarnessLaunchpadTest {
     function test_custodyCoversTheAccruedClaims() public {
         _graduate();
 
-        uint256 promised = hook.creatorClaimable(poolId) + hook.protocolClaimable(poolId);
+        uint256 promised = hook.creatorClaimable(poolId) + hook.protocolClaimable();
         assertGt(promised, 0, "something is promised");
 
         uint256 creatorBefore = creator.balance;
@@ -368,7 +395,7 @@ contract GraduationTest is HarnessLaunchpadTest {
         vm.prank(creator);
         hook.claimCreator(poolId);
         vm.prank(PROTOCOL_RECIPIENT);
-        hook.claimProtocol(poolId);
+        hook.claimProtocol();
 
         assertEq(
             (creator.balance - creatorBefore) + (PROTOCOL_RECIPIENT.balance - protocolBefore),
@@ -403,7 +430,7 @@ contract GraduationTest is HarnessLaunchpadTest {
         assertLt(state.fullRangeTickUpper, TickMath.maxUsableTick(Bounds.POOL_TICK_SPACING), "inside the extreme");
     }
 
-    // --- Scenario: Full-range position is funded from both sides ---
+    // --- Scenario: Graduation seeds both sides from original allocations ---
 
     function test_fullRangeIsFundedFromBothSides() public {
         _graduate();
@@ -434,11 +461,9 @@ contract GraduationTest is HarnessLaunchpadTest {
         assertEq(_fullRangeLiquidity(), state.fullRangeLiquidity, "untouched");
     }
 
-    // --- Scenario: Fee collection preserves net liquidity ---
+    // --- Scenario: Other routing preserves existing liquidity ---
 
-    /// @dev The one path that legitimately calls `modifyLiquidity` against the locked position — collecting
-    /// its fees is a zero liquidity delta, not a withdrawal. `make lock-check` asserts the same thing at
-    /// source level; this asserts it against a live pool.
+    /// @dev Fee collection routes value without adding to or removing from the locked position.
     function test_feeCollectionPreservesNetLiquidity() public {
         _graduate();
 
@@ -451,7 +476,7 @@ contract GraduationTest is HarnessLaunchpadTest {
 
         hook.collectFees(key);
 
-        assertGe(_fullRangeLiquidity(), before, "collection never reduces net liquidity");
+        assertEq(_fullRangeLiquidity(), before, "collection does not mutate locked liquidity");
     }
 
     // --- Scenario: Lock survives ladder exhaustion ---

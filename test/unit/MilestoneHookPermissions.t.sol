@@ -10,9 +10,10 @@ import {PoolId} from "v4-core/src/types/PoolId.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {MilestoneBase} from "../../src/MilestoneBase.sol";
 import {MilestoneColdPaths} from "../../src/MilestoneColdPaths.sol";
+import {MilestonePayoutPaths} from "../../src/MilestonePayoutPaths.sol";
 import {RevenueNFT} from "../../src/RevenueNFT.sol";
 import {LaunchSupport} from "../../src/LaunchSupport.sol";
-import {LaunchConfig, Phase} from "../../src/types/LaunchTypes.sol";
+import {Bounds, LaunchConfig, Phase} from "../../src/types/LaunchTypes.sol";
 import {LaunchpadTest} from "../Fixtures.sol";
 
 /// @notice Unit tests for task 3.1: the hook shell's permission declaration and per-pool state.
@@ -36,7 +37,8 @@ contract MilestoneHookPermissionsTest is LaunchpadTest {
             support,
             template,
             address(coldPaths),
-            PROTOCOL_ADMIN,
+            address(payoutPaths),
+            address(controller),
             PROTOCOL_RECIPIENT
         );
     }
@@ -46,7 +48,7 @@ contract MilestoneHookPermissionsTest is LaunchpadTest {
         assertFalse(ok, signature);
     }
 
-    // --- Scenario (token-launch): Deployed hook address carries the required flags ---
+    // --- Scenario (token-launch): Deployed hook has required callback flags ---
 
     function test_declaredPermissionsMatchTheSpec() public view {
         Hooks.Permissions memory p = hook.getHookPermissions();
@@ -92,11 +94,11 @@ contract MilestoneHookPermissionsTest is LaunchpadTest {
         assertFalse(ok, "a wrongly-flagged address must not be constructible");
     }
 
-    /// @dev The dynamic fee cannot be a hook-address flag: it is bit 23, while the hook mask covers
-    /// only the low 14 bits. It lives in `PoolKey.fee` instead.
-    function test_dynamicFeeIsNotAHookAddressFlag() public pure {
-        assertEq(uint160(LPFeeLibrary.DYNAMIC_FEE_FLAG) & Hooks.ALL_HOOK_MASK, 0, "outside the hook mask");
-        assertEq(uint256(Hooks.ALL_HOOK_MASK), (1 << 14) - 1, "hook mask is 14 bits");
+    // --- Scenario: Pool has no dynamic-fee flag ---
+
+    function test_poolHasNoDynamicFeeFlag() public view {
+        assertEq(key.fee, Bounds.TRADING_FEE_HUNDREDTHS_BIP, "static template fee");
+        assertFalse(LPFeeLibrary.isDynamicFee(key.fee), "no dynamic capability");
     }
 
     // --- Construction wiring ---
@@ -105,7 +107,8 @@ contract MilestoneHookPermissionsTest is LaunchpadTest {
         assertEq(address(hook.poolManager()), address(manager), "pool manager");
         assertEq(address(hook.revenueNFT()), address(nft), "revenue NFT");
         assertEq(hook.coldPaths(), address(coldPaths), "cold paths");
-        assertEq(hook.protocolAdmin(), PROTOCOL_ADMIN, "protocol admin");
+        assertEq(hook.payoutPaths(), address(payoutPaths), "payout paths");
+        assertEq(hook.protocolController(), address(controller), "protocol controller");
         assertEq(hook.protocolRecipient(), PROTOCOL_RECIPIENT, "protocol recipient");
     }
 
@@ -137,7 +140,8 @@ contract MilestoneHookPermissionsTest is LaunchpadTest {
                 support,
                 template,
                 address(coldPaths),
-                PROTOCOL_ADMIN,
+                address(payoutPaths),
+                address(controller),
                 PROTOCOL_RECIPIENT
             )
         );
@@ -154,7 +158,8 @@ contract MilestoneHookPermissionsTest is LaunchpadTest {
                 LaunchSupport(address(0)),
                 template,
                 address(coldPaths),
-                PROTOCOL_ADMIN,
+                address(payoutPaths),
+                address(controller),
                 PROTOCOL_RECIPIENT
             )
         );
@@ -163,7 +168,7 @@ contract MilestoneHookPermissionsTest is LaunchpadTest {
         _assertRevertedWith(ret, MilestoneBase.ZeroAddress.selector);
     }
 
-    function test_constructorRejectsZeroAdmin() public {
+    function test_constructorRejectsZeroController() public {
         (bool ok, bytes memory ret) = _tryConstruct(
             abi.encode(
                 IPoolManager(address(manager)),
@@ -171,6 +176,7 @@ contract MilestoneHookPermissionsTest is LaunchpadTest {
                 support,
                 template,
                 address(coldPaths),
+                address(payoutPaths),
                 address(0),
                 PROTOCOL_RECIPIENT
             )
@@ -183,7 +189,14 @@ contract MilestoneHookPermissionsTest is LaunchpadTest {
     function test_constructorRejectsZeroRecipient() public {
         (bool ok, bytes memory ret) = _tryConstruct(
             abi.encode(
-                IPoolManager(address(manager)), nft, support, template, address(coldPaths), PROTOCOL_ADMIN, address(0)
+                IPoolManager(address(manager)),
+                nft,
+                support,
+                template,
+                address(coldPaths),
+                address(payoutPaths),
+                address(controller),
+                address(0)
             )
         );
 
@@ -191,8 +204,8 @@ contract MilestoneHookPermissionsTest is LaunchpadTest {
         _assertRevertedWith(ret, MilestoneBase.ZeroAddress.selector);
     }
 
-    /// @dev A cold-paths target with no code fails the {MilestoneBase.NotAContract} guard, so the split
-    /// cannot be deployed with a mistyped or unset satellite address that would silently no-op launches.
+    /// @dev A codeless satellite target fails the {MilestoneBase.NotAContract} guard, so a mistyped
+    /// address cannot turn a delegated operation into a silent no-op.
     function test_constructorRejectsCodelessColdPaths() public {
         (bool ok, bytes memory ret) = _tryConstruct(
             abi.encode(
@@ -201,7 +214,26 @@ contract MilestoneHookPermissionsTest is LaunchpadTest {
                 support,
                 template,
                 address(0xC0DE),
-                PROTOCOL_ADMIN,
+                address(payoutPaths),
+                address(controller),
+                PROTOCOL_RECIPIENT
+            )
+        );
+
+        assertFalse(ok, "must not construct");
+        _assertRevertedWith(ret, MilestoneBase.NotAContract.selector);
+    }
+
+    function test_constructorRejectsCodelessPayoutPaths() public {
+        (bool ok, bytes memory ret) = _tryConstruct(
+            abi.encode(
+                IPoolManager(address(manager)),
+                nft,
+                support,
+                template,
+                address(coldPaths),
+                address(0xBEEF),
+                address(controller),
                 PROTOCOL_RECIPIENT
             )
         );
@@ -224,7 +256,7 @@ contract MilestoneHookPermissionsTest is LaunchpadTest {
 
         assertEq(uint8(hook.poolPhase(unknown)), uint8(Phase.NONE), "unknown pool has no phase");
         assertEq(hook.creatorClaimable(unknown), 0, "no creator balance");
-        assertEq(hook.protocolClaimable(unknown), 0, "no protocol balance");
+        assertEq(hook.protocolClaimable(), 0, "no global protocol balance");
         assertFalse(hook.curvePositionDeployed(unknown, 0), "no curve positions");
         assertFalse(hook.bandDeployed(unknown, 0), "no bands deployed");
     }
@@ -243,27 +275,40 @@ contract MilestoneHookPermissionsTest is LaunchpadTest {
 
     // --- Protocol administration is the whole privileged surface ---
 
-    function test_adminCanSetProtocolRecipient() public {
+    function test_adminCanGovernProtocolRecipientThroughController() public {
         address next = address(0xFEED);
+        bytes32 salt = keccak256("next-recipient");
 
         vm.prank(PROTOCOL_ADMIN);
-        hook.setProtocolRecipient(next);
+        controller.scheduleProtocolRecipient(next, salt);
+        controller.executeProtocolRecipient(next, salt);
 
-        assertEq(hook.protocolRecipient(), next, "recipient updated");
+        assertEq(hook.protocolRecipient(), next, "hook recipient updated");
+        assertEq(controller.protocolRecipient(), next, "controller recipient updated");
     }
 
-    function test_nonAdminCannotSetProtocolRecipient() public {
+    function test_nonAdminCannotScheduleProtocolRecipient() public {
         vm.prank(address(0xBAD));
-        vm.expectRevert(MilestoneBase.NotProtocolAdmin.selector);
-        hook.setProtocolRecipient(address(0xBAD));
+        vm.expectRevert();
+        controller.scheduleProtocolRecipient(address(0xBAD), keccak256("unauthorised"));
 
         assertEq(hook.protocolRecipient(), PROTOCOL_RECIPIENT, "unchanged");
     }
 
-    function test_protocolRecipientCannotBeZeroed() public {
+    function test_directHookRecipientUpdateRequiresController() public {
         vm.prank(PROTOCOL_ADMIN);
-        vm.expectRevert(MilestoneBase.ZeroAddress.selector);
-        hook.setProtocolRecipient(address(0));
+        vm.expectRevert(MilestoneBase.NotProtocolController.selector);
+        hook.setProtocolRecipient(address(0xFEED));
+    }
+
+    function test_protocolRecipientCannotBeZeroed() public {
+        bytes32 salt = keccak256("zero-recipient");
+        vm.prank(PROTOCOL_ADMIN);
+        controller.scheduleProtocolRecipient(address(0), salt);
+        vm.expectRevert();
+        controller.executeProtocolRecipient(address(0), salt);
+
+        assertEq(hook.protocolRecipient(), PROTOCOL_RECIPIENT, "unchanged");
     }
 
     /// @dev No privileged function exists beyond the recipient setter: no pause, no config override,
@@ -319,6 +364,18 @@ contract MilestoneHookPermissionsTest is LaunchpadTest {
     function test_coldPathsRejectDirectUnlockDispatch() public {
         vm.expectRevert(MilestoneColdPaths.NotDelegated.selector);
         coldPaths.dispatchUnlock(abi.encode(uint8(0), uint256(0)));
+    }
+
+    // --- Payout paths are reachable only as the hook ---
+
+    function test_payoutPathsRejectDirectFlush() public {
+        vm.expectRevert(MilestonePayoutPaths.NotDelegated.selector);
+        payoutPaths.flush(poolId);
+    }
+
+    function test_payoutPathsRejectDirectCreatorClaim() public {
+        vm.expectRevert(MilestonePayoutPaths.NotDelegated.selector);
+        payoutPaths.claimCreatorPath(poolId);
     }
 
     // --- Unimplemented callbacks fail closed ---

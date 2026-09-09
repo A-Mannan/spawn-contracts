@@ -111,7 +111,7 @@ library LadderLib {
 
     /// @notice The ladder's total token allocation, as fixed at launch.
     function ladderSupply(uint256 totalSupply, uint64 ladderSupplyShareWad) internal pure returns (uint256) {
-        return (totalSupply * ladderSupplyShareWad) / 1e18;
+        return FullMath.mulDiv(totalSupply, ladderSupplyShareWad, 1e18);
     }
 
     /// @notice Splits the tokens available to a band into the amount it takes and the amount carried on.
@@ -130,7 +130,7 @@ library LadderLib {
         pure
         returns (uint256 amount, uint256 carried)
     {
-        uint256 cap = perBand * capMultiple;
+        uint256 cap = mulSaturating(perBand, capMultiple);
         if (available > cap) return (cap, available - cap);
         return (available, 0);
     }
@@ -161,16 +161,45 @@ library LadderLib {
         liquidity = uint128(FullMath.mulDiv(amount1, FixedPoint96.Q96, denominator));
     }
 
+    /// @notice One past the highest addressable band index.
+    ///
+    /// @dev Band membership is stored as one bit per index in a `uint256`, so index 256 has nowhere to
+    /// live. That ceiling is *not* implied by the creation caps: a level the price jumped is skipped
+    /// rather than created, and a skip advances the cursor without consuming an extension, so the
+    /// absolute index can outrun `coreBandCount + maxFeeFundedBands` without bound. Left unchecked,
+    /// `1 << 256` evaluates to zero — the band would mint, record no deployed bit, and never appear in
+    /// the live set to be harvested, stranding its inventory in a position nothing can burn.
+    uint256 internal constant MAX_BAND_COUNT = 256;
+
     /// @notice Whether band `index` may still be created at all.
     /// @dev Core bands are always addressable. Fee-funded bands stop at the template cap, counted in
     /// bands actually created — a level the price jumped was never created and so does not consume one.
+    /// Every index is additionally bounded by {MAX_BAND_COUNT}, which is the bitmap's width rather than
+    /// an economic limit; reaching it ends the ladder the same way running out of tick space does.
     function withinLadderCap(uint8 coreBandCount, uint256 index, uint32 feeFundedBandsCreated, uint8 maxFeeFunded)
         internal
         pure
         returns (bool)
     {
+        if (index >= MAX_BAND_COUNT) return false;
         if (index < coreBandCount) return true;
         return feeFundedBandsCreated < maxFeeFunded;
+    }
+
+    /// @notice `a * b`, saturating at `type(uint256).max` instead of reverting.
+    ///
+    /// @dev Total supply is unbounded above, so an inventory capacity expressed as a multiple of a
+    /// per-band share can leave `uint256` for a large enough launch. Reverting there would be worse than
+    /// saturating: the products this guards are compared against real inventory and then clamped by a
+    /// fee amount, so a saturated ceiling is indistinguishable from the true one at every reachable
+    /// input, while a revert would permanently brick fee collection for that pool.
+    function mulSaturating(uint256 a, uint256 b) internal pure returns (uint256) {
+        if (a == 0 || b == 0) return 0;
+        unchecked {
+            uint256 product = a * b;
+            if (product / a != b) return type(uint256).max;
+            return product;
+        }
     }
 
     // --- Swap-path simulation (design Decision 15) ---

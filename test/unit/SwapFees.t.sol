@@ -9,7 +9,9 @@ import {PoolId} from "v4-core/src/types/PoolId.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {HarnessLaunchpadTest} from "../HarnessFixtures.sol";
 import {MilestoneBase} from "../../src/MilestoneBase.sol";
-import {Bounds, FEE_DENOMINATOR, HarvestSplit, LaunchConfig, Phase} from "../../src/types/LaunchTypes.sol";
+import {MilestoneToken} from "../../src/MilestoneToken.sol";
+import {Bounds, FEE_DENOMINATOR, Phase, PoolState, WAD} from "../../src/types/LaunchTypes.sol";
+import {EconomicConfig} from "../../src/types/PayoutTypes.sol";
 
 /// @notice Shared rig for the swap-fee suites: sizes that keep a measurement clear of the ladder, and the
 /// log decoding the two fee events need.
@@ -115,12 +117,11 @@ abstract contract FeeFixture is HarnessLaunchpadTest {
         uint256 quoteFees;
         uint256 tokenFees;
         bool routed;
-        uint256 lpQuote;
-        uint256 lpToken;
         uint256 creatorQuote;
         uint256 protocolQuote;
         uint256 diverted;
-        uint128 liquidityAdded;
+        uint256 tokensBurned;
+        uint64 economicVersion;
     }
 
     function _collectedFromLogs(Vm.Log[] memory logs) internal pure returns (Collected memory c) {
@@ -131,8 +132,8 @@ abstract contract FeeFixture is HarnessLaunchpadTest {
                 (c.quoteFees, c.tokenFees) = abi.decode(logs[i].data, (uint256, uint256));
             } else if (logs[i].topics[0] == MilestoneBase.FeesRouted.selector) {
                 c.routed = true;
-                (c.lpQuote, c.lpToken, c.creatorQuote, c.protocolQuote, c.diverted, c.liquidityAdded) =
-                    abi.decode(logs[i].data, (uint256, uint256, uint256, uint256, uint256, uint128));
+                (c.creatorQuote, c.protocolQuote, c.diverted, c.tokensBurned, c.economicVersion) =
+                    abi.decode(logs[i].data, (uint256, uint256, uint256, uint256, uint64));
             }
         }
     }
@@ -159,11 +160,115 @@ abstract contract GraduatedFeeFixture is FeeFixture {
         super.setUp();
         _graduate();
 
-        // Decision 18 graduates inside the *next* swap's `beforeSwap`, so `_graduate()` signs off with a
-        // dust buy whose fee lands in the brand-new full-range position. Sweeping it here starts every
-        // measurement below from a position with nothing accrued, at the price of a few wei of quote left
-        // in `pendingLpQuote` — the rounding dust the specs provide for.
+        // The transition's dust buy leaves a small fee in the new position. Sweep it so every measurement
+        // below starts from a clean position.
         _clearAccrual();
+    }
+
+    struct PoolContext {
+        PoolId id;
+        PoolKey key;
+        MilestoneToken token;
+    }
+
+    struct AccountingSnapshot {
+        uint256 creatorQuote;
+        uint256 protocolQuote;
+        uint256 milestoneFund;
+        uint256 tokenSupply;
+        uint128 liquidity;
+    }
+
+    function _currentPool() internal view returns (PoolContext memory pool) {
+        pool = PoolContext({id: poolId, key: key, token: token});
+    }
+
+    function _usePool(PoolContext memory pool) internal {
+        poolId = pool.id;
+        key = pool.key;
+        token = pool.token;
+    }
+
+    function _launchGraduatedPool(string memory name_, string memory symbol_)
+        internal
+        returns (PoolContext memory pool)
+    {
+        (PoolId id, PoolKey memory poolKey, MilestoneToken poolToken) = _launchDirect(_defaultConfig(name_, symbol_));
+        pool = PoolContext({id: id, key: poolKey, token: poolToken});
+        _usePool(pool);
+        _graduate();
+        _clearAccrual();
+    }
+
+    function _setEconomics(uint64 quoteCreatorShareWad, uint64 tokenMilestoneFundShareWad)
+        internal
+        returns (EconomicConfig memory next)
+    {
+        EconomicConfig memory current = hook.economicConfig();
+        next = EconomicConfig({
+            harvestServiceFeeWad: current.harvestServiceFeeWad,
+            quoteCreatorShareWad: quoteCreatorShareWad,
+            tokenMilestoneFundShareWad: tokenMilestoneFundShareWad,
+            version: current.version + 1
+        });
+        bytes32 salt = keccak256(abi.encode("swap-fee-economics", next));
+        vm.prank(PROTOCOL_ADMIN);
+        controller.scheduleEconomicConfig(next, salt);
+        controller.executeEconomicConfig(next, salt);
+        assertEq(hook.economicConfig().version, next.version, "hook activated the governed version");
+        assertEq(controller.economicConfig().version, next.version, "controller records the same version");
+    }
+
+    function _snapshot() internal view returns (AccountingSnapshot memory before_) {
+        before_ = AccountingSnapshot({
+            creatorQuote: hook.creatorClaimable(poolId),
+            protocolQuote: hook.protocolClaimable(),
+            milestoneFund: hook.poolState(poolId).milestoneFundAccrued,
+            tokenSupply: token.totalSupply(),
+            liquidity: _fullRangeLiquidity()
+        });
+    }
+
+    function _assertQuoteCollection(Collected memory c, AccountingSnapshot memory before_, EconomicConfig memory config)
+        internal
+        view
+    {
+        uint256 expectedCreator = (c.quoteFees * config.quoteCreatorShareWad) / WAD;
+        assertTrue(c.seen && c.routed, "a real collection was routed");
+        assertGt(c.quoteFees, 0, "quote fees were collected");
+        assertEq(c.tokenFees, 0, "the measurement was quote-only");
+        assertEq(c.economicVersion, config.version, "the active version was sampled");
+        assertEq(c.creatorQuote, expectedCreator, "creator received the configured floor share");
+        assertEq(c.protocolQuote, c.quoteFees - expectedCreator, "protocol received the exact remainder");
+        assertEq(hook.creatorClaimable(poolId) - before_.creatorQuote, c.creatorQuote, "creator ledger delta is exact");
+        assertEq(hook.protocolClaimable() - before_.protocolQuote, c.protocolQuote, "protocol ledger delta is exact");
+        assertEq(hook.poolState(poolId).milestoneFundAccrued, before_.milestoneFund, "quote cannot fund milestones");
+        assertEq(token.totalSupply(), before_.tokenSupply, "quote cannot burn launch tokens");
+        assertEq(_fullRangeLiquidity(), before_.liquidity, "quote collection cannot compound liquidity");
+    }
+
+    function _assertTokenCollection(Collected memory c, AccountingSnapshot memory before_, EconomicConfig memory config)
+        internal
+        view
+    {
+        uint256 expectedDiversion = (c.tokenFees * config.tokenMilestoneFundShareWad) / WAD;
+        assertTrue(c.seen && c.routed, "a real collection was routed");
+        assertGt(c.tokenFees, 0, "token fees were collected");
+        assertEq(c.quoteFees, 0, "the measurement was token-only");
+        assertEq(c.economicVersion, config.version, "the active version was sampled");
+        assertEq(c.creatorQuote, 0, "token cannot reach the creator ledger");
+        assertEq(c.protocolQuote, 0, "token cannot reach the protocol ledger");
+        assertEq(c.diverted, expectedDiversion, "milestone fund received the configured floor share");
+        assertEq(c.tokensBurned, c.tokenFees - expectedDiversion, "the exact token remainder burned");
+        assertEq(hook.creatorClaimable(poolId), before_.creatorQuote, "creator ledger is unchanged");
+        assertEq(hook.protocolClaimable(), before_.protocolQuote, "protocol ledger is unchanged");
+        assertEq(
+            hook.poolState(poolId).milestoneFundAccrued - before_.milestoneFund,
+            c.diverted,
+            "milestone-fund ledger delta is exact"
+        );
+        assertEq(before_.tokenSupply - token.totalSupply(), c.tokensBurned, "supply fell by the exact burn");
+        assertEq(_fullRangeLiquidity(), before_.liquidity, "token collection cannot compound liquidity");
     }
 }
 
@@ -175,13 +280,14 @@ abstract contract GraduatedFeeFixture is FeeFixture {
 /// pool to that: they measure what a trader was actually charged, at genesis and a year later, rather than
 /// only reading the stored value back.
 contract DefaultSwapFeeTest is FeeFixture {
-    // --- Scenario: The base fee applies from genesis ---
+    // --- Scenario: One percent applies from genesis forever ---
 
     function test_theBaseFeeAppliesFromGenesis() public {
         // Before any trade at all, the pool is already set to the template's fee and the hook agrees.
-        assertEq(_baseFeeOf(poolId), template.baseFeeHundredthsBip, "the pool opens at the template's base fee");
-        assertEq(hook.poolState(poolId).baseFeeHundredthsBip, template.baseFeeHundredthsBip, "and the hook agrees");
-        assertEq(template.baseFeeHundredthsBip, 10_000, "which is 1%");
+        assertEq(_baseFeeOf(poolId), template.tradingFeeHundredthsBip, "the pool opens at the template's fee");
+        assertEq(key.fee, template.tradingFeeHundredthsBip, "which is the literal fee carried in the pool key");
+        assertEq(template.tradingFeeHundredthsBip, Bounds.TRADING_FEE_HUNDREDTHS_BIP, "the published constant");
+        assertEq(template.tradingFeeHundredthsBip, 10_000, "which is 1%");
 
         // And that is what the very first swap is charged. Both buys stop inside curve position 0, so the
         // liquidity they met is the one the accumulator has to be scaled by.
@@ -198,7 +304,9 @@ contract DefaultSwapFeeTest is FeeFixture {
         assertEq(_deployedCurveCount(), 1, "without waking a second position, so one liquidity all through");
 
         uint256 firstFee = _feeFromGrowth(growthBefore, liquidity);
-        assertApproxEqRel(firstFee, _feeOn(firstIn, template.baseFeeHundredthsBip), 0.0005e18, "the first swap paid 1%");
+        assertApproxEqRel(
+            firstFee, _feeOn(firstIn, template.tradingFeeHundredthsBip), 0.0005e18, "the first swap paid 1%"
+        );
 
         // Identical on the next swap, and the stored fee is where it started.
         growthBefore = _quoteFeeGrowth();
@@ -207,11 +315,13 @@ contract DefaultSwapFeeTest is FeeFixture {
         assertEq(_poolLiquidity(poolId), liquidity, "still the same single position");
 
         uint256 secondFee = _feeFromGrowth(growthBefore, liquidity);
-        assertApproxEqRel(secondFee, _feeOn(secondIn, template.baseFeeHundredthsBip), 0.0005e18, "and so did the next");
-        assertEq(_baseFeeOf(poolId), template.baseFeeHundredthsBip, "trading does not move the base fee");
+        assertApproxEqRel(
+            secondFee, _feeOn(secondIn, template.tradingFeeHundredthsBip), 0.0005e18, "and so did the next"
+        );
+        assertEq(_baseFeeOf(poolId), template.tradingFeeHundredthsBip, "trading does not move the base fee");
     }
 
-    // --- Scenario: The fee does not depend on time since launch ---
+    // --- Scenario: Time does not affect the fee ---
 
     /// @dev Two launches of the same shape open at the same level with the same geometry, so the same input
     /// must buy the same output — unless the fee between them differs. Comparing two pools rather than two
@@ -242,7 +352,7 @@ contract DefaultSwapFeeTest is FeeFixture {
 /// there was no sliver to put back. The tests below still check it, because the requirement is about the
 /// observable position rather than about how it is realised.
 contract FeeCollectionTest is GraduatedFeeFixture {
-    // --- Scenario: Any address can trigger collection ---
+    // --- Scenario: Any address can collect ---
 
     function test_anyAddressCanTriggerCollection() public {
         _sell(MEASURED_SELL);
@@ -276,8 +386,8 @@ contract FeeCollectionTest is GraduatedFeeFixture {
         }
     }
 
-    // --- Scenario: Net position is preserved ---
-    // --- Scenario (graduation): Fee collection preserves net liquidity ---
+    // --- Scenario: Net locked position is preserved ---
+    // --- Scenario (graduation): Other routing preserves existing liquidity ---
 
     /// @dev The lopsided case, which is the common one: v4 charges the fee on the swap's input, so a stretch
     /// of one-directional trading accrues in one currency only and there is next to nothing to pair at spot.
@@ -291,27 +401,20 @@ contract FeeCollectionTest is GraduatedFeeFixture {
 
         assertEq(quoteFees, 0, "a sell pays its fee in token only");
         assertGt(tokenFees, 0, "and it did pay one");
-        assertGe(_fullRangeLiquidity(), liquidityBefore, "liquidity is never reduced");
-        assertApproxEqRel(_fullRangeLiquidity(), liquidityBefore, 1e12, "not reduced and rebuilt, either");
-        assertEq(hook.poolState(poolId).fullRangeLiquidity, _fullRangeLiquidity(), "and the hook's record agrees");
+        assertEq(_fullRangeLiquidity(), liquidityBefore, "collection leaves locked liquidity unchanged");
+        assertEq(hook.poolState(poolId).fullRangeLiquidity, liquidityBefore, "and the hook's record agrees");
     }
 
-    function test_netLiquidityNeverDecreasesAcrossManyCollections() public {
-        uint128 previous = _fullRangeLiquidity();
-        uint128 opening = previous;
+    function test_netLiquidityNeverChangesAcrossManyCollections() public {
+        uint128 opening = _fullRangeLiquidity();
 
         for (uint256 i = 0; i < 4; i++) {
             _sell(MEASURED_SELL);
             _buyClearOfTheLadder(MEASURED_BUY);
             hook.collectFees(key);
 
-            uint128 current = _fullRangeLiquidity();
-            assertGe(current, previous, "collection never reduces the position");
-            previous = current;
+            assertEq(_fullRangeLiquidity(), opening, "collection never compounds the position");
         }
-
-        // Not a vacuous pass: with both currencies arriving, the LP share really did compound.
-        assertGt(previous, opening, "and over a two-sided market it grows");
     }
 
     // --- Scenario: Repeated collection is harmless ---
@@ -326,10 +429,8 @@ contract FeeCollectionTest is GraduatedFeeFixture {
 
         uint128 liquidity = _fullRangeLiquidity();
         uint256 creatorQuote = hook.creatorClaimable(poolId);
-        uint256 protocolQuote = hook.protocolClaimable(poolId);
+        uint256 protocolQuote = hook.protocolClaimable();
         uint256 accrued = hook.poolState(poolId).milestoneFundAccrued;
-        uint256 carriedQuote = hook.poolState(poolId).pendingLpQuote;
-        uint256 carriedToken = hook.poolState(poolId).pendingLpToken;
         uint256 hookEth = HOOK_ADDR.balance;
         uint256 hookTokens = token.balanceOf(HOOK_ADDR);
 
@@ -349,17 +450,15 @@ contract FeeCollectionTest is GraduatedFeeFixture {
             assertLt(gasUsed, 60_000, "and bounded outright, so spamming it grieves nobody");
         }
 
-        assertEq(_fullRangeLiquidity(), liquidity, "the position is unchanged in net terms");
+        assertEq(_fullRangeLiquidity(), liquidity, "the position is unchanged");
         assertEq(hook.creatorClaimable(poolId), creatorQuote, "no ledger moved");
-        assertEq(hook.protocolClaimable(poolId), protocolQuote, "no ledger moved");
+        assertEq(hook.protocolClaimable(), protocolQuote, "no ledger moved");
         assertEq(hook.poolState(poolId).milestoneFundAccrued, accrued, "the milestone fund did not grow");
-        assertEq(hook.poolState(poolId).pendingLpQuote, carriedQuote, "and nothing was drawn from the carry");
-        assertEq(hook.poolState(poolId).pendingLpToken, carriedToken, "on either side");
         assertEq(HOOK_ADDR.balance, hookEth, "no value left the manager a second time");
         assertEq(token.balanceOf(HOOK_ADDR), hookTokens, "in either currency");
     }
 
-    // --- Scenario: Collection with zero accrual is a no-op ---
+    // --- Scenario: Zero-accrual collection is a no-op ---
 
     function test_collectionWithZeroAccrualIsANoOp() public {
         // The fixture swept graduation's trailing dust, so the position exists and is in range but has
@@ -399,38 +498,43 @@ contract FeeCollectionTest is GraduatedFeeFixture {
 
     // --- Collection realises value out of the singleton, not merely on paper ---
 
-    function test_tokenFeesAreRealisedIntoHookCustody() public {
-        uint256 carriedBefore = hook.poolState(poolId).pendingLpToken;
+    function test_tokenFeesAreRealisedThenFundedOrBurned() public {
         uint256 hookTokensBefore = token.balanceOf(HOOK_ADDR);
 
         _sell(MEASURED_SELL);
         Collected memory c = _collectAndCapture();
 
-        // Whatever the pairing consumed went back into the pool as liquidity; the rest left the manager for
-        // hook custody, which is where the ledgers and the milestone fund are paid from.
-        uint256 paired = (carriedBefore + c.lpToken) - hook.poolState(poolId).pendingLpToken;
         assertGt(c.tokenFees, 0, "the sell paid a fee");
-        assertEq(token.balanceOf(HOOK_ADDR) - hookTokensBefore, c.tokenFees - paired, "the rest became a real balance");
+        assertEq(c.diverted + c.tokensBurned, c.tokenFees, "funding plus burn conserved it");
+        assertEq(token.balanceOf(HOOK_ADDR) - hookTokensBefore, c.diverted, "only milestone funding remains");
     }
 
     function test_quoteFeesAreRealisedAsNativeEth() public {
-        uint256 carriedBefore = hook.poolState(poolId).pendingLpQuote;
         uint256 hookEthBefore = HOOK_ADDR.balance;
 
         _buyClearOfTheLadder(MEASURED_BUY);
         Collected memory c = _collectAndCapture();
 
-        uint256 paired = (carriedBefore + c.lpQuote) - hook.poolState(poolId).pendingLpQuote;
         assertGt(c.quoteFees, 0, "the buy paid a fee");
-        assertEq(HOOK_ADDR.balance - hookEthBefore, c.quoteFees - paired, "and it arrived as native ETH");
+        assertEq(HOOK_ADDR.balance - hookEthBefore, c.quoteFees, "and all quote arrived as native ETH");
     }
 }
 
-/// @notice Unit tests for tasks 10.2 and 10.3 — the fee waterfall and its LP compounding.
+/// @notice Unit tests for the `swap-fees` "Fee routing waterfall" requirement.
+///
+/// @dev The waterfall has two destinations per currency and no third. Quote splits between the pool's
+/// direct creator ledger and the single global protocol ledger; token either funds still-usable ladder
+/// capacity or burns. Nothing compounds, nothing is carried for a later pairing, and no token reaches a
+/// claimant — the LP share and its carry were removed with the rest of the compounding model, so what
+/// these tests assert is an exact two-way partition rather than a remainder.
 contract FeeWaterfallTest is GraduatedFeeFixture {
-    // --- Scenario: Quote fees split three ways on collection ---
+    // --- Scenario: Default quote split is 75 25 ---
 
-    function test_quoteFeesSplitThreeWays() public {
+    /// @dev The remainder is the protocol's *by subtraction*, not by a second percentage: 75% is computed
+    /// and whatever is left over — division dust included — is the protocol's. Asserting both the floor
+    /// and the exact complement is what distinguishes that from two independently rounded shares, which
+    /// would leave a wei unaccounted at some inputs.
+    function test_defaultQuoteSplitIs75_25() public {
         _buyClearOfTheLadder(MEASURED_BUY);
         Collected memory c = _collectAndCapture();
 
@@ -438,49 +542,55 @@ contract FeeWaterfallTest is GraduatedFeeFixture {
         assertEq(c.tokenFees, 0, "and not in token");
         assertEq(c.diverted, 0, "quote is never diverted, so the whole amount reaches the waterfall");
 
-        assertEq(c.creatorQuote, (c.quoteFees * 3) / 10, "30% to the creator");
-        assertEq(c.protocolQuote, c.quoteFees / 10, "10% to the protocol");
-        assertEq(c.lpQuote, c.quoteFees - c.creatorQuote - c.protocolQuote, "the LP takes the remainder");
-        assertApproxEqAbs(c.lpQuote, (c.quoteFees * 6) / 10, 10, "which is 60%, plus the division dust");
+        uint256 expectedCreator = (c.quoteFees * Bounds.DEFAULT_QUOTE_CREATOR_SHARE_WAD) / WAD;
+        assertEq(c.creatorQuote, expectedCreator, "75% to the creator");
+        assertEq(c.protocolQuote, c.quoteFees - expectedCreator, "and the exact remainder to the protocol");
+        assertEq(c.creatorQuote + c.protocolQuote, c.quoteFees, "which together is all of it");
     }
 
-    // --- Scenario: Token fees are never credited to a recipient ---
+    function testFuzz_defaultQuoteSplitIs75_25(uint256 buyAmount) public {
+        buyAmount = bound(buyAmount, 0.01 ether, 50 ether);
 
-    /// @dev design Decision 21. Token fees paid to a creator or the protocol would be income realisable
-    /// only by selling into the pool's own holders, so the whole token side goes to pool-facing
-    /// destinations: the milestone fund's next-band inventory, and full-range compounding.
-    function test_tokenFeesAreNeverCreditedToARecipient() public {
-        uint256 creatorBefore = hook.creatorClaimable(poolId);
-        uint256 protocolBefore = hook.protocolClaimable(poolId);
-        uint256 creatorTokensBefore = token.balanceOf(creator);
-        uint256 recipientTokensBefore = token.balanceOf(PROTOCOL_RECIPIENT);
-
-        _sell(MEASURED_SELL);
+        _buyClearOfTheLadder(buyAmount);
         Collected memory c = _collectAndCapture();
 
-        assertGt(c.tokenFees, 0, "the sell paid a real fee in token");
-        assertEq(c.quoteFees, 0, "and nothing in quote, so no ledger has any business moving");
-
-        assertEq(hook.creatorClaimable(poolId), creatorBefore, "the creator's ledger did not move");
-        assertEq(hook.protocolClaimable(poolId), protocolBefore, "nor the protocol's");
-        assertEq(token.balanceOf(creator), creatorTokensBefore, "and no token was pushed to either");
-        assertEq(token.balanceOf(PROTOCOL_RECIPIENT), recipientTokensBefore, "and no token was pushed to either");
-
-        // Every wei of it went to the fund or to the pool: those are the only two destinations there are.
-        assertEq(c.diverted + c.lpToken, c.tokenFees, "the token side is fully accounted for by the two");
-        assertEq(c.diverted, (c.tokenFees * 2) / 10, "20% to the next band's inventory");
-        assertEq(c.lpToken, c.tokenFees - c.diverted, "and the remainder compounds");
-
-        // There is no token claim entry point to reach it with, either.
-        (bool ok,) = HOOK_ADDR.call(abi.encodeWithSignature("claimCreatorTokens(bytes32)", PoolId.unwrap(poolId)));
-        assertFalse(ok, "no token claim exists for the creator");
-        (ok,) = HOOK_ADDR.call(abi.encodeWithSignature("claimProtocolTokens(bytes32)", PoolId.unwrap(poolId)));
-        assertFalse(ok, "nor for the protocol");
+        assertEq(
+            c.creatorQuote,
+            (c.quoteFees * Bounds.DEFAULT_QUOTE_CREATOR_SHARE_WAD) / WAD,
+            "the creator floor holds at every size"
+        );
+        assertEq(c.creatorQuote + c.protocolQuote, c.quoteFees, "and the protocol takes the exact remainder");
     }
 
-    // --- Scenario: Routed amounts sum to collected fees ---
+    // --- Scenario: Collection uses one configuration snapshot ---
 
-    function test_routedAmountsSumToCollectedFees() public {
+    /// @dev One tuple is copied before any arithmetic, so both currencies in a single collection are routed
+    /// by the same version. The event carries that version, which is what makes the claim checkable rather
+    /// than merely intended: a routing that re-read economics between the quote and token halves could
+    /// report only one of the two versions it used.
+    function test_collectionUsesOneConfigurationSnapshot() public {
+        _sell(MEASURED_SELL);
+        _buyClearOfTheLadder(MEASURED_BUY);
+
+        uint64 live = hook.economicConfig().version;
+        Collected memory c = _collectAndCapture();
+
+        assertTrue(c.routed, "the collection routed");
+        assertGt(c.quoteFees, 0, "with a quote side");
+        assertGt(c.tokenFees, 0, "and a token side, so both halves ran");
+        assertEq(c.economicVersion, live, "both were routed under the version live at collection");
+
+        // The same version governed each half's arithmetic, checkable against the tuple it names.
+        EconomicConfig memory economics = hook.economicConfig();
+        assertEq(
+            c.creatorQuote, (c.quoteFees * economics.quoteCreatorShareWad) / WAD, "quote followed the named version"
+        );
+        assertEq(c.diverted + c.tokensBurned, c.tokenFees, "and the token side was partitioned under the same one");
+    }
+
+    // --- Scenario: Routed amounts conserve each currency ---
+
+    function test_routedAmountsConserveEachCurrency() public {
         _sell(MEASURED_SELL);
         _buyClearOfTheLadder(MEASURED_BUY);
         Collected memory c = _collectAndCapture();
@@ -488,11 +598,11 @@ contract FeeWaterfallTest is GraduatedFeeFixture {
         assertGt(c.quoteFees, 0, "both sides accrued");
         assertGt(c.tokenFees, 0, "both sides accrued");
 
-        assertEq(c.lpQuote + c.creatorQuote + c.protocolQuote, c.quoteFees, "the quote side is fully accounted for");
-        assertEq(c.lpToken + c.diverted, c.tokenFees, "and the token side, diversion included");
+        assertEq(c.creatorQuote + c.protocolQuote, c.quoteFees, "the quote side is fully accounted for");
+        assertEq(c.diverted + c.tokensBurned, c.tokenFees, "and the token side, diversion and burn together");
     }
 
-    function testFuzz_routedAmountsSumToCollectedFees(uint256 sellAmount, uint256 buyAmount) public {
+    function testFuzz_routedAmountsConserveEachCurrency(uint256 sellAmount, uint256 buyAmount) public {
         sellAmount = bound(sellAmount, 1_000 ether, token.balanceOf(address(router)) / 2);
         buyAmount = bound(buyAmount, 0.01 ether, 50 ether);
 
@@ -500,80 +610,11 @@ contract FeeWaterfallTest is GraduatedFeeFixture {
         _buyClearOfTheLadder(buyAmount);
         Collected memory c = _collectAndCapture();
 
-        assertEq(c.lpQuote + c.creatorQuote + c.protocolQuote, c.quoteFees, "quote side sums, at every size");
-        assertEq(c.lpToken + c.diverted, c.tokenFees, "token side sums, at every size");
+        assertEq(c.creatorQuote + c.protocolQuote, c.quoteFees, "quote side sums, at every size");
+        assertEq(c.diverted + c.tokensBurned, c.tokenFees, "token side sums, at every size");
     }
 
-    // --- Scenario: The LP share compounds ---
-
-    function test_theLpShareCompoundsIntoTheFullRangePosition() public {
-        _sell(MEASURED_SELL);
-        _buyClearOfTheLadder(MEASURED_BUY);
-
-        uint128 liquidityBefore = _fullRangeLiquidity();
-        uint256 creatorQuoteBefore = hook.creatorClaimable(poolId);
-        uint256 protocolQuoteBefore = hook.protocolClaimable(poolId);
-
-        Collected memory c = _collectAndCapture();
-
-        assertGt(c.liquidityAdded, 0, "the pairing minted liquidity");
-        assertEq(_fullRangeLiquidity() - liquidityBefore, c.liquidityAdded, "v4 holds exactly what was reported");
-        assertEq(
-            hook.poolState(poolId).fullRangeLiquidity - liquidityBefore,
-            c.liquidityAdded,
-            "and the hook's own record agrees"
-        );
-
-        // Compounding means "became liquidity", not "was credited somewhere". The ledgers moved by exactly
-        // their own shares and not by a wei of the LP's.
-        assertEq(hook.creatorClaimable(poolId) - creatorQuoteBefore, c.creatorQuote, "creator got the creator share");
-        assertEq(hook.protocolClaimable(poolId) - protocolQuoteBefore, c.protocolQuote, "protocol likewise");
-    }
-
-    function test_theLpShareKeepsCompoundingAcrossCollections() public {
-        uint128 previous = _fullRangeLiquidity();
-
-        for (uint256 i = 0; i < 3; i++) {
-            _sell(MEASURED_SELL);
-            _buyClearOfTheLadder(MEASURED_BUY);
-            Collected memory c = _collectAndCapture();
-
-            assertGt(c.liquidityAdded, 0, "each collection compounds");
-            uint128 current = _fullRangeLiquidity();
-            assertGt(current, previous, "so the position strictly grows");
-            previous = current;
-        }
-    }
-
-    // --- Scenario: An unpairable LP token remainder carries forward ---
-
-    /// @dev The full-range position takes both currencies in the ratio spot implies, and a single
-    /// collection's fees are generally one-sided. What cannot be paired is carried rather than swapped for
-    /// (price impact) or donated (which would be re-split and taxed again on the next collection).
-    function test_theUnpairedLpShareIsCarriedRatherThanLost() public {
-        uint256 carriedBefore = hook.poolState(poolId).pendingLpToken;
-
-        _sell(MEASURED_SELL);
-        Collected memory c = _collectAndCapture();
-
-        assertGt(c.lpToken, 0, "there was an LP token share to place");
-        assertApproxEqRel(
-            hook.poolState(poolId).pendingLpToken - carriedBefore,
-            c.lpToken,
-            1e12,
-            "so essentially the whole LP share waits in custody"
-        );
-        uint256 carriedAfterSell = hook.poolState(poolId).pendingLpToken;
-
-        // The other side arriving is what unlocks it.
-        _buyClearOfTheLadder(MEASURED_BUY);
-        Collected memory second = _collectAndCapture();
-
-        assertGt(second.liquidityAdded, 0, "now it pairs");
-        assertLt(hook.poolState(poolId).pendingLpToken, carriedAfterSell, "and the carried token share was drawn down");
-    }
-
-    // --- Scenario (revenue-claims): Fee creator share accrues ---
+    // --- Scenario (revenue-claims): Fee creator share accrues directly ---
 
     function test_feeCreatorShareAccrues() public {
         _sell(MEASURED_SELL);
@@ -598,61 +639,44 @@ contract FeeWaterfallTest is GraduatedFeeFixture {
         assertEq(creator.balance - creatorEthBefore, paidEth, "paid out for real");
     }
 
-    // --- Scenario (revenue-claims): Protocol shares accrue from every source ---
+    // --- Scenario (revenue-claims): Every protocol source accrues globally ---
 
-    /// @dev The fee source. The other two are asserted where they happen: graduation proceeds in
-    /// {GraduationTest.test_protocolCanClaimAfterGraduation}, the harvest share in
-    /// {MilestoneHarvestTest.test_sharesAreDistributedPerConfiguration}.
+    /// @dev The fee source. The protocol ledger is global rather than per-pool, so the assertion is on the
+    /// single balance and the claim takes no pool argument; graduation proceeds and the harvest service fee
+    /// are asserted where they happen.
     function test_feeProtocolShareAccrues() public {
         _sell(MEASURED_SELL);
         _buyClearOfTheLadder(MEASURED_BUY);
 
         uint256 recipientEthBefore = PROTOCOL_RECIPIENT.balance;
-        uint256 claimableBefore = hook.protocolClaimable(poolId);
+        uint256 claimableBefore = hook.protocolClaimable();
 
         Collected memory c = _collectAndCapture();
 
         assertGt(c.protocolQuote, 0, "there was a protocol share to credit");
-        assertEq(hook.protocolClaimable(poolId) - claimableBefore, c.protocolQuote, "credited in ETH");
+        assertEq(hook.protocolClaimable() - claimableBefore, c.protocolQuote, "credited in ETH");
         assertEq(PROTOCOL_RECIPIENT.balance, recipientEthBefore, "and never pushed");
 
         vm.prank(PROTOCOL_RECIPIENT);
-        uint256 paidEth = hook.claimProtocol(poolId);
+        uint256 paidEth = hook.claimProtocol();
 
-        assertEq(paidEth, claimableBefore + c.protocolQuote, "the whole ETH balance");
+        assertEq(paidEth, claimableBefore + c.protocolQuote, "the whole global ETH balance");
         assertEq(PROTOCOL_RECIPIENT.balance - recipientEthBefore, paidEth, "paid out for real");
     }
 
-    // --- Scenario (revenue-claims): Token-denominated fees never accrue to a claimant ---
+    // --- Scenario (revenue-claims): Token fees never accrue to a claimant ---
 
-    /// @dev The twin of {test_tokenFeesAreNeverCreditedToARecipient}, which holds this fixture's own pool to
-    /// the `swap-fees` routing rule. What `revenue-claims` adds is a quantifier — the ledgers stay put when
-    /// token fees are collected "on any pool" — so this walks pools rather than a pool.
-    ///
-    /// Fee routing is fixed by the immutable template while the harvest split is per-launch (Decision 16),
-    /// which makes the launch most able to leak token value to a creator the one whose creator share sits at
-    /// its 70% cap: if any configured share reached the token side, that is where it would show. Checked
-    /// here alongside the default split, and alongside a pool still on its bonding curve, where a seller
-    /// pays a token fee that no claimant can reach for a different reason — it is never collected at all.
+    /// @dev The quantified twin of the routing rule: token fees reach no claimant "on any pool". This walks
+    /// two pools rather than one — this fixture's graduated pool, and a second pool still on its bonding
+    /// curve, where a seller pays a token fee that no claimant can reach for a different reason: with no
+    /// full-range position there is nothing to collect at all, and the fee becomes ladder inventory when
+    /// graduation burns the curves.
     function test_tokenDenominatedFeesNeverAccrueToAClaimant() public {
-        _assertTokenFeesReachNoClaimant("default split");
+        _assertTokenFeesReachNoClaimant("graduated pool");
 
-        _relaunchGraduated(
-            _split(
-                Bounds.MAX_CREATOR_HARVEST_SHARE_WAD,
-                Bounds.MIN_BUYBACK_HARVEST_SHARE_WAD,
-                Bounds.MIN_PROTOCOL_HARVEST_SHARE_WAD
-            )
-        );
-        _assertTokenFeesReachNoClaimant("creator share at its cap");
-
-        // A pool still on its bonding curve. `fullRangeLiquidity` is zero until graduation seeds the
-        // position, so collection is a no-op there: the token fee stays in the curve and becomes ladder
-        // inventory when graduation burns it (`graduation` "Token inventory and curve token fees become
-        // ladder inventory"). Either way it does not pass through a claimable balance.
         (poolId, key, token) = _launchDirect(_defaultConfig("Curvy", "CRV"));
         vm.deal(address(router), 100_000 ether);
-        assertEq(uint8(hook.poolPhase(poolId)), uint8(Phase.BONDING_CURVE), "the third pool is still on its curve");
+        assertEq(uint8(hook.poolPhase(poolId)), uint8(Phase.BONDING_CURVE), "the second pool is still on its curve");
 
         _buy(SMALL_BUY);
         uint256 tokenGrowthBefore = _tokenFeeGrowth();
@@ -660,19 +684,21 @@ contract FeeWaterfallTest is GraduatedFeeFixture {
         assertGt(_tokenFeeGrowth(), tokenGrowthBefore, "the sell really was charged a token fee");
 
         uint256 creatorOnCurve = hook.creatorClaimable(poolId);
-        uint256 protocolOnCurve = hook.protocolClaimable(poolId);
+        uint256 protocolOnCurve = hook.protocolClaimable();
         Collected memory onCurve = _collectAndCapture();
 
         assertFalse(onCurve.seen, "with no full-range position there is nothing to collect");
         assertEq(hook.creatorClaimable(poolId), creatorOnCurve, "so the creator's ledger cannot have moved");
-        assertEq(hook.protocolClaimable(poolId), protocolOnCurve, "nor the protocol's");
+        assertEq(hook.protocolClaimable(), protocolOnCurve, "nor the protocol's");
     }
 
-    /// @dev Sells into `poolId`, collects, and holds both ledgers still. `label` names the pool so a failure
-    /// says which one broke the property.
+    /// @dev Sells into `poolId`, collects, and holds every claimant ledger still. `label` names the pool so
+    /// a failure says which one broke the property.
     function _assertTokenFeesReachNoClaimant(string memory label) private {
         uint256 creatorQuoteBefore = hook.creatorClaimable(poolId);
-        uint256 protocolQuoteBefore = hook.protocolClaimable(poolId);
+        uint256 protocolQuoteBefore = hook.protocolClaimable();
+        uint256 potBefore = hook.payoutPot(poolId);
+        uint256 creatorPathBefore = hook.creatorPathClaimable(poolId);
         uint256 creatorTokensBefore = token.balanceOf(creator);
         uint256 recipientTokensBefore = token.balanceOf(PROTOCOL_RECIPIENT);
 
@@ -683,7 +709,13 @@ contract FeeWaterfallTest is GraduatedFeeFixture {
         assertEq(c.quoteFees, 0, string.concat("and nothing in quote, so no ledger has business moving: ", label));
 
         assertEq(hook.creatorClaimable(poolId), creatorQuoteBefore, string.concat("creator ledger unmoved: ", label));
-        assertEq(hook.protocolClaimable(poolId), protocolQuoteBefore, string.concat("protocol ledger unmoved: ", label));
+        assertEq(hook.protocolClaimable(), protocolQuoteBefore, string.concat("protocol ledger unmoved: ", label));
+        assertEq(hook.payoutPot(poolId), potBefore, string.concat("the payout pot is untouched: ", label));
+        assertEq(
+            hook.creatorPathClaimable(poolId),
+            creatorPathBefore,
+            string.concat("and so is creator-path entitlement: ", label)
+        );
         assertEq(
             token.balanceOf(creator), creatorTokensBefore, string.concat("no token pushed to the creator: ", label)
         );
@@ -693,19 +725,190 @@ contract FeeWaterfallTest is GraduatedFeeFixture {
             string.concat("none to the protocol either: ", label)
         );
 
-        // The two pool-facing destinations account for all of it, which is the same claim from the other
-        // side: there is no third place for a token fee to have gone.
-        assertEq(c.diverted + c.lpToken, c.tokenFees, string.concat("fund plus pool is the whole of it: ", label));
+        // Funding and burning account for all of it, which is the same claim from the other side: there is
+        // no third place for a token fee to have gone.
+        assertEq(c.diverted + c.tokensBurned, c.tokenFees, string.concat("fund plus burn is the whole of it: ", label));
+    }
+}
+
+/// @notice Literal evidence for governed, global, prospective fee routing and the absence of compounding.
+contract GovernedFeeRoutingTest is GraduatedFeeFixture {
+    function _collectQuote(EconomicConfig memory config) private returns (Collected memory c) {
+        _buyClearOfTheLadder(MEASURED_BUY);
+        AccountingSnapshot memory before_ = _snapshot();
+        c = _collectAndCapture();
+        _assertQuoteCollection(c, before_, config);
     }
 
-    /// @dev Relaunches under `split` and graduates, sweeping the graduation dust so the next measurement
-    /// starts clean — the same two steps {GraduatedFeeFixture} takes.
-    function _relaunchGraduated(HarvestSplit memory split) private {
-        LaunchConfig memory config = _defaultConfig("Variant", "VAR");
-        config.harvestSplit = split;
-        (poolId, key, token) = _launchDirect(config);
-        vm.deal(address(router), 100_000 ether);
-        _graduate();
-        _clearAccrual();
+    function _collectToken(EconomicConfig memory config) private returns (Collected memory c) {
+        _sell(MEASURED_SELL);
+        AccountingSnapshot memory before_ = _snapshot();
+        c = _collectAndCapture();
+        _assertTokenCollection(c, before_, config);
+    }
+
+    // --- Scenario: Active quote distribution applies globally ---
+
+    function test_activeQuoteDistributionAppliesGlobally() public {
+        PoolContext memory first = _currentPool();
+        PoolContext memory second = _launchGraduatedPool("Second Quote", "SQUOTE");
+        EconomicConfig memory config = _setEconomics(0.6e18, Bounds.DEFAULT_TOKEN_MILESTONE_FUND_SHARE_WAD);
+
+        _usePool(first);
+        Collected memory firstCollection = _collectQuote(config);
+        _usePool(second);
+        Collected memory secondCollection = _collectQuote(config);
+
+        assertEq(firstCollection.economicVersion, config.version, "first pool used the global version");
+        assertEq(secondCollection.economicVersion, config.version, "second pool used the global version");
+    }
+
+    // --- Scenario: Active token distribution applies globally ---
+
+    function test_activeTokenDistributionAppliesGlobally() public {
+        PoolContext memory first = _currentPool();
+        PoolContext memory second = _launchGraduatedPool("Second Token", "STOKEN");
+        EconomicConfig memory config = _setEconomics(Bounds.DEFAULT_QUOTE_CREATOR_SHARE_WAD, 0.35e18);
+
+        _usePool(first);
+        Collected memory firstCollection = _collectToken(config);
+        _usePool(second);
+        Collected memory secondCollection = _collectToken(config);
+
+        assertEq(firstCollection.economicVersion, config.version, "first pool used the global version");
+        assertEq(secondCollection.economicVersion, config.version, "second pool used the global version");
+    }
+
+    // --- Scenario: Collector cannot redirect value ---
+
+    function test_collectorCannotRedirectValue() public {
+        EconomicConfig memory config = _setEconomics(0.6e18, 0.35e18);
+        _sell(MEASURED_SELL);
+        _buyClearOfTheLadder(MEASURED_BUY);
+        AccountingSnapshot memory before_ = _snapshot();
+        uint256 callerEth = STRANGER.balance;
+        uint256 callerToken = token.balanceOf(STRANGER);
+
+        Collected memory c = _collectAs(STRANGER);
+        uint256 expectedCreator = (c.quoteFees * config.quoteCreatorShareWad) / WAD;
+        uint256 expectedDiversion = (c.tokenFees * config.tokenMilestoneFundShareWad) / WAD;
+
+        assertEq(c.caller, STRANGER, "the third party really triggered collection");
+        assertEq(c.economicVersion, config.version, "routing used the active version");
+        assertEq(c.creatorQuote, expectedCreator, "only the creator destination received its share");
+        assertEq(c.protocolQuote, c.quoteFees - expectedCreator, "only the protocol received the remainder");
+        assertEq(c.diverted, expectedDiversion, "only the milestone fund retained its token share");
+        assertEq(c.tokensBurned, c.tokenFees - expectedDiversion, "all remaining token burned");
+        assertEq(hook.creatorClaimable(poolId) - before_.creatorQuote, c.creatorQuote, "creator ledger delta is exact");
+        assertEq(hook.protocolClaimable() - before_.protocolQuote, c.protocolQuote, "protocol ledger delta is exact");
+        assertEq(
+            hook.poolState(poolId).milestoneFundAccrued - before_.milestoneFund,
+            c.diverted,
+            "milestone-fund delta is exact"
+        );
+        assertEq(STRANGER.balance, callerEth, "collector received no ETH");
+        assertEq(token.balanceOf(STRANGER), callerToken, "collector received no token");
+        assertEq(_fullRangeLiquidity(), before_.liquidity, "collector cannot redirect value into liquidity");
+    }
+
+    // --- Scenario: Prior accrual is not repartitioned ---
+
+    function test_priorAccrualIsNotRepartitioned() public {
+        EconomicConfig memory oldConfig = hook.economicConfig();
+        Collected memory oldCollection = _collectQuote(oldConfig);
+        uint256 creatorRecorded = hook.creatorClaimable(poolId);
+        uint256 protocolRecorded = hook.protocolClaimable();
+
+        EconomicConfig memory next = _setEconomics(0.55e18, 0.4e18);
+
+        assertEq(oldCollection.economicVersion, oldConfig.version, "accrual records its original version");
+        assertEq(hook.creatorClaimable(poolId), creatorRecorded, "recorded creator quantity is unchanged");
+        assertEq(hook.protocolClaimable(), protocolRecorded, "recorded protocol quantity is unchanged");
+        assertEq(hook.economicConfig().version, next.version, "only prospective policy changed");
+    }
+
+    // --- Scenario: Uncollected fees use collection-time configuration ---
+
+    function test_uncollectedFeesUseCollectionTimeConfiguration() public {
+        _buyClearOfTheLadder(MEASURED_BUY);
+        EconomicConfig memory config = _setEconomics(0.55e18, 0.4e18);
+        AccountingSnapshot memory before_ = _snapshot();
+
+        Collected memory c = _collectAndCapture();
+
+        _assertQuoteCollection(c, before_, config);
+    }
+
+    // --- Scenario: Valid update affects every pool prospectively ---
+
+    function test_validUpdateAffectsEveryPoolProspectively() public {
+        PoolContext memory first = _currentPool();
+        Collected memory firstPrior = _collectQuote(hook.economicConfig());
+        uint256 firstRecorded = hook.creatorClaimable(first.id);
+        PoolContext memory second = _launchGraduatedPool("Prospective", "PROSP");
+        Collected memory secondPrior = _collectQuote(hook.economicConfig());
+        uint256 secondRecorded = hook.creatorClaimable(second.id);
+
+        EconomicConfig memory next = _setEconomics(0.55e18, 0.4e18);
+        assertEq(hook.creatorClaimable(first.id), firstRecorded, "first pool's prior quantity stayed fixed");
+        assertEq(hook.creatorClaimable(second.id), secondRecorded, "second pool's prior quantity stayed fixed");
+
+        _usePool(first);
+        Collected memory firstAfter = _collectToken(next);
+        _usePool(second);
+        Collected memory secondAfter = _collectToken(next);
+
+        assertEq(firstPrior.economicVersion + 1, firstAfter.economicVersion, "first pool advanced prospectively");
+        assertEq(secondPrior.economicVersion + 1, secondAfter.economicVersion, "second pool advanced prospectively");
+    }
+
+    // --- Scenario (graduation): Quote fees do not compound ---
+
+    function test_quoteFeesDoNotCompound() public {
+        EconomicConfig memory config = hook.economicConfig();
+        AccountingSnapshot memory before_ = _snapshot();
+        _buyClearOfTheLadder(MEASURED_BUY);
+
+        Collected memory c = _collectAndCapture();
+
+        _assertQuoteCollection(c, before_, config);
+        assertEq(c.diverted, 0, "quote produced no token-side carry");
+        assertEq(c.tokensBurned, 0, "quote produced no token-side burn");
+    }
+
+    // --- Scenario (graduation): Token fees do not compound ---
+
+    function test_tokenFeesDoNotCompound() public {
+        EconomicConfig memory config = hook.economicConfig();
+        AccountingSnapshot memory before_ = _snapshot();
+        uint256 payoutBefore = hook.payoutPot(poolId);
+        uint256 creatorPathBefore = hook.creatorPathClaimable(poolId);
+        _sell(MEASURED_SELL);
+
+        Collected memory c = _collectAndCapture();
+
+        _assertTokenCollection(c, before_, config);
+        assertEq(hook.payoutPot(poolId), payoutBefore, "token fees created no payout entitlement");
+        assertEq(hook.creatorPathClaimable(poolId), creatorPathBefore, "token fees created no creator-path carry");
+    }
+
+    // --- Scenario: No LP fee carry exists ---
+
+    function test_noLpFeeCarryExists() public {
+        EconomicConfig memory config = hook.economicConfig();
+        uint128 lockedLiquidity = _fullRangeLiquidity();
+
+        Collected memory quoteCollection = _collectQuote(config);
+        Collected memory tokenCollection = _collectToken(config);
+        vm.recordLogs();
+        (uint256 latentQuote, uint256 latentToken) = hook.collectFees(key);
+        Vm.Log[] memory emptyLogs = vm.getRecordedLogs();
+
+        assertGt(quoteCollection.quoteFees, 0, "the quote-only collection was real");
+        assertGt(tokenCollection.tokenFees, 0, "the token-only collection was real");
+        assertEq(_fullRangeLiquidity(), lockedLiquidity, "neither side was carried into LP liquidity");
+        assertEq(latentQuote, 0, "no quote fee remained for later pairing");
+        assertEq(latentToken, 0, "no token fee remained for later pairing");
+        assertEq(emptyLogs.length, 0, "zero-accrual collection found no hidden LP carry");
     }
 }

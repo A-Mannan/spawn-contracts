@@ -3,7 +3,7 @@ pragma solidity 0.8.26;
 
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
-import {LPFeeLibrary} from "v4-core/src/libraries/LPFeeLibrary.sol";
+import {FullMath} from "v4-core/src/libraries/FullMath.sol";
 import {Position} from "v4-core/src/libraries/Position.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
@@ -23,15 +23,15 @@ import {LaunchSignature} from "./libraries/LaunchSignature.sol";
 import {Orientation} from "./libraries/Orientation.sol";
 import {TransientLock} from "./libraries/TransientLock.sol";
 import {Bounds, LaunchConfig, Phase, PoolState, ProtocolTemplate, WAD} from "./types/LaunchTypes.sol";
+import {EconomicConfig} from "./types/PayoutTypes.sol";
 
 /// @title MilestoneColdPaths
 /// @notice The launch, graduation, and fee-collection logic of {MilestoneHook}, held in a separate
 /// contract and reached by DELEGATECALL so it does not consume the hook's 24 KB budget.
 ///
-/// @dev design.md Decision 1 (revised). The singleton hook exceeded EIP-170 during task group 8: 25,461
-/// bytes against a 24,576 limit, with the ladder harvest, the fee waterfall and the reclaim path still
-/// to come. `via_ir` and a size-tuned `optimizer_runs` were already in place and between them bought
-/// 162 further bytes, so the overflow was structural rather than a squeeze.
+/// @dev The hook's hot path had already exceeded EIP-170 before launch, graduation, and fee collection
+/// were finalized. `via_ir` and size-tuned optimizer runs were already in place, so moving these cold
+/// paths behind immutable delegatecall was a structural split rather than a bytecode squeeze.
 ///
 /// This split is chosen over design.md's original contingency — a thin external *launcher* — because
 /// DELEGATECALL introduces no trust edge, which is the property Decision 1 exists to protect:
@@ -46,13 +46,13 @@ import {Bounds, LaunchConfig, Phase, PoolState, ProtocolTemplate, WAD} from "./t
 ///   direct call reverts {NotDelegated} before it does anything.
 ///
 /// What it does share with the hook is the storage layout, which is a real coupling and the reason
-/// every state variable is declared once in {MilestoneBase} and never here. `make layout-check`
-/// compares the compiled layouts of both contracts in CI, so a variable added to either one fails the
-/// build rather than silently aliasing a slot.
+/// every state variable is declared once in {MilestoneBase} and never here. `make layout-check` compares
+/// all three compiled layouts, so a variable added to a derived implementation fails the build rather
+/// than silently aliasing a slot.
 ///
-/// The immutables — including every field of the {ProtocolTemplate} — resolve from *this* contract's
-/// bytecode even under delegatecall, so it is constructed with the same pool manager, revenue NFT,
-/// launch support and template as the hook. The Migration Plan asserts that at deployment.
+/// The immutables — including every field of the {ProtocolTemplate}, the controller, and the registry
+/// resolved through {LaunchSupport} — come from this contract's bytecode during delegatecall. Deployment
+/// therefore constructs the hook and both satellites with matching dependencies and verifies parity.
 contract MilestoneColdPaths is MilestoneBase {
     using BalanceDeltaLibrary for BalanceDelta;
     using CurrencyLibrary for Currency;
@@ -78,8 +78,9 @@ contract MilestoneColdPaths is MilestoneBase {
         IPoolManager poolManager_,
         RevenueNFT revenueNft_,
         LaunchSupport launchSupport_,
-        ProtocolTemplate memory template_
-    ) ImmutableState(poolManager_) MilestoneBase(revenueNft_, launchSupport_, template_) {
+        ProtocolTemplate memory template_,
+        address protocolController_
+    ) ImmutableState(poolManager_) MilestoneBase(revenueNft_, launchSupport_, template_, protocolController_) {
         _self = address(this);
     }
 
@@ -87,12 +88,13 @@ contract MilestoneColdPaths is MilestoneBase {
 
     /// @notice Launches a token from a creator-signed configuration. Permissionless to relay.
     ///
-    /// @dev The creator is the configuration's *declared* creator, never the relayer — the revenue NFT,
-    /// the vesting schedule and the dev-buy authorisation all key off that address, and the signature is
-    /// verified against the declaration rather than being asked to produce it. Passing an empty signature
-    /// selects the creator-direct path, where the declaration must equal `msg.sender` and no signature is
-    /// required; both entries derive the same CREATE2 salt, so a creator who publishes a signed
-    /// configuration and later self-launches lands at the advertised address either way.
+    /// @dev The creator is the configuration's *declared* creator, never the relayer — RevenueNFT
+    /// ownership, exact payout-plan identity, and creator-direct dev-buy authorisation all key off that
+    /// address, and the signature is verified against the declaration rather than being asked to produce
+    /// it. Passing an empty signature selects the creator-direct path, where the declaration must equal
+    /// `msg.sender` and no signature is required; both entries derive the same CREATE2 salt, so a creator
+    /// who publishes a signed configuration and later self-launches lands at the advertised address either
+    /// way.
     ///
     /// Ordering matters in three places:
     /// - The token is deployed before the `PoolKey` is built, since the key's `currency1` is its address.
@@ -111,8 +113,14 @@ contract MilestoneColdPaths is MilestoneBase {
         onlyDelegated
         returns (PoolId poolId, address token, PoolKey memory key)
     {
-        launchSupport.validate(config);
+        TransientLock.requireNoPayoutDelivery();
 
+        // Authenticate before validating, not after. The specs require that flipping *any* signed field —
+        // a payout-plan bit included — fail signature verification, and a plan is only checkable against
+        // live registry state: a tampered bit that happens to name a suspended or over-subscribed entry
+        // would otherwise revert with a registry error, reporting a configuration problem for what is
+        // actually a forgery. Recovering first makes the relayer's alteration the reported cause in every
+        // case, and leaves validation to judge only configurations the creator really signed.
         address creator = config.creator;
         if (signature.length == 0) {
             // The direct path proves identity by transaction origin instead of by signature. Checking
@@ -121,6 +129,8 @@ contract MilestoneColdPaths is MilestoneBase {
         } else {
             LaunchSignature.recoverCreator(config, signature, address(this));
         }
+
+        launchSupport.validate(config);
         bytes32 configHash = LaunchSignature.configHash(config);
 
         // Deployed through the immutable helper so its creation bytecode stays out of both contracts'
@@ -142,7 +152,7 @@ contract MilestoneColdPaths is MilestoneBase {
         key = PoolKey({
             currency0: CurrencyLibrary.ADDRESS_ZERO,
             currency1: Currency.wrap(token),
-            fee: LPFeeLibrary.DYNAMIC_FEE_FLAG,
+            fee: Bounds.TRADING_FEE_HUNDREDTHS_BIP,
             tickSpacing: Bounds.POOL_TICK_SPACING,
             hooks: IHooks(address(this))
         });
@@ -158,23 +168,12 @@ contract MilestoneColdPaths is MilestoneBase {
 
         _recordLaunch(poolId, config, token, creator, opening, far);
 
-        // A dynamic-fee pool opens at fee 0, so the base fee has to be pushed explicitly. Both of these
-        // are callable without unlocking the manager.
         poolManager.initialize(key, TickMath.getSqrtPriceAtTick(Orientation.toTickChecked(opening)));
-        poolManager.updateDynamicLPFee(key, baseFeeHundredthsBip);
 
         revenueNFT.mint(poolId, creator);
 
         emit Launched(poolId, creator, token, config.totalSupply, opening, far, configHash);
-        emit LaunchConfigured(
-            poolId,
-            config.harvestSplit.creatorWad,
-            config.harvestSplit.buybackWad,
-            config.harvestSplit.protocolWad,
-            config.harvestSplit.lpWad,
-            config.devBuyShareWad,
-            config.devBuyVestingSeconds
-        );
+        emit LaunchConfigured(poolId, config.payoutPlan, config.devBuyShareWad);
 
         _openGenesis(poolId, key, token, config, creator);
     }
@@ -194,12 +193,10 @@ contract MilestoneColdPaths is MilestoneBase {
         state.creator = creator;
         state.token = token;
         state.launchedAt = uint64(block.timestamp);
-        state.baseFeeHundredthsBip = baseFeeHundredthsBip;
         state.totalSupply = config.totalSupply;
         state.openingLevel = opening;
         state.farLevel = far;
-        state.devBuyVestingSeconds = config.devBuyVestingSeconds;
-        state.harvestSplit = config.harvestSplit;
+        state.payoutPlan = config.payoutPlan;
         // Provisional; graduation overwrites it with the tick actually observed there.
         state.graduationLevel = far;
         state.ladderInventoryRemaining = LadderLib.ladderSupply(config.totalSupply, ladderSupplyShareWad);
@@ -219,7 +216,7 @@ contract MilestoneColdPaths is MilestoneBase {
         LaunchConfig calldata config,
         address creator
     ) private {
-        uint256 devBuyTokens = (config.totalSupply * config.devBuyShareWad) / WAD;
+        uint256 devBuyTokens = FullMath.mulDiv(config.totalSupply, config.devBuyShareWad, WAD);
 
         if (msg.sender != creator) {
             if (devBuyTokens != 0) emit DevBuySkipped(poolId, msg.sender, devBuyTokens);
@@ -232,16 +229,8 @@ contract MilestoneColdPaths is MilestoneBase {
         uint256 ethSpent = abi.decode(result, (uint256));
 
         if (devBuyTokens != 0) {
-            PoolState storage state = _pools[poolId];
-            state.devBuyTotal = devBuyTokens;
-
-            emit DevBuyExecuted(poolId, devBuyTokens, ethSpent, config.devBuyVestingSeconds);
-
-            if (config.devBuyVestingSeconds == 0) {
-                state.devBuyReleased = devBuyTokens;
-                MilestoneToken(token).transfer(creator, devBuyTokens);
-                emit DevBuyReleased(poolId, creator, devBuyTokens);
-            }
+            MilestoneToken(token).transfer(creator, devBuyTokens);
+            emit DevBuyExecuted(poolId, devBuyTokens, ethSpent);
         }
 
         uint256 refund = msg.value - ethSpent;
@@ -260,6 +249,7 @@ contract MilestoneColdPaths is MilestoneBase {
     /// caller to steer. It races the `beforeSwap` auto-trigger and both are idempotent against the phase
     /// check, so whichever arrives second reverts having changed nothing.
     function graduate(PoolKey calldata key) external onlyDelegated {
+        TransientLock.requireNoPayoutDelivery();
         PoolId poolId = key.toId();
         _beginGraduation(poolId);
 
@@ -281,6 +271,7 @@ contract MilestoneColdPaths is MilestoneBase {
     /// curves earned and the LP seed's `take` is satisfiable. That is precisely why the *crossing* swap
     /// cannot graduate in its own `afterSwap` — there, Decision 13's shortfall applies.
     function graduateWhileUnlocked(PoolKey calldata key) external onlyDelegated {
+        TransientLock.requireNoPayoutDelivery();
         PoolId poolId = key.toId();
         _beginGraduation(poolId);
 
@@ -325,6 +316,7 @@ contract MilestoneColdPaths is MilestoneBase {
     /// lost, they are simply not collected here — they sit in the curve positions and fold into
     /// `quoteProceeds` when graduation burns them.
     function collectFees(PoolKey calldata key) external onlyDelegated returns (uint256 quoteFees, uint256 tokenFees) {
+        TransientLock.requireNoPayoutDelivery();
         PoolId poolId = key.toId();
         PoolState storage state = _pools[poolId];
 
@@ -343,6 +335,13 @@ contract MilestoneColdPaths is MilestoneBase {
         TransientLock.exit(TransientLock.SETTLEMENT, poolId);
 
         (quoteFees, tokenFees) = abi.decode(result, (uint256, uint256));
+
+        // Changed fee growth does not guarantee a realised amount: `Position.update` floors what the
+        // position is owed, so a growth delta small enough against this position's liquidity realises
+        // zero on both sides. That is still a collection with zero accrual, and the specs make the
+        // absence of any event the observable form of it — so the emit is gated on what was actually
+        // realised rather than on having opened an unlock.
+        if (quoteFees == 0 && tokenFees == 0) return (0, 0);
 
         // Emitted out here rather than inside the unlock, where `msg.sender` is the pool manager calling
         // back in. Under delegatecall from the hook it is still the original caller at this point.
@@ -382,10 +381,22 @@ contract MilestoneColdPaths is MilestoneBase {
             return "";
         }
 
+        if (raw == uint8(UnlockAction.REDEEM_PROTOCOL_BACKING)) {
+            (, uint256 amount) = abi.decode(data, (uint8, uint256));
+            _redeemQuote(amount);
+            return "";
+        }
+
         if (raw == uint8(UnlockAction.COLLECT_FEES)) {
             (, PoolKey memory key) = abi.decode(data, (uint8, PoolKey));
             (uint256 quoteFees, uint256 tokenFees) = _collectFees(key);
             return abi.encode(quoteFees, tokenFees);
+        }
+
+        if (raw == uint8(UnlockAction.REDEEM_PAYOUT_POT)) {
+            (, PoolId poolId, uint256 amount) = abi.decode(data, (uint8, PoolId, uint256));
+            _redeemPayoutPot(poolId, amount);
+            return "";
         }
 
         revert UnknownUnlockAction();
@@ -393,15 +404,20 @@ contract MilestoneColdPaths is MilestoneBase {
 
     /// @notice Converts `amount` of the hook's quote claim back into real ETH in hook custody.
     ///
-    /// @dev The redemption half of Decision 13, reached only from {MilestoneBase-_ensureEth} on a claim.
-    /// Being its own unlock is the whole point: no swap is in flight, so the manager holds every claim it
-    /// has issued and `take` can be satisfied. Burning first and taking second means the delta is zero
-    /// again by the end, so `CurrencyNotSettled` still backstops a mistake here.
+    /// @dev Exact redemption primitive used only by liability-class-specific unlock actions.
     function _redeemQuote(uint256 amount) private {
         if (amount == 0) return;
 
         _burnClaim(CurrencyLibrary.ADDRESS_ZERO, amount);
         _takeCurrency(CurrencyLibrary.ADDRESS_ZERO, address(this), amount);
+    }
+
+    /// @dev Dedicated whole-pot redemption. The payout satellite has already removed this exact amount
+    /// from the pool's pot liability before opening the unlock; poolId remains in the payload so traces
+    /// bind the redemption to its source pool rather than to ambient claim backing.
+    function _redeemPayoutPot(PoolId poolId, uint256 amount) private {
+        if (_pools[poolId].phase == Phase.NONE) revert NotInBondingCurvePhase(poolId, Phase.NONE);
+        _redeemQuote(amount);
     }
 
     // --- Genesis ---
@@ -411,7 +427,7 @@ contract MilestoneColdPaths is MilestoneBase {
     /// @dev design Decision 17's just-in-time curve: only position 0 exists when the launch transaction
     /// ends, so launch gas is independent of the template's position count. Position 0 spans the whole
     /// opening-to-far range holding a thirty-second of curve inventory, which is the thinnest book the
-    /// curve ever offers — the structural anti-snipe that replaces the deleted fee decay (Decision 20).
+    /// curve ever offers. Trading still uses the pool's literal static fee throughout this path.
     ///
     /// The dev buy runs the shared deployment path explicitly before swapping. It has to: the swap is
     /// issued by the hook itself, and v4 skips both swap callbacks when the hook is the swapper, so
@@ -424,7 +440,7 @@ contract MilestoneColdPaths is MilestoneBase {
         PoolState storage state = _pools[poolId];
         int24 opening = state.openingLevel;
         int24 far = state.farLevel;
-        uint256 curveSupply = (state.totalSupply * curveSupplyShareWad) / WAD;
+        uint256 curveSupply = FullMath.mulDiv(state.totalSupply, curveSupplyShareWad, WAD);
 
         uint128 liquidity = CurveLib.positionLiquidity(opening, far, curvePositions, curveSupply, 0);
         uint256 owed = _mintCurvePosition(key, opening, far, 0, liquidity);
@@ -505,7 +521,7 @@ contract MilestoneColdPaths is MilestoneBase {
         int24 opening = state.openingLevel;
         int24 far = state.farLevel;
         uint16 positions = curvePositions;
-        uint256 curveSupply = (state.totalSupply * curveSupplyShareWad) / WAD;
+        uint256 curveSupply = FullMath.mulDiv(state.totalSupply, curveSupplyShareWad, WAD);
 
         int256 delta0;
         int256 delta1;
@@ -577,8 +593,8 @@ contract MilestoneColdPaths is MilestoneBase {
     ) private {
         PoolState storage state = _pools[poolId];
 
-        uint256 lpSeedQuote = (quoteProceeds * lpSeedWad) / WAD;
-        uint256 creatorQuote = (quoteProceeds * proceedsCreatorWad) / WAD;
+        uint256 lpSeedQuote = FullMath.mulDiv(quoteProceeds, lpSeedWad, WAD);
+        uint256 creatorQuote = FullMath.mulDiv(quoteProceeds, proceedsCreatorWad, WAD);
         uint256 protocolQuote = quoteProceeds - lpSeedQuote - creatorQuote;
 
         int24 tickLower = -Bounds.FULL_RANGE_TICK_BOUND;
@@ -590,7 +606,7 @@ contract MilestoneColdPaths is MilestoneBase {
             TickMath.getSqrtPriceAtTick(tickLower),
             TickMath.getSqrtPriceAtTick(tickUpper),
             lpSeedQuote,
-            (state.totalSupply * fullRangeSupplyShareWad) / WAD
+            FullMath.mulDiv(state.totalSupply, fullRangeSupplyShareWad, WAD)
         );
 
         int256 owed0;
@@ -624,6 +640,7 @@ contract MilestoneColdPaths is MilestoneBase {
 
         _accrueCreator(poolId, creatorQuote, AccrualSource.CURVE_PROCEEDS);
         _accrueProtocol(poolId, protocolQuote, AccrualSource.CURVE_PROCEEDS);
+        _assertSolvent();
 
         emit Graduated(
             poolId, state.graduationLevel, quoteProceeds, lpSeedQuote, creatorQuote, protocolQuote, liquidity
@@ -668,19 +685,9 @@ contract MilestoneColdPaths is MilestoneBase {
         _routeFees(key, poolId, state, quoteFees, tokenFees);
     }
 
-    /// @notice Routes collected fees per currency: the quote side three ways, the token side entirely
-    /// into pool-facing destinations.
-    ///
-    /// @dev design Decision 21. Token fees paid to a creator or to the protocol were income those
-    /// parties could only realise by selling against their own holders, and the protocol has no use for
-    /// a token balance it will never act on. So the token side splits between the milestone fund — the
-    /// next band's inventory — and full-range compounding, and *nothing* on that side reaches a
-    /// claimant. Creators earn ETH; token fees build walls and liquidity.
-    ///
-    /// Diversion happens first and only on the token side: band inventory is token offered for sale, so
-    /// quote fees could only fund one by buying token, and the `milestone-ladder` requirement that
-    /// inventory accrue "with no swap performed and no price impact" rules that out. Past the ladder cap
-    /// there is no next band to fund, so diversion stops and the whole token amount compounds.
+    /// @notice Routes quote fees to direct ledgers and token fees to the next useful band or burn.
+    /// @dev One economic tuple is copied before any arithmetic. Quote dust is protocol revenue; token
+    /// dust is burned. No fee path changes the graduation-seeded full-range position.
     function _routeFees(
         PoolKey memory key,
         PoolId poolId,
@@ -688,99 +695,38 @@ contract MilestoneColdPaths is MilestoneBase {
         uint256 quoteFees,
         uint256 tokenFees
     ) private {
+        EconomicConfig memory economics = _economicConfig;
+        uint256 creatorQuote = FullMath.mulDiv(quoteFees, economics.quoteCreatorShareWad, WAD);
+        uint256 protocolQuote = quoteFees - creatorQuote;
+
         uint256 diverted;
-        if (
-            tokenFees != 0
-                && LadderLib.withinLadderCap(
-                    coreBandCount, state.nextBandIndex, state.feeFundedBandsCreated, maxFeeFundedBands
-                )
-        ) {
-            diverted = (tokenFees * milestoneFundShareWad) / WAD;
-            if (diverted != 0) state.milestoneFundAccrued += diverted;
+        if (tokenFees != 0 && state.feeFundedBandsCreated < maxFeeFundedBands) {
+            // Token fees may only fund capacity that a future band could actually use. The ceiling is
+            // what the remaining extensions can hold at the template's per-band cap, less the inventory
+            // already waiting for them; everything beyond it burns. Both products saturate rather than
+            // revert, because this runs on a permissionless path and an unbounded total supply could
+            // otherwise leave `uint256` — and a saturated ceiling is still clamped by the fee amount
+            // below, so it is indistinguishable from the exact one at every reachable input.
+            uint256 perBand = LadderLib.perBandInventory(state.totalSupply, ladderSupplyShareWad, coreBandCount);
+            uint256 remainingExtensions = uint256(maxFeeFundedBands) - state.feeFundedBandsCreated;
+            uint256 totalCapacity =
+                LadderLib.mulSaturating(LadderLib.mulSaturating(remainingExtensions, perBand), bandInventoryCapMultiple);
+            uint256 reservedInventory = state.carriedInventory + state.milestoneFundAccrued;
+            uint256 freeCapacity = totalCapacity > reservedInventory ? totalCapacity - reservedInventory : 0;
+            uint256 configuredDiversion = FullMath.mulDiv(tokenFees, economics.tokenMilestoneFundShareWad, WAD);
+            diverted = configuredDiversion < freeCapacity ? configuredDiversion : freeCapacity;
+            state.milestoneFundAccrued += diverted;
         }
+        uint256 tokensBurned = tokenFees - diverted;
 
-        uint256 creator0 = (quoteFees * Bounds.FEE_CREATOR_SHARE_WAD) / WAD;
-        uint256 protocol0 = (quoteFees * Bounds.FEE_PROTOCOL_SHARE_WAD) / WAD;
-        // The LP share takes the remainder rather than its own wad, so the three parts sum to the
-        // collected amount exactly and integer-division dust lands in the pool.
-        uint256 lp0 = quoteFees - creator0 - protocol0;
-        uint256 lp1 = tokenFees - diverted;
+        _takeCurrency(key.currency0, address(this), quoteFees);
+        _takeCurrency(key.currency1, address(this), tokenFees);
 
-        _accrueCreator(poolId, creator0, AccrualSource.SWAP_FEES);
-        _accrueProtocol(poolId, protocol0, AccrualSource.SWAP_FEES);
+        _accrueCreator(poolId, creatorQuote, AccrualSource.SWAP_FEES);
+        _accrueProtocol(poolId, protocolQuote, AccrualSource.SWAP_FEES);
+        if (tokensBurned != 0) MilestoneToken(state.token).burn(tokensBurned);
 
-        // The LP share joins whatever an earlier collection could not pair off, and the pair compounds.
-        uint256 offered0 = state.pendingLpQuote + lp0;
-        uint256 offered1 = state.pendingLpToken + lp1;
-        (uint128 added, uint256 used0, uint256 used1) = _compoundFees(key, poolId, state, offered0, offered1);
-        state.pendingLpQuote = offered0 - used0;
-        state.pendingLpToken = offered1 - used1;
-
-        // Whatever did not become liquidity leaves the manager: the ledgers owe real balances, the
-        // milestone fund has to hold real token to mint a band from, and the unpaired LP share waits in
-        // custody. A negative net is the case where this collection compounded more than it collected,
-        // spending an earlier collection's carried balance — which is in custody, so settling it from
-        // there is exact.
-        _netSettle(key.currency0, int256(quoteFees) - int256(used0));
-        _netSettle(key.currency1, int256(tokenFees) - int256(used1));
-
-        emit FeesRouted(poolId, lp0, lp1, creator0, protocol0, diverted, added);
-    }
-
-    /// @notice Turns as much of the offered LP share as pairs at spot into full-range liquidity.
-    ///
-    /// @dev This is where "the LP share compounds" becomes true of `liquidity` rather than of fees owed:
-    /// the share is added as *principal* to the same position, under the same salt, so it is thereafter
-    /// indistinguishable from the graduation seed and equally locked.
-    ///
-    /// It needs both currencies, and a single collection's fees are generally lopsided — v4 charges the
-    /// fee on the swap's input, so buys pay in quote and sells pay in token. Rather than swap to balance
-    /// (price impact, and a swap inside a fee collection) or donate the excess (which would be re-split
-    /// on the next collection, taxing the same value repeatedly), the unpaired remainder stays in
-    /// custody as `pendingLp*` and is offered again next time. Over a two-sided market both sides
-    /// arrive, so all of it compounds eventually.
-    ///
-    /// `used0`/`used1` cannot exceed what was offered: `getLiquidityForAmounts` floors the liquidity each
-    /// side could support and takes the smaller, and v4 then charges `ceil` of the amounts that liquidity
-    /// needs — and `ceil(floor(x/d)*d) <= x` for integer `x`. So the subtractions in the caller are safe,
-    /// and left as plain subtraction so that a mistake in that reasoning reverts a collection rather than
-    /// silently mis-stating what is still owed to the position.
-    function _compoundFees(PoolKey memory key, PoolId poolId, PoolState storage state, uint256 amount0, uint256 amount1)
-        private
-        returns (uint128 added, uint256 used0, uint256 used1)
-    {
-        if (amount0 == 0 || amount1 == 0) return (0, 0, 0);
-
-        int24 tickLower = state.fullRangeTickLower;
-        int24 tickUpper = state.fullRangeTickUpper;
-        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(poolId);
-
-        added = LiquidityAmounts.getLiquidityForAmounts(
-            sqrtPriceX96,
-            TickMath.getSqrtPriceAtTick(tickLower),
-            TickMath.getSqrtPriceAtTick(tickUpper),
-            amount0,
-            amount1
-        );
-        if (added == 0) return (0, 0, 0);
-
-        (BalanceDelta delta,) = poolManager.modifyLiquidity(
-            key,
-            IPoolManager.ModifyLiquidityParams({
-                tickLower: tickLower,
-                tickUpper: tickUpper,
-                liquidityDelta: int256(uint256(added)),
-                salt: FULL_RANGE_SALT
-            }),
-            ""
-        );
-
-        // Adding liquidity in range can only ever owe both currencies, never credit them.
-        int128 owed0 = delta.amount0();
-        int128 owed1 = delta.amount1();
-        used0 = owed0 < 0 ? uint256(uint128(-owed0)) : 0;
-        used1 = owed1 < 0 ? uint256(uint128(-owed1)) : 0;
-
-        state.fullRangeLiquidity += added;
+        _assertSolvent();
+        emit FeesRouted(poolId, creatorQuote, protocolQuote, diverted, tokensBurned, economics.version);
     }
 }

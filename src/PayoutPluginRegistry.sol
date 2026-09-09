@@ -137,11 +137,36 @@ contract PayoutPluginRegistry is IPayoutPluginRegistry {
             && stored.codeHash != bytes32(0);
     }
 
-    /// @dev Reject common delegate/proxy bytecode patterns. Code-hash checks remain the runtime backstop.
+    /// @dev Rejects the delegate/proxy bytecode shapes whose behaviour a pinned code hash cannot bind.
+    ///
+    /// **What this is and is not.** The registry's real guarantee is the immutable `codeHash` recorded at
+    /// registration and rechecked before every delivery, together with administrator-only appends and
+    /// reversible suspension. This scan is a registration-time convenience on top of that: it catches the
+    /// obvious case where an entry's code hash would stay constant while the code it actually runs lives
+    /// somewhere else. It is deliberately not claimed as a security boundary, because no bytecode
+    /// heuristic can be one — a contract that forwards through an ordinary `CALL` to an address it holds
+    /// in storage keeps a fixed code hash, contains neither rejected opcode, and is indistinguishable
+    /// here from any other contract that makes a call. Delivery is value-bounded and failure-isolated
+    /// precisely so that a destination's internals never have to be trusted.
+    ///
+    /// **Why the executable region is isolated first.** Solidity appends a CBOR metadata trailer whose
+    /// final two bytes hold its length. Those bytes are data, never executed, and a compiler-produced
+    /// digest is as likely to contain `0xf2` or `0xf4` as any other value — so scanning them as opcodes
+    /// rejected perfectly ordinary contracts at a rate set by nothing but the hash of their own source.
+    /// Trimming the trailer removes that false rejection entirely; PUSH immediates inside the code are
+    /// already stepped over below for the same reason.
     function _isProxyLike(address plugin) private view returns (bool) {
         bytes memory code = plugin.code;
         uint256 length = code.length;
-        for (uint256 cursor; cursor < length;) {
+
+        uint256 executable = length;
+        if (length >= 2) {
+            uint256 metadataLength = (uint256(uint8(code[length - 2])) << 8) | uint256(uint8(code[length - 1]));
+            // Only trust a trailer that actually fits; anything else is scanned in full.
+            if (metadataLength + 2 <= length) executable = length - metadataLength - 2;
+        }
+
+        for (uint256 cursor; cursor < executable;) {
             uint8 opcode = uint8(code[cursor]);
             if (opcode == 0xf2 || opcode == 0xf4) return true;
             if (opcode >= 0x60 && opcode <= 0x7f) cursor += uint256(opcode) - 0x5f;

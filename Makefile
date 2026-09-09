@@ -3,7 +3,7 @@
 # Task groups referenced below are from
 # openspec/changes/add-milestone-launchpad/tasks.md
 
-.PHONY: all build test test-unit test-fork test-invariant deep size size-gate-selftest structural-gate-selftest lock-check layout-check fmt fmt-check clean deps pins release-check
+.PHONY: all build test test-unit test-fork test-invariant deep size size-gate-selftest structural-gate-selftest scenario-tool-selftest scenario-check lock-check layout-check fmt fmt-check clean deps pins release-check
 
 SIZE_LIMIT ?= 24576
 FIXTURE_DIR := .sizegate-fixture
@@ -74,9 +74,17 @@ layout-check:
 	python3 tools/check_storage_layout.py
 	python3 tools/check_cold_path_guards.py
 
-# Focused mutation tests for the AST-backed structural gates.
+# Focused mutation and fixture tests for the repository's structural and scenario gates.
 structural-gate-selftest:
-	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p 'test_*.py' -v
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p 'test_structural_gates.py' -v
+
+scenario-tool-selftest:
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tools/tests -p 'test_scenario_gate.py' -v
+
+# Checks the delta specs against literal test headers. For final passing evidence, capture Foundry's XML
+# (`forge test --junit > report.xml`) and run `python3 tools/check_scenarios.py --junit report.xml`.
+scenario-check:
+	python3 tools/check_scenarios.py --report openspec/reports/payout-plugin-scenario-traceability.md
 
 # Proves the gate actually fails on an oversized contract, rather than passing vacuously.
 # Generates a throwaway contract larger than the limit, gates it, then cleans up.
@@ -112,7 +120,8 @@ clean:
 	forge clean
 	rm -rf $(FIXTURE_DIR)
 
-# Task 14.4: the full release gate.
-release-check: pins fmt-check build size size-gate-selftest structural-gate-selftest lock-check layout-check test-unit test-invariant
-	@echo "release-check: unit + invariant suites and the size gate all passed."
+# OpenSpec add-payout-plugins: full local release gate. Fork and public-testnet campaigns remain separate
+# because they require environment credentials.
+release-check: pins fmt-check build size size-gate-selftest structural-gate-selftest scenario-tool-selftest lock-check layout-check test-unit test-invariant
+	@echo "release-check: unit + invariant suites and all local structural gates passed."
 	@echo "release-check: run 'make test-fork' separately with BASE_RPC_URL set."

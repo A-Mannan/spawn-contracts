@@ -215,7 +215,7 @@ contract MilestoneLadderTest is LaunchpadTest {
         assertEq(uint8(hook.poolPhase(poolId)), uint8(Phase.GRADUATED), "which does not un-graduate the pool");
     }
 
-    // --- Scenario: In-band oscillation is permitted but cannot prevent completion ---
+    // --- Scenario: In-band oscillation cannot prevent completion ---
 
     /// @dev Three round trips into and out of a live band. The band's conversion state churns — token out on
     /// the way up, token back on the way down — without the position being lost or completed, and the
@@ -259,10 +259,12 @@ contract MilestoneLadderTest is LaunchpadTest {
         assertGt(address(manager).balance, poolEth, "and the buy leg left its fee in ETH");
     }
 
-    // --- Scenario: No size or timing gate ---
+    // --- No size or timing gate: derived, no scenario of its own ---
 
-    /// @dev Both halves of the requirement in one transaction sequence: a buy far larger than any band, then
-    /// two more swaps in the same block with no time passing between them.
+    /// @dev The payout-plugin delta restated "the hook never blocks a swap in the graduated phase" without
+    /// this scenario name, so the claim is now derived rather than specified — but it is still the sharpest
+    /// form of that requirement, so the test stays. Both halves in one transaction sequence: a buy far
+    /// larger than any band, then two more swaps in the same block with no time passing between them.
     function test_noSizeOrTimingGate() public {
         uint256 blockAt = block.number;
 

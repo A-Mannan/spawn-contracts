@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-import {LPFeeLibrary} from "v4-core/src/libraries/LPFeeLibrary.sol";
-
-import {Phase, PoolState} from "../../src/types/LaunchTypes.sol";
+import {Bounds, Phase, PoolState} from "../../src/types/LaunchTypes.sol";
 
 import {BaseForkTest} from "./ForkFixtures.sol";
 
@@ -40,7 +38,7 @@ contract ForkSmokeTest is BaseForkTest {
         assertEq(address(router).balance, FORK_FLOAT, "router float");
     }
 
-    // --- Scenario (token-launch): A relayer can launch on the creator's behalf ---
+    // --- Scenario (token-launch): Relayer launches for the signer ---
 
     function test_aRelayerCanLaunchOnTheCreatorsBehalf() public view {
         PoolState memory state = hook.poolState(poolId);
@@ -51,9 +49,8 @@ contract ForkSmokeTest is BaseForkTest {
         assertEq(state.totalSupply, SUPPLY, "supply");
         assertEq(token.totalSupply(), SUPPLY, "the deployed token agrees");
 
-        // The relay is what suppressed the dev buy; the config asked for none either way.
-        assertEq(state.devBuyTotal, 0, "no dev buy on a relayed launch");
-        assertEq(token.balanceOf(creator), 0, "and the creator holds nothing yet");
+        // Relaying only changes the transaction sender; the signed creator remains the launch identity.
+        assertEq(token.balanceOf(creator), 0, "the creator holds nothing yet");
     }
 
     // --- Scenario (revenue-claims): NFT is minted to the creator at launch ---
@@ -71,7 +68,7 @@ contract ForkSmokeTest is BaseForkTest {
         assertEq(_curveLiquidity(1), 0, "position 1 waits for the price to approach it");
     }
 
-    // --- Scenario (token-launch): Starting price matches the anchored opening FDV ---
+    // --- Scenario (token-launch): Starting price matches anchored FDV ---
 
     function test_theStartingPriceIsTheAnchoredOpeningLevel() public view {
         PoolState memory state = hook.poolState(poolId);
@@ -79,11 +76,14 @@ contract ForkSmokeTest is BaseForkTest {
         assertEq(int256(state.farLevel - state.openingLevel), int256(template.curveSpanLevels), "curve span");
     }
 
-    // --- Scenario (token-launch): Pool uses a dynamic fee ---
+    // --- Scenario (token-launch): Pool has no dynamic-fee flag ---
+    // --- Scenario (token-launch): Pool uses static one percent ---
 
-    function test_thePoolUsesADynamicFee() public view {
-        assertTrue(LPFeeLibrary.isDynamicFee(key.fee), "the key carries the dynamic-fee flag");
-        assertEq(uint256(_baseFeeOf(poolId)), uint256(template.baseFeeHundredthsBip), "and the live pool's fee is ours");
+    function test_thePoolUsesStaticOnePercent() public view {
+        assertEq(uint256(key.fee), uint256(Bounds.TRADING_FEE_HUNDREDTHS_BIP), "the key publishes one percent");
+        assertEq(
+            uint256(_baseFeeOf(poolId)), uint256(Bounds.TRADING_FEE_HUNDREDTHS_BIP), "the live fee stays one percent"
+        );
     }
 
     // --- Scenario (bonding-curve-phase): Buyers can always buy ---

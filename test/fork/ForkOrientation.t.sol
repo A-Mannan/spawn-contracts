@@ -148,7 +148,7 @@ contract ForkOrientationTest is BaseForkHarnessTest {
         // The proof that the ETH is really the pool's and not the test's arithmetic: graduating burns the
         // curves and the quote it credits covers this step's share.
         _buy(1_000);
-        assertGt(hook.creatorClaimable(poolId) + hook.protocolClaimable(poolId), 0, "the burn paid out in ETH");
+        assertGt(hook.creatorClaimable(poolId) + hook.protocolClaimable(), 0, "the burn paid out in ETH");
     }
 
     // --- Scenario (milestone-ladder): Band ticks are computable by any observer ---
@@ -221,6 +221,10 @@ contract ForkOrientationTest is BaseForkHarnessTest {
     }
 
     // --- Scenario (milestone-ladder): Harvest proceeds are quote only ---
+    // --- Scenario (milestone-ladder): Active service fee is applied ---
+    // --- Scenario (milestone-ladder): Net harvest funds only its source pool ---
+    // --- Scenario (milestone-ladder): Harvest accounting conserves the gross amount ---
+    // --- Scenario (milestone-ladder): Harvest leaves direct creator revenue unchanged ---
     //
     // The band-side half of "converts to native ETH as the level rises through it". The position is not read
     // for its composition here but burned by the protocol itself, so what the live pool credits is the
@@ -233,7 +237,8 @@ contract ForkOrientationTest is BaseForkHarnessTest {
 
         PoolState memory before = hook.poolState(poolId);
         uint256 creatorBefore = hook.creatorClaimable(poolId);
-        uint256 protocolBefore = hook.protocolClaimable(poolId);
+        uint256 protocolBefore = hook.protocolClaimable();
+        uint256 potBefore = hook.payoutPot(poolId);
         uint256 creatorTokenBefore = token.balanceOf(creator);
         uint256 protocolTokenBefore = token.balanceOf(PROTOCOL_RECIPIENT);
 
@@ -248,13 +253,16 @@ contract ForkOrientationTest is BaseForkHarnessTest {
         assertEq(_bandLiquidity(0), 0, "and its position is gone from the pool");
         assertEq(_deployedBandCount(), 1, "no band was minted by this swap");
 
-        // Quote only: both ledgers grew, neither party received token, and the residue went to the ladder.
+        // Quote only: the active service fee grew the global protocol ledger, the remainder funded this
+        // pool's pot, direct creator revenue was untouched, neither party received token, and residue returned
+        // to ladder inventory.
         PoolState memory now_ = hook.poolState(poolId);
-        uint256 creatorPaid = hook.creatorClaimable(poolId) - creatorBefore;
-        uint256 protocolPaid = hook.protocolClaimable(poolId) - protocolBefore;
-        assertGt(creatorPaid, 0, "the creator's quote ledger grew");
-        assertGt(protocolPaid, 0, "and so did the protocol's");
-        assertLe(creatorPaid + protocolPaid, quoteProceeds, "out of the harvest and nothing else");
+        uint256 protocolPaid = hook.protocolClaimable() - protocolBefore;
+        uint256 potFunded = hook.payoutPot(poolId) - potBefore;
+        assertEq(hook.creatorClaimable(poolId), creatorBefore, "harvest did not credit direct creator revenue");
+        assertGt(protocolPaid, 0, "the service fee entered the global protocol ledger");
+        assertGt(potFunded, 0, "the net harvest funded only this pool's pot");
+        assertEq(protocolPaid + potFunded, quoteProceeds, "service fee plus pot conserved gross quote");
         assertEq(token.balanceOf(creator), creatorTokenBefore, "the creator received no token");
         assertEq(token.balanceOf(PROTOCOL_RECIPIENT), protocolTokenBefore, "and neither did the protocol");
         assertEq(now_.carriedInventory, before.carriedInventory + tokenResidue, "the residue became carried inventory");

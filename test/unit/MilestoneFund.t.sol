@@ -3,17 +3,73 @@ pragma solidity 0.8.26;
 
 import {Vm} from "forge-std/Vm.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {PoolId} from "v4-core/src/types/PoolId.sol";
+import {HarnessLaunchpadTest} from "../HarnessFixtures.sol";
 import {MilestoneBase} from "../../src/MilestoneBase.sol";
 import {LadderLib} from "../../src/libraries/LadderLib.sol";
 import {PoolState, WAD} from "../../src/types/LaunchTypes.sol";
-import {GraduatedFeeFixture} from "./SwapFees.t.sol";
+import {EconomicConfig} from "../../src/types/PayoutTypes.sol";
 
 /// @notice Shared rig for the two ladder-funding suites: a graduated pool plus the one manoeuvre both
 /// need, which is to deploy a band and leave it alive.
-abstract contract LadderFundFixture is GraduatedFeeFixture {
+abstract contract LadderFundFixture is HarnessLaunchpadTest {
+    uint256 internal constant MEASURED_SELL = 1_000_000 ether;
+    uint256 internal constant MEASURED_BUY = 100 ether;
+
+    struct Collected {
+        bool seen;
+        address caller;
+        uint256 quoteFees;
+        uint256 tokenFees;
+        bool routed;
+        uint256 creatorQuote;
+        uint256 protocolQuote;
+        uint256 diverted;
+        uint256 tokensBurned;
+        uint64 economicVersion;
+    }
+
+    function setUp() public virtual override {
+        super.setUp();
+        _graduate();
+        _clearAccrual();
+    }
+
+    function _ceiling() internal view returns (int24) {
+        return _bandLower(hook.poolState(poolId).nextBandIndex) - 1;
+    }
+
+    function _buyClearOfTheLadder(uint256 ethIn) internal {
+        _buyToLevel(ethIn, _ceiling());
+    }
+
+    function _clearAccrual() internal {
+        hook.collectFees(key);
+    }
+
+    function _collectAndCapture() internal returns (Collected memory) {
+        vm.recordLogs();
+        hook.collectFees(key);
+        return _collectedFromLogs(vm.getRecordedLogs());
+    }
+
+    function _collectedFromLogs(Vm.Log[] memory logs) internal pure returns (Collected memory c) {
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] == MilestoneBase.FeesCollected.selector) {
+                c.seen = true;
+                c.caller = address(uint160(uint256(logs[i].topics[2])));
+                (c.quoteFees, c.tokenFees) = abi.decode(logs[i].data, (uint256, uint256));
+            } else if (logs[i].topics[0] == MilestoneBase.FeesRouted.selector) {
+                c.routed = true;
+                (c.creatorQuote, c.protocolQuote, c.diverted, c.tokensBurned, c.economicVersion) =
+                    abi.decode(logs[i].data, (uint256, uint256, uint256, uint256, uint64));
+            }
+        }
+    }
     /// @dev A *budget*, not an amount. Every buy in these suites is price-limited, so what it actually
     /// spends is whatever walking the price to the limit costs; 5,000 ETH carries well past the whole core
     /// ladder unlimited, so it never binds before the limit does.
+
     uint256 internal constant BAND_BUDGET = 5_000 ether;
 
     /// @notice Buys up into band `index` and returns the token inventory it was deployed with.
@@ -39,23 +95,26 @@ abstract contract LadderFundFixture is GraduatedFeeFixture {
 /// probe — the parked pair of launch-validation tests went with it. What survives is the runtime property,
 /// which is the one the spec states.
 contract MilestoneFundDiversionTest is LadderFundFixture {
-    // --- Scenario: Sell-side fees fund the next band ---
+    /// @dev Deliberately tiny: it has to be smaller than the configured share of one collection's token
+    /// fees for the clamp to be the binding constraint rather than the share.
+    uint256 internal constant FREE_CAPACITY = 1_000;
 
-    function test_sellSideFeesFundTheNextBand() public {
+    // --- Scenario: Default token routing funds 20 and burns 80 ---
+
+    function test_defaultTokenRoutingFunds20AndBurns80() public {
         assertEq(hook.poolState(poolId).milestoneFundAccrued, 0, "nothing accrued yet");
 
         _sell(MEASURED_SELL);
+        uint256 supplyBefore = token.totalSupply();
         Collected memory c = _collectAndCapture();
 
-        uint64 share = template.milestoneFundShareWad;
-        assertEq(share, 0.2e18, "the template fixes the share at 20%");
+        uint64 share = hook.economicConfig().tokenMilestoneFundShareWad;
+        assertEq(share, 0.2e18, "the active global share is 20%");
         assertGt(c.tokenFees, 0, "the sell paid in token");
-        assertEq(c.diverted, (c.tokenFees * share) / WAD, "the template's share was diverted");
+        assertEq(c.diverted, (c.tokenFees * share) / WAD, "the active share was diverted");
+        assertEq(c.tokensBurned, c.tokenFees - c.diverted, "the remaining 80% was burned");
+        assertEq(supplyBefore - token.totalSupply(), c.tokensBurned, "supply fell by exactly the burned amount");
         assertEq(hook.poolState(poolId).milestoneFundAccrued, c.diverted, "and is held for the next band");
-
-        // The remainder — and only the remainder — went through the waterfall. Under design Decision 21 the
-        // token side has exactly one destination left, so the whole remainder is the LP share.
-        assertEq(c.lpToken, c.tokenFees - c.diverted, "the rest flowed on");
     }
 
     function test_accrualAccumulatesUntilABandDrawsOnIt() public {
@@ -76,7 +135,7 @@ contract MilestoneFundDiversionTest is LadderFundFixture {
         assertEq(hook.poolState(poolId).milestoneFundAccrued, 0, "and the fund is empty again");
     }
 
-    // --- Scenario: Quote-denominated fees are never diverted ---
+    // --- Scenario: Quote fees are never diverted ---
 
     function test_quoteFeesAreNeverDiverted() public {
         _buyClearOfTheLadder(MEASURED_BUY);
@@ -86,7 +145,7 @@ contract MilestoneFundDiversionTest is LadderFundFixture {
         assertEq(c.tokenFees, 0, "in quote only");
         assertEq(c.diverted, 0, "so nothing was diverted");
         assertEq(hook.poolState(poolId).milestoneFundAccrued, 0, "and the fund is untouched");
-        assertEq(c.creatorQuote + c.protocolQuote + c.lpQuote, c.quoteFees, "the whole amount flowed through");
+        assertEq(c.creatorQuote + c.protocolQuote, c.quoteFees, "the whole quote amount was accounted for");
     }
 
     /// @dev A band's inventory is token offered for sale, so quote could only fund one by buying token —
@@ -101,10 +160,11 @@ contract MilestoneFundDiversionTest is LadderFundFixture {
         assertGt(c.tokenFees, 0, "both sides accrued");
         assertEq(c.diverted, (c.tokenFees * 2) / 10, "20% of the token side");
         assertLt(c.diverted, (c.tokenFees * 2) / 10 + (c.quoteFees * 2) / 10, "and not a wei of the quote side");
-        assertEq(c.lpQuote + c.creatorQuote + c.protocolQuote, c.quoteFees, "quote routed in full");
+        assertEq(c.creatorQuote + c.protocolQuote, c.quoteFees, "quote routed in full");
     }
 
-    // --- Scenario: Diversion requires no swap ---
+    // --- Scenario: Diversion causes no price impact ---
+    // --- Scenario: Token burning is cold-path only ---
 
     function test_diversionPerformsNoSwapAndMovesNoPrice() public {
         _sell(MEASURED_SELL);
@@ -120,7 +180,7 @@ contract MilestoneFundDiversionTest is LadderFundFixture {
         assertEq(_countLogs(logs, IPoolManager.Swap.selector), 0, "no swap was performed");
         assertEq(_sqrtPriceOf(poolId), priceBefore, "and the price did not move");
         assertEq(_level(), levelBefore, "at all");
-        assertEq(token.totalSupply(), supplyBefore, "nor was anything bought and burned");
+        assertGt(supplyBefore - token.totalSupply(), 0, "the routed remainder burned during collection");
         assertGt(hook.poolState(poolId).milestoneFundAccrued, 0, "yet the fund accrued");
     }
 
@@ -132,22 +192,13 @@ contract MilestoneFundDiversionTest is LadderFundFixture {
         Collected memory c = _collectAndCapture();
         uint256 received = token.balanceOf(HOOK_ADDR) - hookTokensBefore;
 
-        // Not quite the whole fee, and not because of rounding. The waterfall compounds the LP share, and
-        // the few wei of quote the graduation's trailing dust buy left carried in `pendingLpQuote` can pair
-        // at spot; that mint's token debit nets against the fee credit inside the same unlock, so the hook
-        // takes the fee less whatever went straight back into the full-range position. A sliver of the LP
-        // share doing its job, in other words — everything else arrives as a real ERC20 balance.
-        assertGt(c.liquidityAdded, 0, "a sliver of the token side paired with the carried quote");
-        assertLe(received, c.tokenFees, "the hook never takes more than it collected");
-        assertApproxEqRel(received, c.tokenFees, 1e12, "and the rest of the fee became a real balance");
-
-        // What the diversion actually rests on: the fund is backed by tokens the hook already holds, and the
-        // compounded sliver came out of the LP share rather than out of the fund's.
-        assertGe(received, c.diverted, "the diverted share in particular arrived as real tokens");
+        assertEq(received, c.diverted, "only the diverted share remains in hook custody");
+        assertEq(c.diverted + c.tokensBurned, c.tokenFees, "the collection conserved token fees");
         assertLe(hook.poolState(poolId).milestoneFundAccrued, token.balanceOf(HOOK_ADDR), "which fully backs the fund");
     }
 
-    // --- Scenario: Diversion stops when the ladder is capped out ---
+    // --- Scenario: Diversion stops at the cap ---
+    // --- Scenario: Post-cap token fees burn entirely ---
 
     function test_diversionStopsWhenTheLadderIsCappedOut() public {
         // Establish that diversion *was* happening, so the change below is attributable to the cap.
@@ -160,30 +211,62 @@ contract MilestoneFundDiversionTest is LadderFundFixture {
         harness.forceLadderCappedOut(poolId);
 
         _sell(MEASURED_SELL);
+        uint256 supplyBefore = token.totalSupply();
         Collected memory c = _collectAndCapture();
 
         assertGt(c.tokenFees, 0, "token fees still arrive");
         assertEq(c.diverted, 0, "but nothing is diverted");
         assertEq(hook.poolState(poolId).milestoneFundAccrued, accruedBefore, "so the fund does not grow");
-        assertEq(c.lpToken, c.tokenFees, "and the whole amount flows through the waterfall instead");
+        assertEq(c.tokensBurned, c.tokenFees, "the entire token fee burns at the cap");
+        assertEq(supplyBefore - token.totalSupply(), c.tokenFees, "supply falls by the complete fee");
     }
 
-    // --- Scenario: Diversion never exceeds the cap ---
+    // --- Scenario: Diversion is clamped to remaining extension capacity ---
 
-    /// @dev The share is a template constant now, so the reachable form of this scenario is the runtime one:
-    /// whatever the size of the collection, the diverted amount never exceeds that share of the token fees.
-    function testFuzz_divertedNeverExceedsTheCap(uint256 sellAmount) public {
-        sellAmount = bound(sellAmount, 1_000 ether, token.balanceOf(address(router)) / 2);
+    /// @dev The clamp's own branch, one step short of the cap: room is left, but less of it than the
+    /// configured share of this collection wants. What enters the fund is the room, not the share, and the
+    /// difference burns in the same collection rather than waiting for one that could hold it.
+    function test_diversionIsClampedToRemainingExtensionCapacity() public {
+        harness.forceExtensionCapacityRemaining(poolId, FREE_CAPACITY);
+        uint256 accruedBefore = hook.poolState(poolId).milestoneFundAccrued;
 
-        _sell(sellAmount);
+        _sell(MEASURED_SELL);
+        uint256 supplyBefore = token.totalSupply();
         Collected memory c = _collectAndCapture();
 
-        assertLe(
-            c.diverted * WAD,
-            c.tokenFees * template.milestoneFundShareWad,
-            "never above 20% of the token fees collected"
-        );
-        assertLe(c.diverted, c.tokenFees, "and obviously never more than was collected");
+        uint256 configured = c.tokenFees * hook.economicConfig().tokenMilestoneFundShareWad / WAD;
+        assertGt(configured, FREE_CAPACITY, "the configured share exceeds the room, so the clamp is live");
+        assertEq(c.diverted, FREE_CAPACITY, "exactly the free capacity enters milestone funding");
+        assertEq(hook.poolState(poolId).milestoneFundAccrued, accruedBefore + FREE_CAPACITY, "and nothing more");
+        assertEq(c.tokensBurned, c.tokenFees - FREE_CAPACITY, "every excess token burns");
+        assertEq(supplyBefore - token.totalSupply(), c.tokensBurned, "supply falls by the whole burn");
+    }
+
+    // --- Scenario: Token fees never credit a claimant or pot ---
+    // --- Scenario: Collected fees never compound ---
+    // --- Scenario: No fee LP carry exists ---
+    // --- Scenario: Net locked position is preserved ---
+
+    function test_tokenFeesBurnWithoutClaimantPotOrLpAccounting() public {
+        uint256 creatorBefore = hook.creatorClaimable(poolId);
+        uint256 protocolBefore = hook.protocolClaimable();
+        uint256 potBefore = hook.payoutPot(poolId);
+        uint128 liquidityBefore = _fullRangeLiquidity();
+
+        _sell(MEASURED_SELL);
+        Collected memory c = _collectAndCapture();
+
+        assertGt(c.tokenFees, 0, "token fees were collected");
+        assertEq(c.diverted + c.tokensBurned, c.tokenFees, "funding and burn conserve the token fee");
+        assertEq(hook.creatorClaimable(poolId), creatorBefore, "no creator claim was credited");
+        assertEq(hook.protocolClaimable(), protocolBefore, "no protocol claim was credited");
+        assertEq(hook.payoutPot(poolId), potBefore, "the payout pot stayed quote-only");
+        assertEq(_fullRangeLiquidity(), liquidityBefore, "the locked position did not compound");
+
+        (bool quoteCarry,) = HOOK_ADDR.call(abi.encodeWithSignature("pendingLpQuote(bytes32)", PoolId.unwrap(poolId)));
+        (bool tokenCarry,) = HOOK_ADDR.call(abi.encodeWithSignature("pendingLpToken(bytes32)", PoolId.unwrap(poolId)));
+        assertFalse(quoteCarry, "no quote LP carry getter exists");
+        assertFalse(tokenCarry, "no token LP carry getter exists");
     }
 }
 

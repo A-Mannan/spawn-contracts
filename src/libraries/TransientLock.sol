@@ -6,27 +6,27 @@ import {PoolId} from "v4-core/src/types/PoolId.sol";
 /// @title TransientLock
 /// @notice Transaction-scoped locks in transient storage, namespaced per pool and per concern.
 ///
-/// @dev design.md Decision 7. These paths nest by design: a harvest settles inside `afterSwap`, its
-/// buyback share calls `poolManager.swap`, and that nested swap re-enters this hook's own
-/// `beforeSwap`/`afterSwap`. Guards are therefore load-bearing rather than defensive boilerplate.
+/// @dev Payout delivery is asynchronous and may invoke untrusted plugins after a pot has been redeemed.
+/// The reference buyback plugin legitimately calls PoolManager, which re-enters this hook's callbacks;
+/// those callbacks must suppress protocol work while the protocol-global payout guard is held. The
+/// pool-scoped locks separately serialize lifecycle, settlement, collection, and claims.
 ///
 /// Two distinct semantics, which is why this is not a single reentrancy modifier:
 ///
-/// - {enter}/{exit} *reject* re-entry. Used by external entry points — claims, fee collection,
-///   graduation — where a second concurrent invocation is always a bug.
-/// - {held} lets a caller *suppress* its own work. Used by the swap callbacks: while a settlement is
-///   in flight, band deployment and harvest detection must quietly skip, not revert. Reverting there
-///   would abort the very harvest that opened the lock (Decision 6).
+/// - {enter}/{exit} *reject* re-entry. Used by external entry points where a second concurrent invocation
+///   is always a bug.
+/// - {held} and {callbackWorkSuppressed} let swap callbacks *suppress* protocol work. Reverting a nested
+///   callback would abort the plugin's legitimate swap; running normal work would expose lifecycle and
+///   custody paths during untrusted execution.
 ///
-/// Transient storage is the right primitive because the guarantee we need — "no lock survives the
-/// transaction" — is provided by the EVM rather than by our own cleanup being correct on every
-/// revert path. It is also cheap enough to sit on the hot swap path.
+/// Transient storage is the right primitive because the EVM guarantees no lock survives the transaction,
+/// including on revert. It is also cheap enough for the hot swap path.
 library TransientLock {
     /// @dev Namespace for every slot this library derives, so nothing collides with other transient
     /// usage in the hook or in v4 core itself.
     uint256 private constant _NAMESPACE = uint256(keccak256("milestone-launchpad.transient.lock.v1"));
 
-    /// @notice Harvest settlement, including the nested buyback swap.
+    /// @notice Pool-scoped lifecycle settlement, including band retirement and exact-redemption unlocks.
     uint8 internal constant SETTLEMENT = 1;
 
     /// @notice The permissionless fee-collection sliver burn and re-add.

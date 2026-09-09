@@ -9,7 +9,10 @@ import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {LaunchSupport} from "../../src/LaunchSupport.sol";
 import {MilestoneColdPaths} from "../../src/MilestoneColdPaths.sol";
 import {MilestoneHook} from "../../src/MilestoneHook.sol";
+import {MilestonePayoutPaths} from "../../src/MilestonePayoutPaths.sol";
 import {MilestoneToken} from "../../src/MilestoneToken.sol";
+import {PayoutPluginRegistry} from "../../src/PayoutPluginRegistry.sol";
+import {ProtocolController} from "../../src/ProtocolController.sol";
 import {RevenueNFT} from "../../src/RevenueNFT.sol";
 import {Bounds, LaunchConfig} from "../../src/types/LaunchTypes.sol";
 
@@ -88,10 +91,14 @@ abstract contract BaseForkTest is LaunchpadTest {
     function _deployProtocolAgainstLiveV4() private {
         manager = PoolManager(BASE_POOL_MANAGER);
         nft = new RevenueNFT();
-        support = new LaunchSupport();
+        registry = new PayoutPluginRegistry(address(this));
+        controller = new ProtocolController(PROTOCOL_ADMIN, PROTOCOL_RECIPIENT, registry, address(0));
+        support = new LaunchSupport(registry);
         template = Bounds.defaultTemplate();
 
-        coldPaths = new MilestoneColdPaths(IPoolManager(address(manager)), nft, support, template);
+        coldPaths = new MilestoneColdPaths(IPoolManager(address(manager)), nft, support, template, address(controller));
+        payoutPaths =
+            new MilestonePayoutPaths(IPoolManager(address(manager)), nft, support, template, address(controller));
 
         deployCodeTo(
             _hookArtifact(),
@@ -101,13 +108,19 @@ abstract contract BaseForkTest is LaunchpadTest {
                 support,
                 template,
                 address(coldPaths),
-                PROTOCOL_ADMIN,
+                address(payoutPaths),
+                address(controller),
                 PROTOCOL_RECIPIENT
             ),
             HOOK_ADDR
         );
         hook = MilestoneHook(payable(HOOK_ADDR));
         nft.setMinter(HOOK_ADDR);
+        vm.prank(PROTOCOL_ADMIN);
+        controller.bindTarget(HOOK_ADDR);
+        registry.proposeAdministrator(address(controller));
+        vm.prank(PROTOCOL_ADMIN);
+        controller.acceptRegistryAdministration();
 
         router = new TestRouter(IPoolManager(address(manager)));
     }

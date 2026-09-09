@@ -2,11 +2,16 @@
 pragma solidity 0.8.26;
 
 import {PoolId} from "v4-core/src/types/PoolId.sol";
-import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {LaunchpadTest} from "../Fixtures.sol";
+import {IPayoutPlugin} from "../../src/interfaces/IPayoutPlugin.sol";
 import {MilestoneToken} from "../../src/MilestoneToken.sol";
 import {LaunchSignature} from "../../src/libraries/LaunchSignature.sol";
 import {LaunchConfig, Phase} from "../../src/types/LaunchTypes.sol";
+import {PluginRole} from "../../src/types/PayoutTypes.sol";
+
+contract SignaturePayoutPlugin is IPayoutPlugin {
+    function onPayout(PoolId, address) external payable {}
+}
 
 /// @notice Unit tests for task 15.3 — the signed-config relay (design Decision 19): EIP-712 hashing, the
 /// deadline, creator identity, and the CREATE2 salt that makes a token address knowable and reserved.
@@ -15,7 +20,14 @@ import {LaunchConfig, Phase} from "../../src/types/LaunchTypes.sol";
 /// relay, so the tests are mostly about what a hostile relayer cannot do: alter a field, claim the
 /// creator slot, replay, or occupy the address a token page has already advertised.
 contract LaunchSignatureTest is LaunchpadTest {
-    // --- Scenario: A relayer can launch on the creator's behalf ---
+    function _registerPayoutPlugin(uint64 takeWad, bytes32 salt) internal returns (uint8 index) {
+        SignaturePayoutPlugin plugin = new SignaturePayoutPlugin();
+        vm.prank(PROTOCOL_ADMIN);
+        controller.scheduleRegisterPlugin(address(plugin), takeWad, 100_000, PluginRole.PAYOUT, salt);
+        index = controller.executeRegisterPlugin(address(plugin), takeWad, 100_000, PluginRole.PAYOUT, salt);
+    }
+
+    // --- Scenario: Relayer launches for the signer ---
 
     function test_aRelayerCanLaunchOnTheCreatorsBehalf() public {
         LaunchConfig memory config = _defaultConfig("Relayed", "RLY");
@@ -49,7 +61,7 @@ contract LaunchSignatureTest is LaunchpadTest {
         assertEq(hook.poolState(id).creator, creator, "identity comes from the signature alone");
     }
 
-    // --- Scenario: A creator can launch directly without a signature ---
+    // --- Scenario: Creator launches directly ---
 
     /// @dev The second half of the scenario is the interesting half: the direct path must land on the
     /// *same* address the creator's signature would have produced, so publishing a configuration and
@@ -74,7 +86,7 @@ contract LaunchSignatureTest is LaunchpadTest {
         hook.launch(config, "");
     }
 
-    // --- Scenario: A relayer cannot alter the configuration ---
+    // --- Scenario: Relayer cannot alter any field ---
 
     /// @dev Every economic field, one at a time. The signature is taken over the original and the relay
     /// submits the edit, which is exactly the attack: the relayer holds a valid signature for *something*
@@ -90,11 +102,12 @@ contract LaunchSignatureTest is LaunchpadTest {
     /// and the final control assertion would be testing the last edit.
     function test_aRelayerCannotAlterTheConfiguration() public {
         LaunchConfig memory signed = _defaultConfig("Honest", "HON");
+        uint8 planIndex = _registerPayoutPlugin(0.2e18, keccak256("all-fields-plan"));
         bytes memory signature = _sign(signed, CREATOR_PK);
 
         uint256 fieldCount = 7;
         for (uint256 i = 0; i < fieldCount; i++) {
-            LaunchConfig memory edited = _editedConfig(i);
+            LaunchConfig memory edited = _editedConfig(i, planIndex);
 
             vm.prank(RELAYER);
             vm.expectRevert();
@@ -109,7 +122,7 @@ contract LaunchSignatureTest is LaunchpadTest {
     }
 
     /// @dev The signed configuration with field `index` altered, and nothing else touched.
-    function _editedConfig(uint256 index) internal view returns (LaunchConfig memory edited) {
+    function _editedConfig(uint256 index, uint8 planIndex) internal view returns (LaunchConfig memory edited) {
         edited = _defaultConfig("Honest", "HON");
 
         if (index == 0) {
@@ -123,10 +136,23 @@ contract LaunchSignatureTest is LaunchpadTest {
         } else if (index == 4) {
             edited.devBuyShareWad = 0.05e18;
         } else if (index == 5) {
-            edited.devBuyVestingSeconds = 30 days;
+            edited.payoutPlan = uint256(1) << planIndex;
         } else {
-            edited.harvestSplit = _split(0.7e18, 0.1e18, 0.1e18);
+            edited.deadline -= 1;
         }
+    }
+
+    // --- Scenario: Relayer cannot alter a plan bit ---
+
+    function test_relayerCannotAlterAPlanBit() public {
+        LaunchConfig memory signed = _defaultConfig("Plan", "PLN");
+        bytes memory signature = _sign(signed, CREATOR_PK);
+        uint8 planIndex = _registerPayoutPlugin(0.2e18, keccak256("signature-plan"));
+
+        signed.payoutPlan = uint256(1) << planIndex;
+        vm.prank(RELAYER);
+        vm.expectRevert();
+        hook.launch(signed, signature);
     }
 
     /// @dev The deadline is signed too, so extending it is an alteration like any other — a relayer
@@ -202,7 +228,7 @@ contract LaunchSignatureTest is LaunchpadTest {
         hook.launch(config, "");
     }
 
-    // --- Scenario: An expired signature is rejected ---
+    // --- Scenario: Expired signature is rejected ---
 
     function test_anExpiredSignatureIsRejected() public {
         LaunchConfig memory config = _defaultConfig("Expiring", "EXP");
@@ -246,7 +272,7 @@ contract LaunchSignatureTest is LaunchpadTest {
         assertEq(hook.poolState(id).creator, creator, "the direct path ignores the deadline");
     }
 
-    // --- Scenario: Token address is knowable before launch ---
+    // --- Scenario: Address is predictable ---
 
     /// @dev Derived from the published configuration alone — no signature, no recovery, and no launch
     /// transaction in existence. The prediction is taken before the launch and compared to what deploys.
@@ -274,7 +300,7 @@ contract LaunchSignatureTest is LaunchpadTest {
         assertEq(address(t), predicted, "an unexpected relayer does not move the address");
     }
 
-    // --- Scenario: A different signer cannot occupy the advertised address ---
+    // --- Scenario: Different signer cannot occupy the address ---
 
     /// @dev Two halves. An imposter who signs the creator's configuration *as published* is rejected
     /// outright, because the declared creator is part of what the signature must match. An imposter who
@@ -308,7 +334,7 @@ contract LaunchSignatureTest is LaunchpadTest {
         assertEq(hook.poolState(creatorPool).creator, creator, "and credited to the creator");
     }
 
-    // --- Scenario: A re-signed configuration lands at the same address ---
+    // --- Scenario: Re-signing preserves the address ---
 
     /// @dev The deadline is inside the EIP-712 struct hash but outside the configuration hash the salt is
     /// built from, so re-signing changes what verifies without moving where the token lands.
@@ -333,7 +359,26 @@ contract LaunchSignatureTest is LaunchpadTest {
         assertEq(address(t), advertised, "and that is where it deploys");
     }
 
-    // --- Scenario: Launch identity is unique per pool ---
+    // --- Scenario: Different payout plan changes the address ---
+
+    function test_differentPayoutPlanChangesTheAddress() public {
+        LaunchConfig memory empty = _defaultConfig("Identity", "IDN");
+        LaunchConfig memory selected = _defaultConfig("Identity", "IDN");
+        uint8 planIndex = _registerPayoutPlugin(0.2e18, keccak256("identity-plan"));
+        selected.payoutPlan = uint256(1) << planIndex;
+
+        assertTrue(support.configHash(empty) != support.configHash(selected), "plan binds config identity");
+        assertTrue(
+            support.predictToken(empty, HOOK_ADDR) != support.predictToken(selected, HOOK_ADDR),
+            "plan bit moves CREATE2 address"
+        );
+
+        (PoolId selectedId,, MilestoneToken selectedToken) = _launchDirect(selected);
+        assertEq(hook.payoutPlan(selectedId), selected.payoutPlan, "selectable plan launches unchanged");
+        assertEq(address(selectedToken), support.predictToken(selected, HOOK_ADDR), "prediction matches deployed token");
+    }
+
+    // --- Scenario: Launch identity is isolated ---
 
     /// @dev Two launches from the same creator differing only in metadata: distinct tokens, distinct pool
     /// ids, and neither one's state readable as the other's.

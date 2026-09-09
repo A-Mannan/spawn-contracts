@@ -19,6 +19,17 @@ interface IPayoutPluginRegistry {
     function acceptAdministrator() external;
 }
 
+/// @notice The controller identity a hook deployment proves at construction.
+///
+/// @dev The hook derives its registry from {LaunchSupport} but receives its controller independently,
+/// and the controller holds its own immutable registry. Nothing at runtime reads across that seam, so a
+/// mismatched pair would launch against one resolver while governance mutated another — silently. The
+/// constructor closes it by proving both halves name the same registry, which turns a deployment
+/// convention into a contract invariant.
+interface IProtocolControllerIdentity {
+    function registry() external view returns (address);
+}
+
 interface IProtocolConfigurationTarget {
     function payoutDeliveryInFlight() external view returns (bool);
     function setEconomicConfig(EconomicConfig calldata config) external;

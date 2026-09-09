@@ -114,19 +114,40 @@ class FullRangeLockTests(unittest.TestCase):
         return lock, values, lock.modify_params(call, values)
 
     def test_compounding_fixture_fails_gate(self):
-        completed = subprocess.run(
-            [
-                sys.executable,
-                str(TOOLS / "check_full_range_lock.py"),
-                "--out-dir",
-                str(TOOLS.parent / "out"),
-                "--src-dir",
-                str(TOOLS.parent / "src"),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            out_dir = Path(directory)
+            for contract in (
+                "MilestoneBase",
+                "MilestoneHook",
+                "MilestoneColdPaths",
+                "MilestonePayoutPaths",
+            ):
+                source = TOOLS.parent / f"out/{contract}.sol/{contract}.json"
+                target = out_dir / f"{contract}.sol/{contract}.json"
+                target.parent.mkdir()
+                target.write_bytes(source.read_bytes())
+
+            artifact_path = out_dir / "MilestoneColdPaths.sol/MilestoneColdPaths.json"
+            artifact = json.loads(artifact_path.read_text())
+            compound = copy.deepcopy(self.seed_function(artifact))
+            compound["name"] = "_compoundFullRange"
+            contract = next(node for node in artifact["ast"]["nodes"] if node.get("name") == "MilestoneColdPaths")
+            contract["nodes"].append(compound)
+            artifact_path.write_text(json.dumps(artifact))
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(TOOLS / "check_full_range_lock.py"),
+                    "--out-dir",
+                    str(out_dir),
+                    "--src-dir",
+                    str(TOOLS.parent / "src"),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("positive FULL_RANGE_SALT mutation outside graduation seed", completed.stderr)
 

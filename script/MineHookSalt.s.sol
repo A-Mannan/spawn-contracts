@@ -10,6 +10,9 @@ import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {Deployment, DeployParams, LaunchpadDeploy} from "./LaunchpadDeploy.sol";
 import {LaunchSupport} from "../src/LaunchSupport.sol";
 import {MilestoneColdPaths} from "../src/MilestoneColdPaths.sol";
+import {MilestonePayoutPaths} from "../src/MilestonePayoutPaths.sol";
+import {PayoutPluginRegistry} from "../src/PayoutPluginRegistry.sol";
+import {ProtocolController} from "../src/ProtocolController.sol";
 import {RevenueNFT} from "../src/RevenueNFT.sol";
 import {Bounds, ProtocolTemplate} from "../src/types/LaunchTypes.sol";
 
@@ -32,14 +35,18 @@ contract MineHookSalt is Script {
             poolManager: IPoolManager(vm.envAddress("POOL_MANAGER")),
             create2Deployer: vm.envOr("CREATE2_DEPLOYER", CREATE2_FACTORY),
             selfIssuesCreate2: false,
+            bootstrapAdministrator: vm.envAddress("BOOTSTRAP_ADMINISTRATOR"),
             protocolAdmin: vm.envAddress("PROTOCOL_ADMIN"),
             protocolRecipient: vm.envAddress("PROTOCOL_RECIPIENT")
         });
 
         Deployment memory d;
         d.nft = RevenueNFT(vm.envAddress("REVENUE_NFT"));
+        d.registry = PayoutPluginRegistry(vm.envAddress("PAYOUT_PLUGIN_REGISTRY"));
+        d.controller = ProtocolController(vm.envAddress("PROTOCOL_CONTROLLER"));
         d.support = LaunchSupport(vm.envAddress("LAUNCH_SUPPORT"));
         d.coldPaths = MilestoneColdPaths(vm.envAddress("COLD_PATHS"));
+        d.payoutPaths = MilestonePayoutPaths(vm.envAddress("PAYOUT_PATHS"));
 
         (hook, salt) = mine(d, p, Bounds.defaultTemplate());
     }
@@ -57,6 +64,7 @@ contract MineHookSalt is Script {
 
         console2.log("create2 deployer  ", p.create2Deployer);
         console2.log("cold paths        ", address(d.coldPaths));
+        console2.log("payout paths      ", address(d.payoutPaths));
         console2.log("hook address      ", hook);
         console2.log("hook salt         ", uint256(salt));
         console2.log("encoded flags     ", uint256(uint160(hook) & Hooks.ALL_HOOK_MASK));

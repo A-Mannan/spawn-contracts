@@ -70,9 +70,9 @@
 ## 10. Reference buyback and helper composition
 
 - [x] 10.1 Implement hook-authenticated `BuybackAndBurnPlugin` bound to the source pool, spending only delivered ETH through its own bounded cold PoolManager swap and burning every token received; verify `BuybackPlugin.t.sol` covers “Buyback spends only delivered ETH” and “Buyback burns acquired tokens”.
-- [ ] 10.2 Make failed bounded buy/burn atomic so the hook records the entire attempted value as carry, and make zero delivery a no-op; verify tests cover “Failed buyback carries the entire share” and “Zero delivery performs no swap”.
+- [x] 10.2 Make failed bounded buy/burn atomic so the hook records the entire attempted value as carry, and make zero delivery a no-op; verify tests cover “Failed buyback carries the entire share” and “Zero delivery performs no swap”.
 - [x] 10.3 Implement `SwapAndFlushHelper` as a non-selectable utility that settles the user swap completely before a separate flush, cannot alter route or payout parameters, and forwards output/refunds/tip; verify `SwapAndFlushHelper.t.sol` covers “Opted-in caller swaps then flushes”, “Helper uses a separate flush unlock”, “Helper cannot alter routing”, and “Helper forwards the tip”.
-- [ ] 10.4 Preserve a settled swap when any later plugin delivery fails by recording carry instead of reverting helper execution; verify “Plugin failure does not undo the settled swap”.
+- [x] 10.4 Preserve a settled swap when any later plugin delivery fails by recording carry instead of reverting helper execution; verify “Plugin failure does not undo the settled swap”.
 - [ ] 10.5 Bootstrap the canonical plan with only the buyback plugin at `floor(2 * WAD / 9)` and creator remainder; verify tests cover “Canonical bits select intended destinations”, “Canonical economics match their declared baseline”, “Preset naming cannot change identity”, and “Preset bit changes alter identity”.
 
 ## 11. Swap-fee collection and token routing
@@ -112,7 +112,7 @@
 
 ## 16. Deployment, tooling, and documentation
 
-- [ ] 16.1 Update deployment scripts to deploy/configure the controller, registry, canonical buyback plugin, helper, launch support, cold paths, and payout paths; register canonical entries deterministically and verify all authorities, immutable terms, economic defaults/caps, codehashes, and template hashes before hook deployment.
+- [ ] 16.1 Update deployment scripts to deploy/configure the controller, registry, canonical buyback plugin, helper, launch support, cold paths, and payout paths; register canonical entries deterministically through the bound controller, verify all authorities, immutable terms, economic defaults/caps, codehashes, and template hashes, and complete the exact-pending multisig handoff only after deployment.
 - [ ] 16.2 Extend hook-address mining inputs for every finalized immutable satellite/support/registry/controller address, mine an address with exactly the six required callback flags, and deploy only after all addresses are final; verify the deployment smoke test rejects stale salts and mismatched satellites.
 - [ ] 16.3 Update `tools/check_storage_layout.py`, delegated-entry guard checks, size gates, and lock checks for the payout satellite and no-positive-full-range rule; verify `make layout-check`, `make size`, `make size-gate-selftest`, and `make lock-check` all pass independently.
 - [ ] 16.4 Update `Makefile` and CI so new unit/invariant/fork suites and all custom gates execute in their correct layers without requiring RPC credentials for local unit runs; verify the CI command matrix locally where credentials permit.
@@ -122,7 +122,7 @@
 
 - [ ] 17.1 Run repository searches proving production removal of `HarvestSplit`, vesting release/state, dynamic fee flags/updates, fee step-downs, inline harvest destinations, LP fee carry/compounding, and per-pool protocol claims; verify remaining matches are only explicit historical/removal documentation or test assertions.
 - [ ] 17.2 Run `make fmt`, `make fmt-check`, `make build`, `make pins`, `make size`, `make size-gate-selftest`, `make lock-check`, `make layout-check`, `make test`, and `make test-invariant`; record exact results and bytecode headroom in a release-check report.
-- [ ] 17.3 With `BASE_RPC_URL`, run the complete fork campaign and reconcile every delta-spec scenario against a passing unit, invariant, or fork test; verify all 212 scenarios are represented and no scenario is marked complete solely by an unexecuted test.
+- [ ] 17.3 With `BASE_RPC_URL`, run the complete fork campaign and reconcile every delta-spec scenario against a passing unit, invariant, or fork test; verify all 215 scenarios derived by `tools/check_scenarios.py` from the six delta specs are represented and no scenario is marked complete solely by an unexecuted test.
 - [ ] 17.4 Perform a local deployment dry-run and Base fork deployment rehearsal, confirming controller ownership handoff, zero initial delay, recipient separation, canonical registration, hook flags, static fee, satellite immutables, predicted token identity, flush/tip/carry, buyback burn, and global claims.
 - [ ] 17.5 With `BASE_SEPOLIA_RPC_URL`, funded deployer credentials, and required environment addresses, run the public-testnet rehearsal through launch, trade, harvest, flush, failure/retry, fee collection/burn, NFT transfer, creator claims, governance update, and global protocol claim; record transaction evidence and keep this task open until the external prerequisites and rehearsal succeed.
 - [ ] 17.6 Run `make release-check` after all applicable local/fork gates, document any credential-blocked testnet step explicitly, and mark this change complete only when every implementation task and named scenario has passing evidence.

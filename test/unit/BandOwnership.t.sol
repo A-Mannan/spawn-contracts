@@ -9,7 +9,7 @@ import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {Position} from "v4-core/src/libraries/Position.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {TestRouter} from "../Fixtures.sol";
-import {GraduatedFeeFixture} from "./SwapFees.t.sol";
+import {HarnessLaunchpadTest} from "../HarnessFixtures.sol";
 import {MilestoneBase} from "../../src/MilestoneBase.sol";
 import {Orientation} from "../../src/libraries/Orientation.sol";
 import {PoolState} from "../../src/types/LaunchTypes.sol";
@@ -21,8 +21,10 @@ import {PoolState} from "../../src/types/LaunchTypes.sol";
 /// a would-be extractor actually has, and by asserting the protocol state those entry points must not move.
 /// The structural half of the same guarantee is covered by `make lock-check` and `make layout-check`, which
 /// assert properties of the code's shape rather than of the paths a test happened to think of.
-contract BandOwnershipTest is GraduatedFeeFixture {
+contract BandOwnershipTest is HarnessLaunchpadTest {
     using StateLibrary for IPoolManager;
+
+    uint256 internal constant MEASURED_SELL = 1_000_000 ether;
 
     /// @dev A *budget*, not an amount: the buy that wakes a band is price-limited inside it.
     uint256 internal constant BAND_BUDGET = 5_000 ether;
@@ -42,6 +44,8 @@ contract BandOwnershipTest is GraduatedFeeFixture {
 
     function setUp() public virtual override {
         super.setUp();
+        _graduate();
+        hook.collectFees(key);
 
         attacker = new TestRouter(IPoolManager(address(manager)));
         vm.deal(address(attacker), 1_000_000 ether);
@@ -137,8 +141,8 @@ contract BandOwnershipTest is GraduatedFeeFixture {
     /// ledger, so it runs here rather than in the assertions.
     function _accrueOnBothSidesOfALiveBand() private {
         _sell(MEASURED_SELL);
-        _buyToLevel(MEASURED_BUY, _bandLower(0) + 200);
-        _collectAndCapture();
+        _buyToLevel(BAND_BUDGET, _bandLower(0) + 200);
+        hook.collectFees(key);
     }
 
     function test_creatorCannotWithdrawLadderInventory() public {
@@ -154,10 +158,8 @@ contract BandOwnershipTest is GraduatedFeeFixture {
         assertGt(before.ladderInventoryRemaining, 0, "and ladder inventory sitting beside it");
 
         // Every entry point the creator has. None of them names an amount, so none can over-draw.
-        vm.startPrank(creator);
+        vm.prank(creator);
         hook.claimCreator(poolId);
-        hook.releaseDevBuy(poolId);
-        vm.stopPrank();
 
         PoolState memory afterClaims = hook.poolState(poolId);
         assertEq(creator.balance - ethBefore, claimable, "the creator received exactly their accrued balance");
@@ -178,10 +180,11 @@ contract BandOwnershipTest is GraduatedFeeFixture {
         Band memory b = _deployBand(0);
         PoolState memory before = hook.poolState(poolId);
 
-        // The protocol's entire privileged surface is the recipient setter (Decision 10). Exercising it
-        // cannot move a token.
+        // Governance can change configuration, but cannot move a token.
+        bytes32 salt = keccak256("band-ownership-recipient");
         vm.prank(PROTOCOL_ADMIN);
-        hook.setProtocolRecipient(STRANGER);
+        controller.scheduleProtocolRecipient(STRANGER, salt);
+        controller.executeProtocolRecipient(STRANGER, salt);
 
         PoolState memory afterAdmin = hook.poolState(poolId);
         assertEq(afterAdmin.ladderInventoryRemaining, before.ladderInventoryRemaining, "ladder supply intact");
@@ -192,7 +195,7 @@ contract BandOwnershipTest is GraduatedFeeFixture {
     }
 
     // --- Scenario (revenue-claims): Claims cannot reach ladder inventory ---
-    // --- Scenario (revenue-claims): Claims cannot reach the full-range position ---
+    // --- Scenario (revenue-claims): Claims cannot reach locked liquidity ---
     //
     // Design Decision 21 removed the token claim ledgers: a claimant is only ever paid in quote, so the
     // parked suite's four claim calls are two here. That makes the negative claim stronger rather than
@@ -209,20 +212,20 @@ contract BandOwnershipTest is GraduatedFeeFixture {
         uint256 hookTokensBefore = token.balanceOf(HOOK_ADDR);
 
         uint256 creatorQuote = hook.creatorClaimable(poolId);
-        uint256 protocolQuote = hook.protocolClaimable(poolId);
+        uint256 protocolQuote = hook.protocolClaimable();
         assertGt(creatorQuote, 0, "the creator has ETH to claim");
         assertGt(protocolQuote, 0, "and so does the protocol");
 
         vm.prank(creator);
         assertEq(hook.claimCreator(poolId), creatorQuote, "paid exactly the accrued ETH");
         vm.prank(PROTOCOL_RECIPIENT);
-        assertEq(hook.claimProtocol(poolId), protocolQuote, "paid exactly the accrued ETH");
+        assertEq(hook.claimProtocol(), protocolQuote, "paid exactly the accrued ETH");
 
         // A second claim finds nothing: the ledgers are zeroed, not merely decremented.
         vm.prank(creator);
         assertEq(hook.claimCreator(poolId), 0, "nothing left to claim");
         vm.prank(PROTOCOL_RECIPIENT);
-        assertEq(hook.claimProtocol(poolId), 0, "nothing left to claim");
+        assertEq(hook.claimProtocol(), 0, "nothing left to claim");
 
         PoolState memory afterClaims = hook.poolState(poolId);
         assertEq(_bandLiquidity(0), bandBefore, "the deployed band is unaffected");
@@ -235,8 +238,6 @@ contract BandOwnershipTest is GraduatedFeeFixture {
 
         assertEq(_fullRangeLiquidity(), fullRangeBefore, "the full-range position's liquidity is unchanged");
         assertEq(afterClaims.fullRangeLiquidity, before.fullRangeLiquidity, "in the hook's record too");
-        assertEq(afterClaims.pendingLpQuote, before.pendingLpQuote, "and its pending LP share is not claimable");
-        assertEq(afterClaims.pendingLpToken, before.pendingLpToken, "in either currency");
         assertEq(token.balanceOf(HOOK_ADDR), hookTokensBefore, "no token left hook custody at all");
     }
 

@@ -11,6 +11,8 @@ import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {BuybackAndBurnPlugin} from "../../src/BuybackAndBurnPlugin.sol";
 import {MilestoneToken} from "../../src/MilestoneToken.sol";
+import {PluginRole} from "../../src/types/PayoutTypes.sol";
+import {PayoutTestFixture} from "../mocks/PayoutTestHook.sol";
 import {MockPayoutHook, MockPoolManager} from "../mocks/PayoutReferenceMocks.sol";
 
 contract RevertingBurnToken is ERC20 {
@@ -91,7 +93,7 @@ contract BuybackPluginTest is Test {
         assertEq(token.balanceOf(address(plugin)), 0, "plugin retains no launch token");
     }
 
-    // --- Scenario: Failed buyback carries the entire share ---
+    // --- Failed buyback atomic rollback: derived, no scenario of its own ---
 
     function test_failedBoundedBuybackRevertsAtomically() public {
         manager.configureSwap(PAYOUT - 1, TOKENS_OUT, key.currency1);
@@ -140,5 +142,34 @@ contract BuybackPluginTest is Test {
         assertTrue(success, "zero payout is harmless");
         assertEq(manager.unlockCount(), 0, "no unlock");
         assertEq(manager.swapCount(), 0, "no swap");
+    }
+}
+
+contract BuybackCarryTest is PayoutTestFixture {
+    uint32 private constant BUYBACK_GAS_LIMIT = 500_000;
+
+    // --- Scenario: Failed buyback carries the entire share ---
+
+    function test_failedBuybackCarriesTheEntireShare() public {
+        BuybackAndBurnPlugin buyback =
+            new BuybackAndBurnPlugin(IPoolManager(address(manager)), address(hook), TickMath.MIN_SQRT_PRICE + 1);
+        uint8 index =
+            _registerPlugin(address(buyback), CANONICAL_BUYBACK_TAKE_WAD, BUYBACK_GAS_LIMIT, PluginRole.PAYOUT);
+        (PoolId id,, MilestoneToken launchedToken) = _launchWithPlan("Carry", "CRY", _canonicalPlan(index));
+        uint256 supplyBefore = launchedToken.totalSupply();
+        uint160 priceBefore = _sqrtPriceOf(id);
+
+        _fundPot(id, 0, 100 ether);
+        uint256 distributable = 90 ether - 0.9 ether;
+        uint256 attempted = (distributable * CANONICAL_BUYBACK_TAKE_WAD) / 1e18;
+        hook.flush(id);
+
+        assertEq(hook.pluginCarry(id, index), attempted, "complete buyback share carried");
+        assertEq(hook.carryBitmap(id), uint256(1) << index, "carry index remains pending");
+        assertEq(hook.payoutPot(id), 0, "funded pot fully processed");
+        assertEq(launchedToken.totalSupply(), supplyBefore, "failed purchase burn rolled back");
+        assertEq(_sqrtPriceOf(id), priceBefore, "failed partial purchase rolled back");
+        (, uint256 carry,,,,) = hook.aggregateLiabilities();
+        assertEq(carry, attempted, "aggregate carry tracks failed buyback");
     }
 }

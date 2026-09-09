@@ -38,14 +38,23 @@ jobs:
       - name: Size gate self-test
         run: make size-gate-selftest
 
+      - name: Structural gate self-tests
+        run: make structural-gate-selftest
+
+      - name: Scenario gate self-tests
+        run: make scenario-tool-selftest
+
       - name: Full-range lock check
         run: make lock-check
 
       - name: Storage layout check
         run: make layout-check
 
-      - name: Unit tests
-        run: make test-unit
+      - name: Unit tests with scenario evidence
+        run: |
+          mkdir -p reports
+          forge test --no-match-path '{test/fork/**,test/invariant/**}' --junit > reports/unit.xml
+          python3 tools/check_scenarios.py --junit reports/unit.xml
 
       - name: Invariant tests
         run: make test-invariant

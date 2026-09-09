@@ -88,9 +88,9 @@ contract ForkAdversarialTest is BaseForkTest {
         assertEq(hook.poolState(poolId).graduatedAt, block.timestamp, "and recorded it");
         assertGt(_fullRangeLiquidity(), 0, "the full-range position is seeded");
 
-        // What the split moved out of reach: the creator and protocol shares are claim ledger entries now,
-        // and no swap can reach a claim ledger.
-        uint256 removed = hook.creatorClaimable(poolId) + hook.protocolClaimable(poolId);
+        // What the split moved out of reach: the creator and global protocol shares are claim ledger
+        // entries now, and no swap can reach a claim ledger.
+        uint256 removed = hook.creatorClaimable(poolId) + hook.protocolClaimable();
         assertGt(removed, 0, "the creator and protocol shares left the pool");
 
         // Straight back out, selling everything the pump bought. A sell moves the price down in level and
@@ -110,7 +110,7 @@ contract ForkAdversarialTest is BaseForkTest {
     }
 
     // --- Scenario (milestone-ladder): Band-boundary trading cannot extract beyond band prices ---
-    // --- Scenario (milestone-ladder): Price falling back does not un-complete a band ---
+    // --- Scenario (milestone-ladder): A completed band cannot be accounted again ---
     //
     // The sandwich a band-boundary attacker would actually attempt: wake the band, sweep through its top so
     // the fills and the harvest are theirs, then sell straight back. Two claims, and the fork settles both
@@ -171,7 +171,7 @@ contract ForkAdversarialTest is BaseForkTest {
         assertEq(hook.poolState(poolId).completedMilestones, 1, "one milestone, once");
     }
 
-    // --- Scenario (milestone-ladder): In-band oscillation is permitted but cannot prevent completion ---
+    // --- Scenario (milestone-ladder): In-band oscillation cannot prevent completion ---
     //
     // Churn as an attack: buy up into the live band, sell back out below its floor, repeat. Every trip
     // starts and ends at the same price, so a fee-free round trip would leave the pool's two balances
@@ -243,6 +243,8 @@ contract ForkAdversarialTest is BaseForkTest {
     }
 
     // --- Scenario (swap-fees): Repeated collection is harmless ---
+    // --- Scenario (swap-fees): Collected fees never compound ---
+    // --- Scenario (swap-fees): No fee LP carry exists ---
     //
     // Griefing by calling the permissionless entry point in a loop. One call does the work; the rest find
     // nothing, say nothing, and cost a fraction of it. Worth re-running on the fork because the thing being
@@ -264,8 +266,9 @@ contract ForkAdversarialTest is BaseForkTest {
 
         uint128 liquidity = _fullRangeLiquidity();
         PoolState memory before = hook.poolState(poolId);
+        uint256 supply = token.totalSupply();
         uint256 creatorQuote = hook.creatorClaimable(poolId);
-        uint256 protocolQuote = hook.protocolClaimable(poolId);
+        uint256 protocolQuote = hook.protocolClaimable();
         uint256 hookEth = address(hook).balance;
         uint256 hookToken = token.balanceOf(address(hook));
         uint256 spammerEth = STRANGER.balance;
@@ -286,12 +289,11 @@ contract ForkAdversarialTest is BaseForkTest {
             assertLt(gasUsed, workingGas / 4, "far cheaper than the call that did the work");
         }
 
-        assertEq(_fullRangeLiquidity(), liquidity, "the position is unchanged in net terms");
+        assertEq(_fullRangeLiquidity(), liquidity, "the locked position never compounded");
         assertEq(hook.creatorClaimable(poolId), creatorQuote, "no ledger moved");
-        assertEq(hook.protocolClaimable(poolId), protocolQuote, "on either side");
+        assertEq(hook.protocolClaimable(), protocolQuote, "on either side");
         assertEq(hook.poolState(poolId).milestoneFundAccrued, before.milestoneFundAccrued, "the fund did not grow");
-        assertEq(hook.poolState(poolId).pendingLpQuote, before.pendingLpQuote, "nothing was drawn from the carry");
-        assertEq(hook.poolState(poolId).pendingLpToken, before.pendingLpToken, "on either side");
+        assertEq(token.totalSupply(), supply, "no token was burned a second time");
         assertEq(address(hook).balance, hookEth, "no value left the manager a second time");
         assertEq(token.balanceOf(address(hook)), hookToken, "in either currency");
 

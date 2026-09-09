@@ -181,9 +181,8 @@ contract LadderSimulationTest is HarnessLaunchpadTest {
             "ladder custody moved by exactly what the log placed and got back"
         );
 
-        // The hook's real token balance tracks the same quantity: the buyback takes tokens and burns
-        // them in the same frame (net zero on the balance, supply falls), and the LP share is donated in
-        // quote only, so neither routing leg touches this identity.
+        // Harvesting performs no token-side destination work. Any residue returns to carried inventory,
+        // so the hook's real token balance moves by exactly what bands took and returned.
         assertEq(token.balanceOf(HOOK_ADDR), balanceBefore - placed + returned, "and real custody agrees with it");
 
         uint256 announced = _countLogs(logs, MilestoneBase.BandDeployed.selector);

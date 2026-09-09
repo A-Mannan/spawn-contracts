@@ -16,12 +16,16 @@ import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {MilestoneHook} from "../src/MilestoneHook.sol";
 import {MilestoneBase} from "../src/MilestoneBase.sol";
 import {MilestoneColdPaths} from "../src/MilestoneColdPaths.sol";
+import {MilestonePayoutPaths} from "../src/MilestonePayoutPaths.sol";
+import {PayoutPluginRegistry} from "../src/PayoutPluginRegistry.sol";
+import {ProtocolController} from "../src/ProtocolController.sol";
 import {MilestoneToken} from "../src/MilestoneToken.sol";
 import {RevenueNFT} from "../src/RevenueNFT.sol";
 import {LaunchSupport} from "../src/LaunchSupport.sol";
 import {Orientation} from "../src/libraries/Orientation.sol";
 import {LadderLib} from "../src/libraries/LadderLib.sol";
-import {Bounds, HarvestSplit, LaunchConfig, PoolState, ProtocolTemplate} from "../src/types/LaunchTypes.sol";
+import {Bounds, LaunchConfig, PoolState, ProtocolTemplate, WAD} from "../src/types/LaunchTypes.sol";
+import {PluginRole} from "../src/types/PayoutTypes.sol";
 
 /// @notice Router that performs swaps and liquidity operations through the manager on behalf of tests,
 /// standing in for an ordinary third-party integrator.
@@ -169,6 +173,8 @@ abstract contract LaunchpadTest is Test {
     uint256 internal constant IMPOSTER_PK = 0xBADBEEF;
 
     uint256 internal constant SUPPLY = 1_000_000_000 ether;
+    uint64 internal constant CANONICAL_BUYBACK_TAKE_WAD = uint64((2 * WAD) / 9);
+    uint32 internal constant DEFAULT_PLUGIN_GAS_LIMIT = 200_000;
 
     PoolManager internal manager;
     MilestoneHook internal hook;
@@ -179,6 +185,10 @@ abstract contract LaunchpadTest is Test {
 
     address internal creator;
     address internal imposter;
+
+    PayoutPluginRegistry internal registry;
+    ProtocolController internal controller;
+    MilestonePayoutPaths internal payoutPaths;
 
     ProtocolTemplate internal template;
 
@@ -209,10 +219,14 @@ abstract contract LaunchpadTest is Test {
     function _deployProtocol() internal {
         manager = new PoolManager(address(this));
         nft = new RevenueNFT();
-        support = new LaunchSupport();
+        registry = new PayoutPluginRegistry(address(this));
+        controller = new ProtocolController(PROTOCOL_ADMIN, PROTOCOL_RECIPIENT, registry, address(0));
+        support = new LaunchSupport(registry);
         template = Bounds.defaultTemplate();
 
-        coldPaths = new MilestoneColdPaths(IPoolManager(address(manager)), nft, support, template);
+        coldPaths = new MilestoneColdPaths(IPoolManager(address(manager)), nft, support, template, address(controller));
+        payoutPaths =
+            new MilestonePayoutPaths(IPoolManager(address(manager)), nft, support, template, address(controller));
 
         deployCodeTo(
             _hookArtifact(),
@@ -222,13 +236,19 @@ abstract contract LaunchpadTest is Test {
                 support,
                 template,
                 address(coldPaths),
-                PROTOCOL_ADMIN,
+                address(payoutPaths),
+                address(controller),
                 PROTOCOL_RECIPIENT
             ),
             HOOK_ADDR
         );
         hook = MilestoneHook(payable(HOOK_ADDR));
         nft.setMinter(HOOK_ADDR);
+        vm.prank(PROTOCOL_ADMIN);
+        controller.bindTarget(HOOK_ADDR);
+        registry.proposeAdministrator(address(controller));
+        vm.prank(PROTOCOL_ADMIN);
+        controller.acceptRegistryAdministration();
 
         router = new TestRouter(IPoolManager(address(manager)));
     }
@@ -291,6 +311,51 @@ abstract contract LaunchpadTest is Test {
         bytes32 digest = support.launchDigest(config, HOOK_ADDR);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, digest);
         return abi.encodePacked(r, s, v);
+    }
+
+    // --- Payout-plan helpers ---
+
+    /// @notice Registers a plugin through the same zero-delay typed governance path used in production.
+    function _registerPayoutPlugin(address plugin, uint64 takeWad) internal returns (uint8 index) {
+        return _registerPlugin(plugin, takeWad, DEFAULT_PLUGIN_GAS_LIMIT, PluginRole.PAYOUT);
+    }
+
+    function _registerPlugin(address plugin, uint64 takeWad, uint32 gasLimit, PluginRole role)
+        internal
+        returns (uint8 index)
+    {
+        bytes32 salt = keccak256(abi.encode("fixture-register", plugin, takeWad, gasLimit, role, registry.entryCount()));
+        vm.prank(PROTOCOL_ADMIN);
+        controller.scheduleRegisterPlugin(plugin, takeWad, gasLimit, role, salt);
+        index = controller.executeRegisterPlugin(plugin, takeWad, gasLimit, role, salt);
+    }
+
+    function _setPluginSuspended(uint8 index, bool suspended) internal {
+        bytes32 salt = keccak256(abi.encode("fixture-suspend", index, suspended, block.number, block.timestamp));
+        vm.prank(PROTOCOL_ADMIN);
+        controller.schedulePluginSuspension(index, suspended, salt);
+        controller.executePluginSuspension(index, suspended, salt);
+    }
+
+    function _plan(uint8 first) internal pure returns (uint256) {
+        return uint256(1) << first;
+    }
+
+    function _plan(uint8 first, uint8 second) internal pure returns (uint256) {
+        return (uint256(1) << first) | (uint256(1) << second);
+    }
+
+    function _canonicalPlan(uint8 buybackIndex) internal pure returns (uint256) {
+        return _plan(buybackIndex);
+    }
+
+    function _launchWithPlan(string memory name_, string memory symbol_, uint256 payoutPlan_)
+        internal
+        returns (PoolId id, PoolKey memory k, MilestoneToken t)
+    {
+        LaunchConfig memory config = _defaultConfig(name_, symbol_);
+        config.payoutPlan = payoutPlan_;
+        return _launchDirect(config);
     }
 
     // --- Price and level helpers ---
@@ -511,20 +576,6 @@ abstract contract LaunchpadTest is Test {
             return tokenInventory;
         }
         revert("no BandDeployed for index");
-    }
-
-    /// @notice A harvest split with the given creator share, the rest arranged to satisfy every bound.
-    function _split(uint64 creatorWad, uint64 buybackWad, uint64 protocolWad)
-        internal
-        pure
-        returns (HarvestSplit memory)
-    {
-        return HarvestSplit({
-            creatorWad: creatorWad,
-            buybackWad: buybackWad,
-            protocolWad: protocolWad,
-            lpWad: uint64(1e18) - creatorWad - buybackWad - protocolWad
-        });
     }
 
     receive() external payable {}

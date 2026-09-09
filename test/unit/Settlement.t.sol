@@ -117,7 +117,8 @@ contract SettlementTest is HarnessLaunchpadTest {
                 support,
                 template,
                 address(coldPaths),
-                PROTOCOL_ADMIN,
+                address(payoutPaths),
+                address(controller),
                 PROTOCOL_RECIPIENT
             ),
             plainAddr

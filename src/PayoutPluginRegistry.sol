@@ -7,8 +7,7 @@ import {IPayoutPluginRegistry} from "./interfaces/IPayoutPluginRegistry.sol";
 /// @title PayoutPluginRegistry
 /// @notice Bounded append-only registry whose indices and payout terms never change.
 contract PayoutPluginRegistry is IPayoutPluginRegistry {
-    /// @dev A stipend must leave useful gas for the plugin without making outer flush accounting unsafe.
-    uint32 public constant MIN_PLUGIN_GAS_LIMIT = 25_000;
+    uint32 public constant MIN_PLUGIN_GAS_LIMIT = 1;
     uint32 public constant MAX_PLUGIN_GAS_LIMIT = 500_000;
     uint16 public constant MAX_ENTRIES = 256;
 

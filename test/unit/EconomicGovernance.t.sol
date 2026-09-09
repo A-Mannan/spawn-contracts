@@ -282,7 +282,24 @@ contract EconomicGovernanceTest is Test {
         assertFalse(registry.isSelectable(index));
     }
 
-    // --- Global payout guard blocks governance: derived, no scenario of its own ---
+    // --- Scenario: Registry mutation is blocked during payout delivery ---
+
+    function test_registryMutationIsBlockedDuringPayoutDelivery() public {
+        GovernancePlugin plugin = new GovernancePlugin();
+        bytes32 salt = bytes32("guarded-register");
+        vm.prank(ADMINISTRATOR);
+        bytes32 operationId =
+            controller.scheduleRegisterPlugin(address(plugin), 0.2e18, GAS_LIMIT, PluginRole.PAYOUT, salt);
+
+        target.setPayoutDeliveryInFlight(true);
+        vm.expectRevert(ProtocolController.PayoutDeliveryInFlight.selector);
+        controller.executeRegisterPlugin(address(plugin), 0.2e18, GAS_LIMIT, PluginRole.PAYOUT, salt);
+
+        assertEq(registry.entryCount(), 0, "registry unchanged");
+        assertTrue(controller.isScheduled(operationId), "operation restored after target guard revert");
+    }
+
+    // --- Global payout guard blocks other governance: derived, no scenario of its own ---
 
     function test_globalPayoutGuardBlocksSchedulingAndExecution() public {
         bytes32 salt = bytes32("guarded");

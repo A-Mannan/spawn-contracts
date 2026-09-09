@@ -86,13 +86,20 @@ contract SwapAndFlushHelperTest is Test {
     // --- Scenario: Helper cannot alter routing ---
 
     function test_helperCannotAlterRouting() public {
-        bytes4 selector =
-            bytes4(keccak256("swapAndFlush((address,address,uint24,int24,address),bool,int256,uint160,uint256)"));
-        (bool callable,) =
-            address(helper).call(abi.encodeWithSelector(selector, key, true, -int256(INPUT), uint160(1), 1));
+        bytes4 canonicalSelector =
+            bytes4(keccak256("swapAndFlush(((address,address,uint24,int24,address),bool,int256,uint160))"));
+        bytes4 routingSelector =
+            bytes4(keccak256("swapAndFlush(((address,address,uint24,int24,address),bool,int256,uint160),uint256)"));
+
+        assertEq(SwapAndFlushHelper.swapAndFlush.selector, canonicalSelector, "exact helper ABI");
+        assertEq(canonicalSelector, bytes4(0x812e0afb), "canonical selector fixed");
+        assertEq(routingSelector, bytes4(0x5168b3f2), "routing overload selector fixed");
+
+        (bool callable,) = address(helper).call(abi.encodeWithSelector(routingSelector, _request(), uint256(1)));
 
         assertFalse(callable, "no routing parameter overload exists");
         assertEq(address(helper.hook()), address(hook), "flush target is immutable");
+        assertEq(address(helper.poolManager()), address(manager), "manager target is immutable");
     }
 
     // --- Scenario: Helper forwards the tip ---

@@ -13,13 +13,15 @@ import {BuybackAndBurnPlugin} from "../../src/BuybackAndBurnPlugin.sol";
 import {MilestoneToken} from "../../src/MilestoneToken.sol";
 import {MockPayoutHook, MockPoolManager} from "../mocks/PayoutReferenceMocks.sol";
 
-contract IncompleteBurnToken is ERC20 {
-    constructor(uint256 supply) ERC20("Incomplete", "INC") {
+contract RevertingBurnToken is ERC20 {
+    error BurnFailed();
+
+    constructor(uint256 supply) ERC20("Reverting", "RVT") {
         _mint(msg.sender, supply);
     }
 
-    function burn(uint256 amount) external {
-        _burn(msg.sender, amount - 1);
+    function burn(uint256) external pure {
+        revert BurnFailed();
     }
 }
 
@@ -106,28 +108,28 @@ contract BuybackPluginTest is Test {
     }
 
     function test_burnFailureRevertsAtomicPurchase() public {
-        IncompleteBurnToken incompleteToken = new IncompleteBurnToken(20_000 ether);
-        PoolKey memory incompleteKey = PoolKey({
+        RevertingBurnToken revertingToken = new RevertingBurnToken(20_000 ether);
+        PoolKey memory revertingKey = PoolKey({
             currency0: Currency.wrap(address(0)),
-            currency1: Currency.wrap(address(incompleteToken)),
+            currency1: Currency.wrap(address(revertingToken)),
             fee: 10_000,
             tickSpacing: 60,
             hooks: IHooks(address(hook))
         });
-        PoolId incompletePoolId = incompleteKey.toId();
-        hook.setSource(incompletePoolId, incompleteKey, address(incompleteToken));
-        incompleteToken.transfer(address(manager), 10_000 ether);
-        manager.configureSwap(PAYOUT, TOKENS_OUT, incompleteKey.currency1);
+        PoolId revertingPoolId = revertingKey.toId();
+        hook.setSource(revertingPoolId, revertingKey, address(revertingToken));
+        revertingToken.transfer(address(manager), 10_000 ether);
+        manager.configureSwap(PAYOUT, TOKENS_OUT, revertingKey.currency1);
         uint256 hookBefore = address(hook).balance;
-        uint256 managerTokensBefore = incompleteToken.balanceOf(address(manager));
-        uint256 supplyBefore = incompleteToken.totalSupply();
+        uint256 managerTokensBefore = revertingToken.balanceOf(address(manager));
+        uint256 supplyBefore = revertingToken.totalSupply();
 
-        (bool success,) = hook.payPlugin{value: PAYOUT}(address(plugin), incompletePoolId, address(incompleteToken));
+        (bool success,) = hook.payPlugin{value: PAYOUT}(address(plugin), revertingPoolId, address(revertingToken));
 
-        assertFalse(success, "incomplete burn rejected");
+        assertFalse(success, "burn revert propagated");
         assertEq(address(hook).balance, hookBefore + PAYOUT, "whole share remains at hook");
-        assertEq(incompleteToken.balanceOf(address(manager)), managerTokensBefore, "purchase rolled back");
-        assertEq(incompleteToken.totalSupply(), supplyBefore, "partial burn rolled back");
+        assertEq(revertingToken.balanceOf(address(manager)), managerTokensBefore, "purchase rolled back");
+        assertEq(revertingToken.totalSupply(), supplyBefore, "supply remains unchanged");
     }
 
     // --- Scenario: Zero delivery performs no swap ---

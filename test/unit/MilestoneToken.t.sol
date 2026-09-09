@@ -4,9 +4,9 @@ pragma solidity 0.8.26;
 import {Test} from "forge-std/Test.sol";
 import {MilestoneToken} from "../../src/MilestoneToken.sol";
 
-/// @notice Unit tests for task 2.1, covering the `token-launch` spec scenarios
-/// "Full supply is held by the hook", "Supply is fixed after launch", and
-/// "Token behaves as a standard ERC20".
+/// @notice Unit tests for add-payout-plugins task 5.4, covering the `token-launch` spec scenarios
+/// "Protocol initially receives the full minted supply", "Supply is fixed after launch", and
+/// "Token remains standard ERC20".
 contract MilestoneTokenTest is Test {
     MilestoneToken internal token;
 
@@ -28,9 +28,9 @@ contract MilestoneTokenTest is Test {
         assertFalse(ok, reason);
     }
 
-    // --- Scenario: Full supply is held by the hook ---
+    // --- Scenario: Protocol initially receives the full minted supply ---
 
-    function test_fullSupplyHeldByHook() public view {
+    function test_protocolInitiallyReceivesTheFullMintedSupply() public view {
         assertEq(token.totalSupply(), SUPPLY, "total supply");
         assertEq(token.balanceOf(HOOK), SUPPLY, "hook holds everything");
         assertEq(token.hook(), HOOK, "hook recorded");
@@ -110,7 +110,7 @@ contract MilestoneTokenTest is Test {
         assertEq(token.balanceOf(ALICE), 10 ether, "alice keeps her tokens");
     }
 
-    // --- Scenario: Token behaves as a standard ERC20 ---
+    // --- Scenario: Token remains standard ERC20 ---
 
     function test_metadata() public view {
         assertEq(token.name(), "Milestone", "name");

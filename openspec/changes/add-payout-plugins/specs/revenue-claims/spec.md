@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Creator accruals are credited to the NFT
-Only the creator's share of quote-denominated swap fees and bonding-curve proceeds SHALL be credited to the hook's direct per-pool creator ledger. Milestone proceeds SHALL enter the payout pot and the separate creator-plugin ledger instead. All creator entitlements SHALL be quote-denominated and SHALL follow current RevenueNFT ownership; token-denominated fees SHALL never accrue to a claimant.
+Only the creator's share of quote-denominated swap fees and bonding-curve proceeds SHALL be credited to the hook's direct per-pool creator ledger. Milestone proceeds SHALL enter the payout pot and the separate creator-path entitlement ledger instead. All creator entitlements SHALL be quote-denominated and SHALL follow current RevenueNFT ownership; token-denominated fees SHALL never accrue to a claimant.
 
 #### Scenario: Fee creator share accrues directly
 - **WHEN** quote-denominated swap fees are collected
@@ -24,11 +24,11 @@ Only the creator's share of quote-denominated swap fees and bonding-curve procee
 - **THEN** no milestone value is added to the hook's direct creator ledger
 
 #### Scenario: Plugin-pot proceeds remain separate
-- **WHEN** creator remainder is delivered to the creator plugin
-- **THEN** it is accounted in the creator plugin's per-pool ledger
+- **WHEN** creator remainder is assigned to the creator path
+- **THEN** it is accounted in the creator path's per-pool entitlement ledger
 
 ### Requirement: Pull-based claiming by the current holder
-Only the current RevenueNFT owner SHALL be able to claim the hook's direct per-pool creator balance. A claim SHALL transfer the full recorded direct balance and reset it before transfer. It SHALL NOT flush a payout pot, claim a creator-plugin balance, or depend on plugin availability.
+Only the current RevenueNFT owner SHALL be able to claim the hook's direct per-pool creator balance. A claim SHALL transfer the full recorded direct balance and reset it before transfer. It SHALL NOT flush a payout pot, claim a creator-path balance, or depend on plugin availability.
 
 #### Scenario: Current holder claims direct revenue
 - **WHEN** the current holder claims a non-zero direct balance
@@ -59,7 +59,7 @@ Only the current RevenueNFT owner SHALL be able to claim the hook's direct per-p
 - **THEN** the current holder can still claim direct creator revenue
 
 ### Requirement: Transfer carries the unclaimed balance
-Transferring the RevenueNFT SHALL transfer entitlement to future direct accruals, the complete unclaimed direct balance, and any unpaid creator-plugin entitlement. Transfer SHALL NOT settle the outgoing holder, flush a pot, or invoke a plugin.
+Transferring the RevenueNFT SHALL transfer entitlement to future direct accruals, the complete unclaimed direct balance, and any unpaid creator-path entitlement. Transfer SHALL NOT settle the outgoing holder, flush a pot, or invoke a plugin.
 
 #### Scenario: New holder claims pre-transfer direct revenue
 - **WHEN** an NFT with a non-zero direct balance is transferred
@@ -69,8 +69,8 @@ Transferring the RevenueNFT SHALL transfer entitlement to future direct accruals
 - **WHEN** direct creator value accrues after transfer
 - **THEN** it is claimable by the new holder
 
-#### Scenario: New holder receives unpaid creator-plugin value
-- **WHEN** creator-plugin value remains unpaid at transfer
+#### Scenario: New holder receives unpaid creator-path value
+- **WHEN** creator-path value remains unpaid at transfer
 - **THEN** only the new holder can claim it
 
 #### Scenario: Previous holder loses all creator claim rights
@@ -79,10 +79,10 @@ Transferring the RevenueNFT SHALL transfer entitlement to future direct accruals
 
 #### Scenario: Transfer performs no settlement
 - **WHEN** the RevenueNFT is transferred
-- **THEN** no payout pot, direct balance, or creator-plugin balance is paid or flushed
+- **THEN** no payout pot, direct balance, or creator-path balance is paid or flushed
 
 ### Requirement: Protocol claimable balance
-All quote-denominated protocol revenue SHALL accrue to one global pool-agnostic ledger, including milestone service fees, quote-fee protocol shares, and graduation protocol proceeds. Only the current configurable protocol recipient SHALL be able to pull the full global balance. The protocol administrator SHALL have no claim authority unless it is also the configured recipient. Accrual events SHALL retain pool, source, amount, and active configuration version attribution. No per-pool protocol claim path SHALL exist.
+All quote-denominated protocol revenue SHALL accrue to one global pool-agnostic ledger, including milestone service fees, quote-fee protocol shares, and graduation protocol proceeds. The protocol SHALL additionally track the exact subset of that global ledger still backed by PoolManager quote claims: milestone service fees SHALL increase both totals, while raw-ETH-backed quote-fee and graduation revenue SHALL increase only the global ledger. Only the current configurable protocol recipient SHALL be able to pull the full global balance. A claim SHALL zero both totals before interaction, redeem exactly the captured claim-backed subset, and transfer the complete captured global balance; it SHALL NOT redeem claims backing payout pots or rely on ambient ETH reserved for another liability. The protocol administrator SHALL have no claim authority unless it is also the configured recipient. Accrual events SHALL retain pool, source, amount, and active configuration version attribution. No per-pool protocol claim path SHALL exist.
 
 #### Scenario: Every protocol source accrues globally
 - **WHEN** graduation, quote-fee collection, or milestone harvest creates protocol revenue
@@ -93,8 +93,16 @@ All quote-denominated protocol revenue SHALL accrue to one global pool-agnostic 
 - **THEN** one global balance contains their sum while events preserve source pools
 
 #### Scenario: Current recipient claims globally
-- **WHEN** the configured recipient claims a non-zero balance
-- **THEN** the entire global balance is transferred and reset before transfer
+- **WHEN** the configured recipient claims a non-zero balance containing raw-backed and claim-backed sources
+- **THEN** both protocol counters are reset before interaction, exactly the claim-backed subset is redeemed, and the entire global balance is transferred
+
+#### Scenario: Protocol backing classes remain explicit
+- **WHEN** milestone service fees coexist with quote-fee or graduation protocol revenue
+- **THEN** the claim-backed subset equals only the unredeemed service-fee value and never exceeds the global protocol ledger
+
+#### Scenario: Protocol claim leaves payout backing intact
+- **WHEN** the recipient claims while one or more payout pots remain claim-backed
+- **THEN** the claim redeems no pot backing and every pot remains fully covered
 
 #### Scenario: Unauthorized protocol claim is rejected
 - **WHEN** any address other than the current recipient attempts a claim
@@ -137,7 +145,7 @@ Creator and protocol claim paths SHALL transfer only their recorded ledgers. The
 
 #### Scenario: Protocol claim cannot consume creator value
 - **WHEN** the global protocol recipient claims
-- **THEN** no direct or creator-plugin entitlement is reduced
+- **THEN** no direct or creator-path entitlement is reduced
 
 ## ADDED Requirements
 

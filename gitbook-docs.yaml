@@ -1,0 +1,12 @@
+$schema: https://api.gitbook.com/gitbook-docs.yaml
+version: 1
+site:
+  title: Spawn
+  structure:
+    - type: space
+      key: space-spawn-docs
+      title: Spawn
+      path: spawn
+      default: true
+      content:
+        directory: ./docs

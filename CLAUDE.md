@@ -18,6 +18,11 @@ Three documents are normative. Read the relevant parts before changing behaviour
 - **`openspec/changes/add-payout-plugins/specs/*/spec.md`** — requirements expressed as named
   `#### Scenario:` blocks. Those names are the contract with the test suite (see Testing).
 
+`docs/` is the published-documentation space (GitBook-ready; `docs/SUMMARY.md` is the index):
+`docs/user/` for protocol users, `docs/technical/` for integrators, with
+`docs/technical/integration.md` as the frontend/data-layer handoff. Keep those pages in sync when
+changing user-visible behavior.
+
 **`openspec/changes/add-payout-plugins/tasks.md` is the current work ledger.** Mark a task `- [x]` only
 when its behavior is implemented and every scenario it names has literal passing evidence. Do not infer
 completion from an earlier generation's reports. Fork and public-testnet boxes stay open until their RPC,
@@ -31,13 +36,16 @@ permission to weaken a requirement.
 
 ```bash
 make build              # forge build
-make test               # == test-unit: forge test --no-match-path 'test/fork/**'
+make test               # == test-unit: forge test --no-match-path '{test/fork/**,test/invariant/**}'
 make test-invariant     # test/invariant/** — the handler-driven suite
 make test-fork          # needs BASE_RPC_URL; runs FOUNDRY_PROFILE=fork
 make deep               # 10k fuzz / 1k invariant runs
 make fmt / fmt-check
+make abis               # export curated ABIs to abi/ for the frontend/data-layer handoff
+                        # (docs/technical/integration.md; satellites deliberately excluded)
 make release-check      # the full gate: pins fmt-check build size size-gate-selftest
-                        #                lock-check layout-check test-unit test-invariant
+                        #   structural-gate-selftest scenario-tool-selftest lock-check layout-check
+                        #   abis test-unit test-invariant
 ```
 
 `make fmt` has been run over the whole tree, so `fmt-check` is clean and `release-check` is unblocked.
@@ -47,7 +55,7 @@ Single test:
 
 ```bash
 forge test --match-path test/unit/MilestoneHarvest.t.sol
-forge test --match-test test_crossingTheBandTopCompletesTheMilestone -vvv
+forge test --match-test test_crossingTheBandTopCompletesAndAccountsForTheMilestone -vvv
 forge test --match-contract MilestoneHarvestTest
 ```
 
@@ -268,7 +276,7 @@ Conventions to follow when adding tests:
   controller, `LaunchSupport`, lifecycle satellite, and payout satellite before mining final hook initcode;
   then bind the controller target, complete registry authority, and set the NFT minter. Fixture/bootstrap
   helpers own this ordering—do not reproduce a partial two-contract setup in individual suites.
-- `TestRouter` (`test/Fixtures.sol:32`) stands in for a third-party integrator, driving the plainest
+- `TestRouter` (`test/Fixtures.sol:36`) stands in for a third-party integrator, driving the plainest
   `unlock`/`swap`/`settle` sequence an integrator would write. `swapToLimit` is what you want for large
   buys — a plain `swap` runs the price to the extreme, because nothing provides liquidity above the far
   level until graduation. Negative `amountSpecified` is exact-input.
@@ -282,7 +290,7 @@ Conventions to follow when adding tests:
 
 - **`via_ir` common-subexpression-eliminates `block.timestamp`.** Two `vm.warp(block.timestamp + delta)`
   calls in the same test function collapse into one warp. Compute every warp from the fixture's absolute
-  `launchTime` instead. See `test/Fixtures.sol:189` and `test/unit/DevBuy.t.sol:238`.
+  `launchTime` instead. See `test/Fixtures.sol:202`.
 - **Which currency a fee lands in depends on swap direction.** A buy (`zeroForOne == true`) pays its fee
   in ETH/`currency0`; a sell pays in token/`currency1`. Collection routes those independently under one
   economics snapshot, so measure quote-ledger and token-fund/burn effects against the matching direction.
@@ -308,7 +316,7 @@ Conventions to follow when adding tests:
   callback work suppression—not a callback revert—keeps a reference buyback from recursively graduating,
   deploying, or harvesting.
 - **`using StateLibrary for IPoolManager` in `test/Fixtures.sol` is file-scoped** and does not reach an
-  inheriting suite (the fixture notes this at line 312). A suite that must read the manager directly —
+  inheriting suite (the fixture notes this at line 377). A suite that must read the manager directly —
   `getSlot0`, `getPositionLiquidity` at raw ticks — declares its own `using` directive; the fixture's own
   level-taking helpers cover everything else.
 - **Solidity string literals must be pure ASCII.** An em dash in an `assert*` message is

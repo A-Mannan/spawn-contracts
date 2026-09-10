@@ -6,6 +6,8 @@ This change builds it: a protocol-owned ladder of one-sided sell-limit bands at 
 
 ## What Changes
 
+> **Revised during planning review:** the mechanism set below evolved — the bonding curve is a fixed nested template (Doppler algorithm, JIT-minted), ladder deployment is simulation-driven, graduation auto-triggers, launch is a signed-config relay, the anti-snipe decay is removed, creator/protocol accrue ETH only, and reclaim was removed. The normative mechanism descriptions live in `design.md` (Decisions 15–22) and the specs; the bullets below are retained as the original scope statement.
+
 This is a greenfield protocol. `DESIGN.md` at the repo root is the normative design; this change implements its **v1** scope on Base.
 
 - **New Foundry project** in this repository: `foundry.toml` pinned to Solidity `0.8.26`, `evm_version = cancun` (transient storage is required), with `v4-core @ 5f00c84` and `v4-periphery @ 9628c36` installed at the pins named in `DESIGN.md §0`.

@@ -11,11 +11,19 @@ libs = ["lib"]
 solc = "0.8.26"
 evm_version = "cancun"
 
-# Low optimizer_runs biases the optimiser toward smaller bytecode, which is what
-# the 24 KB size gate on the singleton hook needs. Raise only if gas regresses
-# materially and the size gate still has headroom.
+# optimizer_runs was tuned low when the singleton hook was pressed against the 24 KB budget. Since the
+# DELEGATECALL split (design.md Decision 1 revision) that pressure is gone: measured at runs=200,
+# MilestoneHook is 12,713 B and MilestoneColdPaths 16,278 B, both with 8 KB+ to spare; runs=1000 grows
+# them to 13,773 and 17,542, still well under. 200 is retained as a size/gas midpoint, no longer forced
+# by size — it can be raised for cheaper runtime gas now that headroom exists, which is a deliberate
+# gas decision rather than a constraint.
 optimizer = true
 optimizer_runs = 200
+
+# via_ir is load-bearing, not a tuning knob: it takes MilestoneHook from 24,092 bytes (over the EIP-170
+# limit) to 19,457. design.md names the hook's size budget as the leading structural risk, and this is
+# the single largest lever against it. v4-periphery ships the same setting for the same reason.
+via_ir = true
 
 bytecode_hash = "none"
 cbor_metadata = false
@@ -37,10 +45,16 @@ depth = 64
 fail_on_revert = false
 call_override = false
 
-# Fork profile: Base mainnet, endpoint supplied from the environment so no RPC
-# URL or key is committed. Select with `forge test --profile fork`.
+# Fork profile: Base mainnet. Select it with `FOUNDRY_PROFILE=fork forge test`
+# (forge 1.3.5 has no `--profile` flag on `forge test`).
+#
+# Deliberately sets no `eth_rpc_url`: that key makes forge instantiate a fork at
+# boot for every test in the profile, and `${VAR}` is not expanded there, so it
+# reached the transport as a literal path. The endpoint stays in [rpc_endpoints]
+# below, where interpolation does work, and each fork test selects it by alias
+# with its own pinned block — see `test/fork/ForkFixtures.sol`. Endpoint still
+# comes from the environment, so no RPC URL or key is committed.
 [profile.fork]
-eth_rpc_url = "${BASE_RPC_URL}"
 
 [profile.fork.fuzz]
 runs = 64
@@ -70,3 +84,11 @@ line_length = 120
 tab_width = 4
 bracket_spacing = false
 int_types = "long"
+
+[lint]
+# erc20-unchecked-transfer: assumes a token that returns false on failure. Every token this
+#   protocol touches is either our own OZ-based MilestoneToken or an OZ ERC721 — both revert.
+#   The pool itself only ever holds native ETH and the launch token, so no foreign ERC20 is in play.
+# screaming-snake-case-immutable: v4 itself uses mixedCase immutables (see ImmutableState.poolManager);
+#   matching the ecosystem convention beats matching the linter's default.
+exclude_lints = ["erc20-unchecked-transfer", "screaming-snake-case-immutable"]

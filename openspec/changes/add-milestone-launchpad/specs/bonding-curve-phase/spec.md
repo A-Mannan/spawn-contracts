@@ -1,41 +1,46 @@
 ## Purpose
 
-Defines pre-graduation price discovery: a set of hook-owned multicurve liquidity positions minted once at launch, which buyers fill as demand arrives and which remain tradeable in both directions indefinitely.
+Defines pre-graduation price discovery: a fixed, hook-owned set of nested liquidity positions derived from the protocol template — the first minted at genesis, the rest deployed just before the price reaches them — which buyers fill as demand arrives and which remain tradeable in both directions indefinitely.
 
 ## ADDED Requirements
 
-### Requirement: Multicurve position minting at initialization
+### Requirement: The nested curve template
 
-The system SHALL mint the configured curve set as real pool liquidity when the pool is initialized. Each curve SHALL specify a lower tick, an upper tick, a position count, and a share of ladder-external bonding curve inventory, and the shares across all curves SHALL sum to one whole unit. Positions SHALL be distributed across each curve as a fan spanning from that curve's starting tick to the shared far tick.
+The bonding curve SHALL be a fixed set of nested single-sided token positions derived from the immutable protocol template: 32 positions spanning the 2× opening-to-far-level range, where position i spans from the opening level plus i·span/32 to the far level, each holding an equal share of the bonding curve supply, so liquidity staircases upward and concentrates toward the far level. The opening level SHALL be derived from the launch's total supply and the protocol's anchored opening FDV, so every launch opens at the same ETH-denominated market capitalization. Only the first position SHALL be minted at genesis; the remaining positions SHALL be minted before the price reaches them, per the simulation-driven deployment requirement.
 
-#### Scenario: Curves are minted as pool liquidity at launch
+#### Scenario: Genesis mints only the first curve position
 
-- **WHEN** a pool is initialized
-- **THEN** the configured curve positions exist as pool liquidity owned by the hook, and their combined token amount equals the bonding curve supply share
+- **WHEN** a launch completes
+- **THEN** only position 0 exists as pool liquidity, spanning from the opening level to the far level and holding its equal share of the curve supply, and the pool is tradable
 
-#### Scenario: Curve shares must sum to one whole
+#### Scenario: Later curve positions deploy as price approaches
 
-- **WHEN** a launch configuration provides curve shares that do not sum to exactly one whole unit
-- **THEN** the launch reverts
+- **WHEN** a buy's simulated path would reach an undeployed curve position's start level
+- **THEN** that position is minted before the price arrives, exactly as band deployment works after graduation
 
-#### Scenario: Every curve terminates at the shared far tick
+#### Scenario: Positions form a nested staircase
 
-- **WHEN** the curve set is minted
-- **THEN** each curve's positions span from its own starting tick to the common far tick
+- **WHEN** any set of curve positions is deployed
+- **THEN** each spans from its own start level to the shared far level holding an equal token amount, so the active liquidity is thinnest at the opening level and densest near the far level
 
-#### Scenario: Phased pricing across curves
+#### Scenario: The opening price is derived from the FDV anchor
 
-- **WHEN** a launch configures multiple curves with different starting ticks and shares
-- **THEN** the resulting inventory distribution is denser at lower prices for curves configured with earlier starting ticks, producing a rising average fill price as buying continues
+- **WHEN** a launch is configured with any total supply
+- **THEN** the pool's opening level is the level at which that supply is valued at the protocol's anchored opening FDV
 
-### Requirement: Bonding curve liquidity is static
+#### Scenario: Every launch opens at the same valuation
 
-The system SHALL NOT rebalance, re-price, expire, or otherwise modify bonding curve positions after they are minted. There SHALL be no epochs, no time decay, and no fixed duration.
+- **WHEN** two launches with different total supplies are compared
+- **THEN** both pools open at the same ETH-denominated FDV
+
+### Requirement: Bonding curve liquidity is static in shape
+
+Deployed bonding curve positions SHALL NOT be rebalanced, re-priced, expired, or otherwise modified after they are minted. There SHALL be no epochs, no time decay, and no fixed duration. The only liquidity change during the phase is the protocol's own deployment of not-yet-deployed template positions ahead of the price.
 
 #### Scenario: No rebalancing occurs over time
 
 - **WHEN** an arbitrary amount of time passes during the bonding curve phase with no trading
-- **THEN** curve positions are unchanged in ticks, liquidity, and count
+- **THEN** deployed curve positions are unchanged in ticks, liquidity, and count
 
 #### Scenario: No caller can reprice curves
 

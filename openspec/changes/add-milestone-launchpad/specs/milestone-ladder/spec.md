@@ -1,41 +1,51 @@
 ## Purpose
 
-Defines the milestone ladder: a protocol-owned series of narrow single-sided sell bands at ascending market-cap levels, deployed just in time as the price approaches each one, harvested atomically when the price crosses out the top, and routed per the launch's harvest split.
+Defines the milestone ladder: a protocol-owned series of narrow single-sided sell bands at ascending market-cap levels, deployed by simulating the incoming swap's price path before it executes, harvested atomically when the price crosses out the top, and routed per the launch's harvest split. Geometry is fixed by the protocol template; band state is tracked per index.
 
 ## ADDED Requirements
 
 ### Requirement: Deterministic band geometry
 
-Band ticks and inventory SHALL be fully derivable from the launch configuration and the graduation price, with no hidden or off-chain parameters. Bands SHALL be spaced at uniform tick offsets so that each successive band sits at a constant market-cap multiple of the previous one, and each band SHALL be a narrow range whose width is the configured fraction of the band gap.
+Band ticks and inventory SHALL be fully derivable from the protocol template and the graduation price, with no hidden or off-chain parameters. Bands SHALL be spaced at uniform level offsets so that each successive band sits at a constant market-cap multiple of the previous one, and each band SHALL be a narrow range whose width is the template fraction of the band gap. Geometry SHALL NOT be configurable per launch.
 
 #### Scenario: Band ticks are computable by any observer
 
-- **WHEN** an observer reads the launch configuration and the graduation tick
-- **THEN** every core band's lower tick, upper tick, and target inventory can be computed without additional information
+- **WHEN** an observer reads the protocol template and the graduation tick
+- **THEN** every band's lower tick, upper tick, and target inventory can be computed without additional information
 
 #### Scenario: Uniform tick spacing yields geometric market caps
 
-- **WHEN** bands are laid out from the graduation tick using the configured tick spacing
-- **THEN** the tick offset between consecutive band lower bounds is constant, and the implied market cap of each band is a constant multiple of the previous band's
+- **WHEN** bands are laid out from the graduation tick using the template tick spacing
+- **THEN** the tick offset between consecutive band lower bounds is constant (2,235 levels, a 1.25× market-cap step), and the implied market cap of each band is a constant multiple of the previous band's
 
 #### Scenario: Band width is a fraction of the gap
 
 - **WHEN** bands are laid out
-- **THEN** each band's tick width equals the configured fraction of the band gap, and no band overlaps its neighbour
+- **THEN** each band's tick width equals the template fraction of the band gap (447 levels of the 2,235-level spacing), and no band overlaps its neighbour
 
-#### Scenario: One geometry setting applies to all bands
+#### Scenario: One template applies to all launches
 
-- **WHEN** a launch is configured
-- **THEN** band count, tick spacing, band width, and ladder supply share are single values applied uniformly across all core bands, with no per-band overrides in this version
+- **WHEN** any launch is configured
+- **THEN** band count, spacing, width, and ladder supply share come from the immutable protocol template with no per-launch overrides and no per-band overrides
 
-### Requirement: Just-in-time band deployment
+### Requirement: Simulation-driven band deployment
 
-The system SHALL NOT deploy bands at graduation. A band SHALL be minted during the swap whose pre-swap tick lies inside that band's deploy window — the range immediately below the band's lower tick, sized as the configured fraction of the band gap — and only when the swap moves the price toward the band.
+The system SHALL NOT deploy bands at graduation. On a buy, the hook SHALL simulate the incoming swap's price path using the swap's own parameters and the pool's known protocol-owned liquidity profile, and SHALL deploy every undeployed band the simulated path crosses before the swap executes, so the swap fills them as real liquidity. Band deployments SHALL be capped per swap; a sell SHALL never deploy a band.
 
-#### Scenario: Band is minted on approach
+#### Scenario: A buy crossing multiple undeployed bands deploys each before filling it
 
-- **WHEN** a swap begins with the pre-swap tick inside the next band's deploy window and moves the price upward
-- **THEN** the band is minted as single-sided token liquidity before the swap executes
+- **WHEN** a buy's simulated path crosses the lower bounds of several consecutive undeployed bands
+- **THEN** each crossed band is minted as single-sided token liquidity before the price reaches it, and the swap fills them in order within the same transaction
+
+#### Scenario: A deployed band cannot be jumped without filling
+
+- **WHEN** a swap's price path passes through a deployed band's range
+- **THEN** the band's inventory is real pool liquidity in the path, and exiting the range's top necessarily consumed its inventory
+
+#### Scenario: An undeployed band straddling spot deploys before the crossing buy fills it
+
+- **WHEN** a buy's simulated path enters the range of a band that was never deployed
+- **THEN** the band is minted before the price enters its range, and the straddle deadlock — a band that can neither deploy nor skip — cannot occur
 
 #### Scenario: No bands exist immediately after graduation
 
@@ -44,32 +54,46 @@ The system SHALL NOT deploy bands at graduation. A band SHALL be minted during t
 
 #### Scenario: Downward swaps do not mint
 
-- **WHEN** a swap begins with the pre-swap tick inside a band's deploy window but moves the price downward
-- **THEN** no band is minted
-
-#### Scenario: A single sweeping swap still fills correctly
-
-- **WHEN** a swap begins inside the deploy window and is large enough to push the price above the band's upper tick in one transaction
-- **THEN** the band is minted before the swap executes, the swap fills it, and the milestone is harvested within the same transaction
+- **WHEN** a sell arrives after graduation
+- **THEN** no band is deployed
 
 #### Scenario: Bands below spot never deploy
 
-- **WHEN** the current tick is already above a band's upper tick and that band has never been deployed
+- **WHEN** the current level is already above a band's upper tick and that band has never been deployed
 - **THEN** the band is not minted, since a single-sided sell band below spot would hold no token inventory
 
-#### Scenario: At most one band is live at a time
+#### Scenario: A simulation mismatch can only under-deploy
 
-- **WHEN** any sequence of swaps and harvests has occurred after graduation
-- **THEN** at most one band position exists at any moment, and it is the lowest band level that is neither complete nor skipped
+- **WHEN** simulated execution differs from real execution at a band boundary
+- **THEN** the only possible divergence is a band that was not deployed; inventory degrades to the skip-and-carry behaviour, and no inventory is ever sold that the simulation did not place
 
-### Requirement: Jumped bands are skipped benignly
+### Requirement: Band state is tracked per index
 
-If the price moves past a band without that band having been deployed, the system SHALL leave that band's inventory in hook custody and re-target it at the next band in line. The system SHALL NOT revert, lock the ladder, or lose the inventory.
+Band deployment and completion SHALL be recorded per band index in per-pool bitmaps, so that multiple bands may be live simultaneously and every band's lifecycle is independently observable. A completed band SHALL never redeploy, and deployment order SHALL remain strictly ascending.
 
-#### Scenario: Inventory survives a jumped band
+#### Scenario: Multiple bands may be live simultaneously
 
-- **WHEN** a swap moves the pre-swap tick from below a band's deploy window to above the band's upper tick without triggering a mint
-- **THEN** the swap succeeds, the band is treated as skipped, and its inventory remains in hook custody
+- **WHEN** swaps deploy several consecutive bands without completing them all
+- **THEN** each live band's deployed state is tracked independently by its index
+
+#### Scenario: Completed bands never redeploy
+
+- **WHEN** the price later approaches a completed band's level from below
+- **THEN** no position is minted for that level; the band stays complete
+
+#### Scenario: Deployment order is strictly ascending
+
+- **WHEN** any sequence of deployments has occurred
+- **THEN** no band below an already-deployed or completed index is deployed
+
+### Requirement: Band deployments are capped per swap; overflow skips benignly
+
+Band deployments within one swap SHALL be capped at a protocol maximum per swap. If a buy's simulated path crosses more undeployed bands than the cap, the excess bands SHALL be treated as skipped: the swap succeeds, their inventory remains in hook custody, and it re-targets the bands that deploy later. The system SHALL NOT revert, lock the ladder, or lose the inventory.
+
+#### Scenario: Inventory survives a capped-out swap
+
+- **WHEN** a single buy's simulated path crosses more undeployed bands than the per-swap deployment cap
+- **THEN** the swap succeeds, the uncrossed-at-execution bands are treated as skipped, and their inventory remains in hook custody
 
 #### Scenario: Skipped inventory re-targets the next band
 
@@ -100,10 +124,15 @@ The system SHALL detect milestone completion within the same transaction as the 
 - **WHEN** a band that accrued swap fees while in range is harvested
 - **THEN** those fees are collected with the band's balance and are included in the routed amount
 
-#### Scenario: A swap sweeping past several band levels settles the deployed one
+#### Scenario: A sweeping swap harvests every band it completes within the cap
 
-- **WHEN** a single swap ends above the upper ticks of several consecutive band levels, one of which was deployed
-- **THEN** the deployed band is completed and routed within that transaction, and the levels that were never deployed are treated as skipped
+- **WHEN** a single swap ends above the upper ticks of several consecutive deployed bands, no more than the per-swap harvest cap
+- **THEN** every such band is completed and routed within that transaction, in ascending order
+
+#### Scenario: Harvests beyond the per-swap cap settle on the next swap
+
+- **WHEN** a single swap ends above the upper ticks of more deployed bands than the per-swap harvest cap
+- **THEN** the lowest bands are harvested up to the cap, the remainder remain live and complete, and the next swap that ends above them routes them
 
 #### Scenario: A completed band cannot be harvested again
 
@@ -123,6 +152,11 @@ Harvest proceeds SHALL be split per the launch's global harvest configuration in
 
 - **WHEN** a milestone is harvested
 - **THEN** the creator share is credited to the creator's claimable balance, the protocol share to the protocol's claimable balance, the buyback share is spent buying and burning the token, and the LP share is added to the full-range position
+
+#### Scenario: Harvest proceeds are quote only
+
+- **WHEN** a band is harvested
+- **THEN** the routed proceeds are entirely ETH: the band's token inventory converted by the fills, plus the fees it accrued while in range; any token residue the position releases on burn returns to carried inventory, never to a recipient
 
 #### Scenario: Routed amounts sum to the harvest
 
@@ -213,7 +247,7 @@ Once the configured core bands are exhausted, the system SHALL continue creating
 #### Scenario: A new band is created beyond the core ladder
 
 - **WHEN** all core bands are complete or skipped and sufficient milestone-fund inventory has accrued
-- **THEN** a new band is created one tick-spacing step above the last band and behaves like a core band for deployment, harvest, routing, and reclaim
+- **THEN** a new band is created one tick-spacing step above the last band and behaves like a core band for deployment, harvest, and routing
 
 #### Scenario: Extension stops at the cap
 
@@ -224,35 +258,6 @@ Once the configured core bands are exhausted, the system SHALL continue creating
 
 - **WHEN** the core ladder is exhausted and no milestone-fund inventory has accrued
 - **THEN** no new band is created and the ladder is simply inactive until accrual resumes
-
-### Requirement: Permissionless reclaim of stale bands
-
-A deployed band that has remained incomplete for the configured reclaim period SHALL be reclaimable by any address: the position is burned and its inventory returns to hook custody, re-targeted at the next band in line. The default reclaim period SHALL be 30 days. Reclaim SHALL NOT burn, reprice, or redirect the inventory in this version.
-
-#### Scenario: Any address can reclaim after the period
-
-- **WHEN** an arbitrary address triggers reclaim on a band that has been deployed and incomplete for longer than the reclaim period
-- **THEN** the band position is burned and its inventory returns to hook custody
-
-#### Scenario: Reclaim before the period is rejected
-
-- **WHEN** reclaim is triggered on a band deployed more recently than the reclaim period
-- **THEN** the call reverts and the band remains deployed
-
-#### Scenario: Reclaim is rejected for completed bands
-
-- **WHEN** reclaim is triggered on a band already marked complete
-- **THEN** the call reverts
-
-#### Scenario: Reclaimed inventory re-targets the next band
-
-- **WHEN** the next band in line is subsequently deployed after a reclaim
-- **THEN** the reclaimed inventory is available to that deployment
-
-#### Scenario: Reclaimed band can be redeployed later
-
-- **WHEN** the price later approaches a previously reclaimed band's deploy window from below and that band is still the next in line
-- **THEN** the band may be deployed again with available inventory
 
 ### Requirement: Bands are hook-owned and externally immutable
 

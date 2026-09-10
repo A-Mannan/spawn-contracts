@@ -1,12 +1,12 @@
 ## Purpose
 
-Defines how accrued value leaves the protocol: a transferable NFT that represents a launch's creator revenue stream, and the pull-based claim paths through which the NFT holder and the protocol withdraw what they have accrued.
+Defines how accrued value leaves the protocol: a transferable NFT that represents a launch's creator revenue stream, and the pull-based claim paths through which the NFT holder and the protocol withdraw what they have accrued. Creator and protocol accruals are denominated exclusively in the pool's quote currency (ETH); token-denominated fees are routed to pool-facing destinations and never accrue to a claimant.
 
 ## ADDED Requirements
 
 ### Requirement: Transferable creator revenue NFT
 
-Each launch SHALL mint exactly one non-fungible token representing the creator's revenue stream, identified by the launch's pool, issued to the launch creator, and freely transferable under the ERC721 standard.
+Each launch SHALL mint exactly one non-fungible token representing the creator's revenue stream, identified by the launch's pool, issued to the launch creator — the recovered signer of a relayed launch configuration, or the sender of a creator-direct launch — and freely transferable under the ERC721 standard.
 
 #### Scenario: NFT is minted to the creator at launch
 
@@ -30,7 +30,7 @@ Each launch SHALL mint exactly one non-fungible token representing the creator's
 
 ### Requirement: Creator accruals are credited to the NFT
 
-The creator's share of milestone harvests, swap fees, and bonding curve proceeds SHALL be credited to a claimable balance associated with the revenue NFT rather than transferred at accrual time.
+The creator's share of milestone harvests, swap fees, and bonding curve proceeds SHALL be credited to a claimable balance associated with the revenue NFT rather than transferred at accrual time. All creator accruals SHALL be denominated in the pool's quote currency (ETH); no token-denominated value SHALL ever be credited to a claimant.
 
 #### Scenario: Harvest creator share accrues
 
@@ -39,8 +39,13 @@ The creator's share of milestone harvests, swap fees, and bonding curve proceeds
 
 #### Scenario: Fee creator share accrues
 
-- **WHEN** swap fees are collected
+- **WHEN** quote-denominated swap fees are collected
 - **THEN** the creator share is added to the NFT's claimable balance
+
+#### Scenario: Token-denominated fees never accrue to a claimant
+
+- **WHEN** token-denominated swap fees are collected on any pool
+- **THEN** neither the creator's nor the protocol's claimable balance changes
 
 #### Scenario: Bonding curve proceeds creator share accrues
 
@@ -102,7 +107,7 @@ Transferring the revenue NFT SHALL transfer entitlement to both future accruals 
 
 ### Requirement: Protocol claimable balance
 
-The protocol's share of milestone harvests, swap fees, and bonding curve proceeds SHALL be credited to a protocol claimable balance and withdrawable only by the protocol's designated recipient, on a pull basis, per pool.
+The protocol's share of milestone harvests, swap fees, and bonding curve proceeds SHALL be credited to a protocol claimable balance — quote-denominated exclusively — and withdrawable only by the protocol's designated recipient, on a pull basis, per pool.
 
 #### Scenario: Protocol shares accrue from every source
 

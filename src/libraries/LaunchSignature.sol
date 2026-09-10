@@ -35,7 +35,7 @@ library LaunchSignature {
     bytes32 private constant _EIP712_DOMAIN_TYPEHASH =
         keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
 
-    bytes32 private constant _DOMAIN_NAME_HASH = keccak256("MilestoneLaunchpad");
+    bytes32 private constant _DOMAIN_NAME_HASH = keccak256("SpawnLaunchpad");
     bytes32 private constant _DOMAIN_VERSION_HASH = keccak256("1");
 
     bytes32 private constant _LAUNCH_CONFIG_TYPEHASH = keccak256(

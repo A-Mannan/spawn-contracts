@@ -28,7 +28,7 @@ contract RevenueNFT is ERC721 {
     error AlreadyMinted(uint256 tokenId);
     error ZeroRecipient();
 
-    constructor() ERC721("Milestone Launchpad Revenue", "MLREV") {
+    constructor() ERC721("Spawn Launchpad Revenue", "SPNREV") {
         deployer = msg.sender;
     }
 

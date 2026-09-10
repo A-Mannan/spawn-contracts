@@ -402,7 +402,7 @@ contract LaunchSignatureTest is LaunchpadTest {
         bytes32 expected = keccak256(
             abi.encode(
                 keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
-                keccak256("MilestoneLaunchpad"),
+                keccak256("SpawnLaunchpad"),
                 keccak256("1"),
                 block.chainid,
                 HOOK_ADDR

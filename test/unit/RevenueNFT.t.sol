@@ -221,8 +221,8 @@ contract RevenueNFTTest is Test {
     // --- Metadata / standard conformance ---
 
     function test_metadataAndInterfaces() public view {
-        assertEq(nft.name(), "Milestone Launchpad Revenue", "name");
-        assertEq(nft.symbol(), "MLREV", "symbol");
+        assertEq(nft.name(), "Spawn Launchpad Revenue", "name");
+        assertEq(nft.symbol(), "SPNREV", "symbol");
         assertTrue(nft.supportsInterface(0x80ac58cd), "ERC721");
         assertTrue(nft.supportsInterface(0x5b5e139f), "ERC721Metadata");
         assertTrue(nft.supportsInterface(0x01ffc9a7), "ERC165");

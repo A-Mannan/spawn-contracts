@@ -320,8 +320,6 @@ contract DeploymentTest is Test {
         assertEq(address(deployed.buyback.poolManager()), address(manager), "buyback manager");
         assertEq(deployed.buyback.hook(), address(deployed.hook), "buyback hook");
         assertEq(deployed.buyback.sqrtPriceLimitX96(), TickMath.MIN_SQRT_PRICE + 1, "buyback limit");
-        assertEq(address(deployed.helper.poolManager()), address(manager), "helper manager");
-        assertEq(address(deployed.helper.hook()), address(deployed.hook), "helper hook");
     }
 
     // --- The dry run completes: a real launch through the freshly wired protocol ---

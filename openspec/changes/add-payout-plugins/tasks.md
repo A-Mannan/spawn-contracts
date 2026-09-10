@@ -67,12 +67,12 @@
 - [x] 9.2 Add malicious plugins that attempt cross-pool/global drains, recursive callbacks, and post-call guard poisoning; verify tests cover “Unrelated value is unreachable” and “Guard clears after the transaction”.
 - [ ] 9.3 Ensure pot/carry effects precede interactions, plugins receive no approvals, and all external payout methods preserve aggregate solvency; verify invariant and unit tests exercise reverting receivers, self-destruct/codehash changes, recursive hooks, and gas griefing.
 
-## 10. Reference buyback and helper composition
+## 10. Reference buyback plugin
 
 - [x] 10.1 Implement hook-authenticated `BuybackAndBurnPlugin` bound to the source pool, spending only delivered ETH through its own bounded cold PoolManager swap and burning every token received; verify `BuybackPlugin.t.sol` covers “Buyback spends only delivered ETH” and “Buyback burns acquired tokens”.
 - [x] 10.2 Make failed bounded buy/burn atomic so the hook records the entire attempted value as carry, and make zero delivery a no-op; verify tests cover “Failed buyback carries the entire share” and “Zero delivery performs no swap”.
-- [x] 10.3 Implement `SwapAndFlushHelper` as a non-selectable utility that settles the user swap completely before a separate flush, cannot alter route or payout parameters, and forwards output/refunds/tip; verify `SwapAndFlushHelper.t.sol` covers “Opted-in caller swaps then flushes”, “Helper uses a separate flush unlock”, “Helper cannot alter routing”, and “Helper forwards the tip”.
-- [x] 10.4 Preserve a settled swap when any later plugin delivery fails by recording carry instead of reverting helper execution; verify “Plugin failure does not undo the settled swap”.
+- [x] 10.3 No protocol-authored swap-and-flush composition. The helper is removed from scope before release (design Decision 10, revised): flush stands alone with its 1% tip paid to the immediate caller, `claimCreatorPath` remains the only same-transaction creator composition, and integrators use audited public infrastructure or their own keeper contract. Repository search shows no `SwapAndFlushHelper` surface remains in production, scripts, ABIs, or docs.
+- [x] 10.4 Plugin failure carries the entire attempted share inside a standalone flush; `PayoutFailureIsolation.t.sol` and `PayoutReentrancy.t.sol` cover carry isolation, retry, and conservation without any helper composition.
 - [x] 10.5 Bootstrap the canonical plan with only the buyback plugin at `floor(2 * WAD / 9)` and creator remainder; verify tests cover “Canonical bits select intended destinations”, “Canonical economics match their declared baseline”, “Preset naming cannot change identity”, and “Preset bit changes alter identity”.
 
 ## 11. Swap-fee collection and token routing
@@ -99,7 +99,7 @@
 ## 14. Unit-suite migration and scenario completeness
 
 - [x] 14.1 Rewrite affected existing unit suites (`Launch`, `LaunchSignature`, `LaunchConfigLib`, `DevBuy`, `MilestoneHarvest`, `MilestoneMultiHarvest`, `Settlement`, `SwapFees`, `MilestoneFund`, `Claims`, `Graduation`, `ProtocolTemplate`, permissions, smoke, curve retirement, band ownership, ladder cap, and transient lock) to remove vesting, dynamic-fee, old harvest-split, LP-compounding, and per-pool protocol assumptions; verify no obsolete scenario header remains.
-- [x] 14.2 Add focused suites `PayoutPluginRegistry.t.sol`, `PayoutPlans.t.sol`, `EconomicGovernance.t.sol`, `PayoutPots.t.sol`, `PayoutFlush.t.sol`, `PayoutFailureIsolation.t.sol`, `PayoutReentrancy.t.sol`, `CreatorPathPayout.t.sol`, `BuybackPlugin.t.sol`, and `SwapAndFlushHelper.t.sol`; verify every payout-plugin scenario name appears literally in a `// --- Scenario: ... ---` header and a passing test.
+- [x] 14.2 Add focused suites `PayoutPluginRegistry.t.sol`, `PayoutPlans.t.sol`, `EconomicGovernance.t.sol`, `PayoutPots.t.sol`, `PayoutFlush.t.sol`, `PayoutFailureIsolation.t.sol`, `PayoutReentrancy.t.sol`, `CreatorPathPayout.t.sol`, and `BuybackPlugin.t.sol`; verify every payout-plugin scenario name appears literally in a `// --- Scenario: ... ---` header and a passing test.
 - [ ] 14.3 Preserve literal scenario-header traceability for all modified capability specs, including “Geometry is not configurable” and “Harvest percentages are not configurable”; generate a scenario-to-test report and fail the completion check for any missing, duplicate-only, renamed, or non-passing scenario.
 - [ ] 14.4 Run each affected unit contract individually during migration, then run the full unit layer with `make test`; fix all failures and record the final unit count in the change report.
 
@@ -107,12 +107,12 @@
 
 - [ ] 15.1 Extend `LaunchpadHandler` with bounded actions for multi-pool launch, harvest, flush, carry retry, suspension/reactivation, economic update, fee collection, NFT transfer, creator claims, and global protocol claim while tracking ghost gross/tip/delivery/liability totals.
 - [ ] 15.2 Add invariants proving raw ETH plus claims backs aggregate liabilities, pot/carry isolation, gross-harvest and flush conservation, no double tip/delivery, creator remainder/dust ownership, stable plan interpretation, static trading fee, locked full-range liquidity, and token supply conservation; verify `make test-invariant` passes.
-- [ ] 15.3 Update Base fork fixtures and fork suites for deployed singleton behavior with static fees, claim-backed harvest pots, dedicated redemption, multi-plugin failure isolation, token burn, global claims, helper composition, and no compounding; verify `make test-fork` passes with `BASE_RPC_URL`.
+- [ ] 15.3 Update Base fork fixtures and fork suites for deployed singleton behavior with static fees, claim-backed harvest pots, dedicated redemption, multi-plugin failure isolation, token burn, global claims, and no compounding; verify `make test-fork` passes with `BASE_RPC_URL`.
 - [ ] 15.4 Add fork adversarial cases for large sweeping swaps, nested plugin PoolManager interactions, bounded gas failure, codehash mismatch, cross-pool isolation, and collection-time economics; verify the pinned Base block produces the same accounting and callback suppression as unit tests.
 
 ## 16. Deployment, tooling, and documentation
 
-- [ ] 16.1 Update deployment scripts to deploy/configure the controller, registry, canonical buyback plugin, helper, launch support, cold paths, and payout paths; register canonical entries deterministically through the bound controller, verify all authorities, immutable terms, economic defaults/caps, codehashes, and template hashes, and complete the exact-pending multisig handoff only after deployment.
+- [ ] 16.1 Update deployment scripts to deploy/configure the controller, registry, canonical buyback plugin, launch support, cold paths, and payout paths; register canonical entries deterministically through the bound controller, verify all authorities, immutable terms, economic defaults/caps, codehashes, and template hashes, and complete the exact-pending multisig handoff only after deployment.
 - [ ] 16.2 Extend hook-address mining inputs for every finalized immutable satellite/support/registry/controller address, mine an address with exactly the six required callback flags, and deploy only after all addresses are final; verify the deployment smoke test rejects stale salts and mismatched satellites.
 - [x] 16.3 Update `tools/check_storage_layout.py`, delegated-entry guard checks, size gates, and lock checks for the payout satellite and no-positive-full-range rule; verify `make layout-check`, `make size`, `make size-gate-selftest`, and `make lock-check` all pass independently.
 - [x] 16.4 Update `Makefile` and CI so new unit/invariant/fork suites and all custom gates execute in their correct layers without requiring RPC credentials for local unit runs; verify the CI command matrix locally where credentials permit.

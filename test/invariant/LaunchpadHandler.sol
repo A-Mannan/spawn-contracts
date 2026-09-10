@@ -158,6 +158,14 @@ contract LaunchpadHandler is CommonBase, StdUtils {
         _refreshMonotonic();
     }
 
+    /// @dev The handler is the `msg.sender` of its own `flush` calls, so it is the ordinary flusher the
+    /// 1% tip is paid to. Without this, every tip-bearing flush reverts `EthTransferFailed` -- which is
+    /// the specified atomic behaviour for a rejecting flusher -- and the campaign would never observe a
+    /// successful flush, starving the delivery, carry, and conservation invariants of the very actions
+    /// they exist to check. Accepting the tip keeps the handler inside the tracked `ethAccounts` set of
+    /// {LaunchpadInvariantsTest}, so ETH conservation still balances.
+    receive() external payable {}
+
     function buy(uint256 poolSeed, uint256 ethSeed, uint256 levelSeed) external {
         uint256 i = _poolIndex(poolSeed);
         uint256 ethIn = bound(ethSeed, 0.001 ether, 2_000 ether);

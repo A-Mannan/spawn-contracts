@@ -5,12 +5,7 @@ import {PoolId} from "v4-core/src/types/PoolId.sol";
 import {MilestoneBase} from "../../src/MilestoneBase.sol";
 import {PoolState} from "../../src/types/LaunchTypes.sol";
 import {PayoutTestFixture} from "../mocks/PayoutTestHook.sol";
-import {
-    IPayoutFlusher,
-    RecordingPayoutPlugin,
-    RejectingPayoutCaller,
-    SwitchablePayoutPlugin
-} from "../mocks/PayoutReferenceMocks.sol";
+import {RecordingPayoutPlugin, RejectingPayoutCaller, SwitchablePayoutPlugin} from "../mocks/PayoutReferenceMocks.sol";
 
 contract PayoutFlushTest is PayoutTestFixture {
     event PayoutPotRedeemed(PoolId indexed poolId, uint256 amount);
@@ -152,7 +147,7 @@ contract PayoutFlushTest is PayoutTestFixture {
         _fundPot(id, 0, 100 ether);
         RejectingPayoutCaller caller = new RejectingPayoutCaller();
         vm.expectRevert(abi.encodeWithSelector(MilestoneBase.EthTransferFailed.selector, address(caller), 0.9 ether));
-        caller.flush(IPayoutFlusher(address(hook)), id);
+        caller.flush(address(hook), id);
         assertEq(hook.payoutPot(id), 90 ether);
         assertEq(plugin.calls(), 0);
         assertEq(hook.creatorPathClaimable(id), 0);

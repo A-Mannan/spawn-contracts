@@ -1,4 +1,4 @@
-# Milestone Launchpad — Payout Plugin Design
+# Spawn Launchpad — Payout Plugin Design
 
 A singleton Uniswap v4 hook launchpad for Base. Its differentiator is a protocol-owned ladder of
 one-sided token sell bands at ascending valuation levels. Crossing a band's top retires real liquidity
@@ -253,7 +253,7 @@ increase. Administrator transfer is propose/accept. Administrator and protocol r
 independent.
 
 Deployment has a constructor cycle because the final mined hook address depends on immutable controller,
-registry, helper, and both satellite addresses. Bootstrap therefore creates the registry, controller,
+registry, and both satellite addresses. Bootstrap therefore creates the registry, controller,
 `RevenueNFT`, `LaunchSupport`, and both satellites with final matching dependencies, then mines and deploys
 the hook. It binds the controller's one-shot target, hands registry authority to the controller, registers
 the canonical buyback through a zero-delay typed operation, verifies immutable parity, registry
@@ -276,8 +276,9 @@ plugin any routing or storage authority. Transient storage guarantees no guard s
 
 `BuybackAndBurnPlugin` is authenticated to one hook and PoolManager. It spends exactly `msg.value` against
 the source pool, enforces immutable execution bounds, and burns all received launch tokens. Failure
-becomes hook carry. `SwapAndFlushHelper` is a non-selectable utility: it completes an ordinary router
-unlock and settlement first, invokes the independent flush, and returns output/refunds/tip to its caller.
+becomes hook carry. There is no protocol-authored swap-and-flush composition: `flush` is a standalone
+permissionless call whose 1% tip goes to the immediate caller, and `claimCreatorPath` is the only
+same-transaction creator composition, flushing first and retaining its own tip for the holder.
 
 ## 12. Security and failure model
 

@@ -8,9 +8,9 @@ import {Currency} from "v4-core/src/types/Currency.sol";
 import {PoolId} from "v4-core/src/types/PoolId.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {IPayoutPlugin} from "../../src/interfaces/IPayoutPlugin.sol";
-import {IPayoutFlusher, IPayoutPoolLookup} from "../../src/interfaces/IPayoutPlugin.sol";
+import {IPayoutPoolLookup} from "../../src/interfaces/IPayoutPlugin.sol";
 
-contract MockPayoutHook is IPayoutPoolLookup, IPayoutFlusher {
+contract MockPayoutHook is IPayoutPoolLookup {
     PoolId internal sourcePoolId;
     PoolKey internal sourceKey;
     address internal sourceToken;
@@ -359,9 +359,13 @@ contract CallbackSwapPayoutPlugin is RecordingPayoutPlugin {
     }
 }
 
+interface IFlushTarget {
+    function flush(PoolId poolId) external;
+}
+
 contract RejectingPayoutCaller {
-    function flush(IPayoutFlusher target, PoolId poolId) external {
-        target.flush(poolId);
+    function flush(address target, PoolId poolId) external {
+        IFlushTarget(target).flush(poolId);
     }
 
     receive() external payable {

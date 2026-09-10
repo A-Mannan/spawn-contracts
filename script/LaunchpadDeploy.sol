@@ -15,8 +15,6 @@ import {MilestonePayoutPaths} from "../src/MilestonePayoutPaths.sol";
 import {PayoutPluginRegistry} from "../src/PayoutPluginRegistry.sol";
 import {ProtocolController} from "../src/ProtocolController.sol";
 import {RevenueNFT} from "../src/RevenueNFT.sol";
-import {SwapAndFlushHelper} from "../src/SwapAndFlushHelper.sol";
-import {IPayoutFlusher} from "../src/interfaces/IPayoutPlugin.sol";
 import {Bounds, ProtocolTemplate} from "../src/types/LaunchTypes.sol";
 import {EconomicConfig, PAYOUT_WAD, PluginEntry, PluginRole} from "../src/types/PayoutTypes.sol";
 
@@ -30,7 +28,6 @@ struct Deployment {
     MilestonePayoutPaths payoutPaths;
     MilestoneHook hook;
     BuybackAndBurnPlugin buyback;
-    SwapAndFlushHelper helper;
     uint8 buybackIndex;
     uint256 canonicalPayoutPlan;
     bytes32 hookSalt;
@@ -267,7 +264,6 @@ library LaunchpadDeploy {
 
     function _deployCanonicalComponents(Deployment memory d, DeployParams memory p) private {
         d.buyback = new BuybackAndBurnPlugin(p.poolManager, address(d.hook), TickMath.MIN_SQRT_PRICE + 1);
-        d.helper = new SwapAndFlushHelper(p.poolManager, IPayoutFlusher(address(d.hook)));
     }
 
     /// @dev Bind the controller before handing it registry authority, then register the canonical entry
@@ -405,8 +401,6 @@ library LaunchpadDeploy {
         require(address(d.buyback.poolManager()) == address(p.poolManager), "verify: buyback pool manager");
         require(d.buyback.hook() == address(d.hook), "verify: buyback hook");
         require(d.buyback.sqrtPriceLimitX96() == TickMath.MIN_SQRT_PRICE + 1, "verify: buyback limit");
-        require(address(d.helper.poolManager()) == address(p.poolManager), "verify: helper pool manager");
-        require(address(d.helper.hook()) == address(d.hook), "verify: helper hook");
     }
 
     /// @dev The two `CREATE2` issuers {HookMiner} distinguishes. Mining is done against

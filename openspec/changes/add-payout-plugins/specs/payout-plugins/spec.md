@@ -311,29 +311,6 @@ The protocol-authored buyback plugin SHALL accept only hook-authenticated payout
 - **WHEN** the plugin has neither a current share nor carry
 - **THEN** it is not invoked
 
-### Requirement: Opt-in same-transaction swap-and-flush helper
-A protocol-authored utility helper SHALL allow a caller to opt into performing a swap and then a cold flush in one transaction. The swap SHALL fully settle before the separate flush unlock begins. The helper SHALL not be a selectable payout destination, SHALL not choose or alter payout destinations, and SHALL forward the flush tip and swap outputs or refunds to the initiating caller. Ordinary routers SHALL remain unchanged.
-
-#### Scenario: Opted-in caller swaps then flushes
-- **WHEN** a caller uses the helper
-- **THEN** the swap settles before the helper invokes a flush for that pool
-
-#### Scenario: Helper uses a separate flush unlock
-- **WHEN** the helper composes both operations
-- **THEN** pot redemption occurs in an unlock distinct from swap settlement
-
-#### Scenario: Helper cannot alter routing
-- **WHEN** the helper flushes a pool
-- **THEN** the pool's immutable plan alone determines payout destinations
-
-#### Scenario: Helper forwards the tip
-- **WHEN** the helper is the immediate flush caller
-- **THEN** it forwards the received tip to the initiating external caller
-
-#### Scenario: Plugin failure does not undo the settled swap
-- **WHEN** a payout plugin fails during the helper's flush
-- **THEN** the plugin share carries and the completed swap remains successful
-
 ### Requirement: Canonical default plan and off-chain presets
 The deployment SHALL publish one canonical default bitset that enables the registered buyback plugin with a fixed take of 2/9 of the post-tip distributable amount. The creator SHALL remain the implicit mandatory sink and receive the exact remainder, nominally 7/9 plus fixed-point dust. With the default 10% service fee, this preserves the former 2:1 buyback-to-LP plugin allocation by redirecting the removed LP destination into the creator remainder. Named presets SHALL remain off-chain aliases only; signatures, CREATE2 identity, and storage SHALL bind the bitset rather than a preset name.
 

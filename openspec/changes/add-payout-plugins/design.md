@@ -152,15 +152,15 @@ The existing `claimCreator(poolId)` remains a separate NFT-gated path for gradua
 
 **Alternatives considered:** External creator-sink plugin holding funds (duplicates NFT authorization and custody); push to current owner on every flush (recipient can block settlement); merge creator ledgers (direct claims would implicitly depend on flush semantics).
 
-### 10. Move buyback into an authenticated external plugin and keep helper composition outside routing
+### 10. Move buyback into an authenticated external plugin
 
 **Decision:** `BuybackAndBurnPlugin` is registered as a selectable payout role with immutable hook and PoolManager authentication. It accepts only hook calls, uses exactly `msg.value` in its own cold unlock to buy the launch token from the supplied source pool, requires atomic completion within immutable price/execution bounds, and burns every token received. Failure reverts the plugin call, causing the hook to retain the full attempted amount as carry.
 
-`SwapAndFlushHelper` is a utility, never a payout entry. It completes the ordinary router unlock and settlement first, then calls the hook's separate flush entry. It forwards swap output, refunds, and the tip it receives to its initiating caller. A plugin failure is represented by a successful flush with carry, so it does not revert the already settled swap.
+No protocol-authored swap-and-flush composition exists. Flush is a standalone permissionless call whose 1% tip is paid to the immediate caller; the only same-transaction creator composition is `claimCreatorPath`, which flushes internally and retains its own tip for the holder. Integrators who want batched or composed settlement use public audited infrastructure or their own thin keeper contract.
 
-**Why:** Buyback no longer belongs in `afterSwap`; isolating it as a selected plugin removes nested untrusted work from every trader's path. The helper supplies explicit one-transaction UX without changing ordinary routers or letting a helper choose destinations.
+**Why:** Buyback no longer belongs in `afterSwap`; isolating it as a selected plugin removes nested untrusted work from every trader's path. A dedicated swap-and-flush helper was considered and dropped before release: its only irreplaceable value was tip race avoidance for the triggering trader, it duplicated settlement machinery that audited routers already own, and every state-changing claim path already pays its named recipient directly, so no protocol surface is required for beneficiary composition.
 
-**Alternatives considered:** Keep inline buyback (plugin failure blocks swaps); let the helper execute plugins itself (duplicates accounting and routing authority); register the helper with zero take (a plan bit would falsely imply payout semantics).
+**Alternatives considered:** Keep inline buyback (plugin failure blocks swaps); a protocol swap-and-flush helper (thin MEV-hygiene wrapper duplicating router settlement; removed — see above); routing tips through an arbitrary recipient parameter (spec churn with no demonstrated integrator demand; re-evaluate if public bundler demand emerges).
 
 ### 11. Use typed operation hashes and capture readiness at schedule time
 
@@ -186,9 +186,9 @@ Fee collection retains zero-delta `modifyLiquidity` but routes quote to direct c
 
 **Decision:** Preserve the three-layer strategy but replace obsolete scenario mappings.
 
-- Unit suites cover registry immutability, plan validation and identity, typed governance, global economics, pot funding, exact flush math, suspension/codehash redirects, CALL-bit success with ignored returndata, carry retry, EIP-150 preflight and gas exhaustion, ordinary-tip atomic failure, same/cross-pool reentry, creator-path NFT semantics and post-plugin ownership recheck, buyback, helper composition, static fees, immediate dev buy, aggregate liability/custody invariants, capacity-clamped token burning, global protocol claiming, and fixed locked liquidity.
+- Unit suites cover registry immutability, plan validation and identity, typed governance, global economics, pot funding, exact flush math, suspension/codehash redirects, CALL-bit success with ignored returndata, carry retry, EIP-150 preflight and gas exhaustion, ordinary-tip atomic failure, same/cross-pool reentry, creator-path NFT semantics and post-plugin ownership recheck, buyback, static fees, immediate dev buy, aggregate liability/custody invariants, capacity-clamped token burning, global protocol claiming, and fixed locked liquidity.
 - Invariants drive multiple pools and alternate ordinary swaps, fee collection, flush/carry retry, direct and plugin creator claims, global protocol claims, NFT transfer, governance, and suspension. Ghost accounting proves global and per-pool solvency, new-pot-plus-carry conservation, no double tip/delivery, registry/plan immutability, token-fee fund-plus-burn conservation, static fees, and unchanged locked liquidity.
-- Base-fork tests validate real PoolManager claim redemption, separate unlocks, both currency orientations, buyback execution, callback suppression, failure carry, global claims, and swap-and-flush ordering.
+- Base-fork tests validate real PoolManager claim redemption, separate unlocks, both currency orientations, buyback execution, callback suppression, failure carry, and global claims.
 
 Every scenario section comment continues to mirror its delta-spec scenario literally. Fixture and harness test-only unlock actions remain at 200 or above. `make size`, layout, cold-path guard, lock, pin, unit, invariant, fork, and release gates remain mandatory.
 
@@ -222,7 +222,7 @@ There is no deployed production state to migrate. Implementation replaces the pr
 2. Implement and unit-test `ProtocolController` and `PayoutPluginRegistry`, including typed operation identity, two-step administrator transfer, stable entries, code identity, and reversible suspension.
 3. Refactor the hot harvest and lifecycle fee/graduation paths, then run layout, lock, build, and size gates before adding plugin delivery.
 4. Implement `MilestonePayoutPaths`, dedicated pot redemption, exact aggregate liability accounting, global transient delivery guard, carry, creator-path claiming, ownership rechecks, and callback suppression; extend all delegatecall guard/layout checks.
-5. Implement the authenticated buyback-and-burn plugin and non-selectable swap-and-flush helper; add adversarial mocks and focused unit/invariant coverage.
+5. Implement the authenticated buyback-and-burn plugin; add adversarial mocks and focused unit/invariant coverage.
 6. Deploy controller and registry under a bootstrap administrator with initial zero delay. The final
    intended multisig is proposed after deterministic setup and accepts directly on the controller.
 7. Deploy `RevenueNFT`, `LaunchSupport`, lifecycle satellite, and payout satellite with final immutable

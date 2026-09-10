@@ -8,6 +8,7 @@ import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 
 import {Deployment, DeployParams, LaunchpadDeploy} from "./LaunchpadDeploy.sol";
 import {Bounds, ProtocolTemplate} from "../src/types/LaunchTypes.sol";
+import {EconomicConfig} from "../src/types/PayoutTypes.sol";
 
 /// @title Deploy
 /// @notice The design's Migration Plan end to end: revenue NFT and launch helper, the satellite, the
@@ -27,6 +28,11 @@ import {Bounds, ProtocolTemplate} from "../src/types/LaunchTypes.sol";
 /// printed — which is why mining happens inside {LaunchpadDeploy.deployAll} and not here. The configured
 /// protocol multisig completes the final two-step handoff by calling `ProtocolController.acceptAdministrator`
 /// directly; routing that call through this script contract would change `msg.sender` and fail acceptance.
+///
+/// A completed run writes `deployments/<chainId>.json` — the machine-readable manifest the frontend and
+/// data layer consume (see docs/technical/integration.md). Only `run` writes it; the dry-run test drives {deploy}
+/// directly precisely so a rehearsal leaves no artifacts behind. Values larger than a JavaScript-safe
+/// integer (every WAD-denominated field among them) are serialized as decimal strings, never as numbers.
 contract Deploy is Script {
     function run() external returns (Deployment memory d) {
         address bootstrapAdministrator = vm.envAddress("BOOTSTRAP_ADMINISTRATOR");
@@ -51,13 +57,79 @@ contract Deploy is Script {
         console2.log("payout paths      ", address(d.payoutPaths));
         console2.log("hook              ", address(d.hook));
         console2.log("buyback plugin    ", address(d.buyback));
-        console2.log("swap/flush helper ", address(d.helper));
         console2.log("buyback index     ", uint256(d.buybackIndex));
         console2.log("canonical plan    ", d.canonicalPayoutPlan);
         console2.log("hook salt         ", uint256(d.hookSalt));
         console2.log("bootstrap admin   ", d.controller.administrator());
         console2.log("pending admin     ", d.controller.pendingAdministrator());
         console2.log("protocol recipient", d.hook.protocolRecipient());
+
+        _writeManifest(d, p);
+    }
+
+    /// @notice Writes `deployments/<chainId>.json`: every address the run produced, the mined salt, the
+    /// canonical payout plan, and the template plus economics snapshot the deployment actually ran with.
+    ///
+    /// @dev This is the handoff artifact for the frontend and the data layer — docs/technical/integration.md is its
+    /// reader's guide. It is written after the logs and outside the broadcast window, so it never
+    /// appears in the transaction list and never runs for the {deploy} rehearsal.
+    ///
+    /// WAD-denominated fields exceed JavaScript's `Number.MAX_SAFE_INTEGER`, so every one of them is
+    /// serialized as a decimal string; consumers must parse them as bigint. The counts (positions, band
+    /// counts, caps, fee in hundredths of a bip, version, chain id) stay numbers.
+    function _writeManifest(Deployment memory d, DeployParams memory p) private {
+        ProtocolTemplate memory t = d.hook.template();
+        EconomicConfig memory e = d.hook.economicConfig();
+
+        string memory json = "deployment";
+        vm.serializeUint(json, "chainId", block.chainid);
+        vm.serializeUint(json, "deployedAt", block.timestamp);
+        vm.serializeAddress(json, "poolManager", address(p.poolManager));
+        vm.serializeAddress(json, "bootstrapAdministrator", p.bootstrapAdministrator);
+        vm.serializeAddress(json, "protocolAdmin", p.protocolAdmin);
+        vm.serializeAddress(json, "protocolRecipient", p.protocolRecipient);
+        vm.serializeAddress(json, "hook", address(d.hook));
+        vm.serializeAddress(json, "coldPaths", address(d.coldPaths));
+        vm.serializeAddress(json, "payoutPaths", address(d.payoutPaths));
+        vm.serializeAddress(json, "launchSupport", address(d.support));
+        vm.serializeAddress(json, "revenueNft", address(d.nft));
+        vm.serializeAddress(json, "payoutPluginRegistry", address(d.registry));
+        vm.serializeAddress(json, "protocolController", address(d.controller));
+        vm.serializeAddress(json, "buybackPlugin", address(d.buyback));
+        vm.serializeUint(json, "buybackIndex", uint256(d.buybackIndex));
+        vm.serializeBytes32(json, "canonicalPayoutPlan", bytes32(d.canonicalPayoutPlan));
+        vm.serializeBytes32(json, "hookSalt", d.hookSalt);
+
+        string memory template = "template";
+        vm.serializeString(template, "openingFdvWei", vm.toString(t.openingFdvWei));
+        vm.serializeUint(template, "curvePositions", uint256(t.curvePositions));
+        vm.serializeInt(template, "curveSpanLevels", int256(t.curveSpanLevels));
+        vm.serializeInt(template, "bandLevelSpacing", int256(t.bandLevelSpacing));
+        vm.serializeInt(template, "bandWidthLevels", int256(t.bandWidthLevels));
+        vm.serializeUint(template, "coreBandCount", uint256(t.coreBandCount));
+        vm.serializeUint(template, "maxFeeFundedBands", uint256(t.maxFeeFundedBands));
+        vm.serializeString(template, "curveSupplyShareWad", vm.toString(t.curveSupplyShareWad));
+        vm.serializeString(template, "ladderSupplyShareWad", vm.toString(t.ladderSupplyShareWad));
+        vm.serializeString(template, "fullRangeSupplyShareWad", vm.toString(t.fullRangeSupplyShareWad));
+        vm.serializeString(template, "lpSeedWad", vm.toString(t.lpSeedWad));
+        vm.serializeString(template, "proceedsCreatorWad", vm.toString(t.proceedsCreatorWad));
+        vm.serializeString(template, "proceedsProtocolWad", vm.toString(t.proceedsProtocolWad));
+        vm.serializeUint(template, "tradingFeeHundredthsBip", uint256(t.tradingFeeHundredthsBip));
+        vm.serializeUint(template, "bandInventoryCapMultiple", uint256(t.bandInventoryCapMultiple));
+        vm.serializeUint(template, "maxDeploysPerSwap", uint256(t.maxDeploysPerSwap));
+        string memory templateJson = vm.serializeUint(template, "maxHarvestsPerSwap", uint256(t.maxHarvestsPerSwap));
+        vm.serializeString(json, "template", templateJson);
+
+        string memory economics = "economicConfig";
+        vm.serializeString(economics, "harvestServiceFeeWad", vm.toString(e.harvestServiceFeeWad));
+        vm.serializeString(economics, "quoteCreatorShareWad", vm.toString(e.quoteCreatorShareWad));
+        vm.serializeString(economics, "tokenMilestoneFundShareWad", vm.toString(e.tokenMilestoneFundShareWad));
+        string memory economicsJson = vm.serializeUint(economics, "version", uint256(e.version));
+        string memory out = vm.serializeString(json, "economicConfig", economicsJson);
+
+        string memory dir = string.concat(vm.projectRoot(), "/deployments");
+        vm.createDir(dir, true);
+        vm.writeJson(out, string.concat(dir, "/", vm.toString(block.chainid), ".json"));
     }
 
     /// @notice The deployment itself, with its inputs given rather than read from the environment.

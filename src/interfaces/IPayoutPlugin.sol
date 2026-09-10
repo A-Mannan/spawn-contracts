@@ -17,9 +17,3 @@ interface IPayoutPlugin {
 interface IPayoutPoolLookup {
     function payoutPool(PoolId poolId) external view returns (PoolKey memory key, address token);
 }
-
-/// @notice Minimal cold flush surface used by external composition helpers.
-/// @dev The helper deliberately cannot supply destinations, takes, gas limits, or callback data.
-interface IPayoutFlusher {
-    function flush(PoolId poolId) external;
-}

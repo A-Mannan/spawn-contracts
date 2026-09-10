@@ -33,6 +33,10 @@ ast = true
 build_info = true
 extra_output = ["storageLayout"]
 
+# Read the project by default, but let script/Deploy.s.sol write the handoff manifest into
+# deployments/ (and nowhere else). docs/technical/integration.md describes the manifest's consumers.
+fs_permissions = [{ access = "read", path = "./" }, { access = "read-write", path = "./deployments" }]
+
 # Uniswap v4 uses custom errors extensively; keep full revert data in traces.
 verbosity = 1
 

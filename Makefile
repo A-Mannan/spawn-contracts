@@ -1,9 +1,9 @@
-# Milestone Launchpad — build & verification targets.
+# Spawn Launchpad — build & verification targets.
 #
 # Task groups referenced below are from
 # openspec/changes/add-milestone-launchpad/tasks.md
 
-.PHONY: all build test test-unit test-fork test-invariant deep size size-gate-selftest structural-gate-selftest scenario-tool-selftest scenario-check lock-check layout-check fmt fmt-check clean deps pins release-check
+.PHONY: all build test test-unit test-fork test-invariant deep size size-gate-selftest structural-gate-selftest scenario-tool-selftest scenario-check lock-check layout-check abis fmt fmt-check clean deps pins release-check
 
 SIZE_LIMIT ?= 24576
 FIXTURE_DIR := .sizegate-fixture
@@ -110,6 +110,38 @@ open(os.path.join('$(FIXTURE_DIR)', 'Oversized.sol'), 'w').write(src)"
 	else echo "size-gate-selftest: FAIL (gate did not reject the oversized fixture)"; fi; \
 	exit $$status
 
+# Curated ABI export for the frontend/data-layer handoff (docs/technical/integration.md section 10).
+# The delegatecall satellites are deliberately absent: calling them directly reverts, so their ABIs
+# are a foot-gun rather than an interface. StateView and V4Quoter come from v4-periphery.
+# Resolution quirk: src entries need `path:Name`; the lib lens files resolve as a bare path
+# (path:Name fails for them) and each holds exactly one contract, so the basename is the file name.
+ABI_CONTRACTS := \
+	src/MilestoneHook.sol:MilestoneHook \
+	src/LaunchSupport.sol:LaunchSupport \
+	src/MilestoneToken.sol:MilestoneToken \
+	src/RevenueNFT.sol:RevenueNFT \
+	src/PayoutPluginRegistry.sol:PayoutPluginRegistry \
+	src/ProtocolController.sol:ProtocolController \
+	src/BuybackAndBurnPlugin.sol:BuybackAndBurnPlugin \
+	src/interfaces/IPayoutPlugin.sol:IPayoutPlugin \
+	lib/v4-periphery/src/lens/StateView.sol \
+	lib/v4-periphery/src/lens/V4Quoter.sol
+
+abis:
+	forge build --skip 'test/**' --skip 'script/**'
+	# The v4-periphery lens contracts are not imported by anything, so the project build never
+	# compiles them; build them explicitly so their artifacts exist for forge inspect.
+	forge build lib/v4-periphery/src/lens/StateView.sol lib/v4-periphery/src/lens/V4Quoter.sol
+	@mkdir -p abi
+	@for spec in $(ABI_CONTRACTS); do \
+	  case $$spec in \
+	    (*:*) name=$${spec##*:} ;; \
+	    (*)   name=$${spec##*/}; name=$${name%.sol} ;; \
+	  esac; \
+	  forge inspect --json $$spec abi > abi/$$name.json; \
+	done
+	@python3 -c "import json,glob; [json.load(open(f)) for f in glob.glob('abi/*.json')]; print('abis:', len(glob.glob('abi/*.json')), 'valid JSON files')"
+
 fmt:
 	forge fmt
 
@@ -122,6 +154,6 @@ clean:
 
 # OpenSpec add-payout-plugins: full local release gate. Fork and public-testnet campaigns remain separate
 # because they require environment credentials.
-release-check: pins fmt-check build size size-gate-selftest structural-gate-selftest scenario-tool-selftest lock-check layout-check test-unit test-invariant
+release-check: pins fmt-check build size size-gate-selftest structural-gate-selftest scenario-tool-selftest lock-check layout-check abis test-unit test-invariant
 	@echo "release-check: unit + invariant suites and all local structural gates passed."
 	@echo "release-check: run 'make test-fork' separately with BASE_RPC_URL set."

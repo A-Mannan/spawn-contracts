@@ -50,23 +50,31 @@ contract LaunchSupport {
     /// @dev Replay protection needs no bookkeeping anywhere in the protocol: the salt binds the
     /// configuration and its creator, so a second launch of the same configuration by the same creator
     /// resolves to an address that already holds code, and `new ... {salt}` reverts on that collision.
-    function deploy(string calldata name, string calldata symbol, uint256 supply, address recipient, bytes32 salt)
-        external
-        returns (address token)
-    {
-        token = address(new MilestoneToken{salt: salt}(name, symbol, supply, recipient));
+    function deploy(
+        string calldata name,
+        string calldata symbol,
+        string calldata uri,
+        uint256 supply,
+        address recipient,
+        bytes32 salt
+    ) external returns (address token) {
+        token = address(new MilestoneToken{salt: salt}(name, symbol, uri, supply, recipient));
     }
 
     /// @notice The address {deploy} will produce for these arguments.
     /// @dev Pure with respect to protocol state, so a front-end can advertise a token's address from a
     /// published configuration and signature alone: recover the signer, derive the salt, call this.
-    function predict(string memory name, string memory symbol, uint256 supply, address recipient, bytes32 salt)
-        public
-        view
-        returns (address)
-    {
-        bytes32 initCodeHash =
-            keccak256(abi.encodePacked(type(MilestoneToken).creationCode, abi.encode(name, symbol, supply, recipient)));
+    function predict(
+        string memory name,
+        string memory symbol,
+        string memory uri,
+        uint256 supply,
+        address recipient,
+        bytes32 salt
+    ) public view returns (address) {
+        bytes32 initCodeHash = keccak256(
+            abi.encodePacked(type(MilestoneToken).creationCode, abi.encode(name, symbol, uri, supply, recipient))
+        );
 
         return address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(this), salt, initCodeHash)))));
     }
@@ -128,6 +136,7 @@ contract LaunchSupport {
         return predict(
             config.name,
             config.symbol,
+            config.uri,
             config.totalSupply,
             hook,
             LaunchSignature.tokenSalt(LaunchSignature.configHash(config), config.creator)

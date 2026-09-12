@@ -9,7 +9,7 @@ import {Bounds, LaunchConfig} from "../../src/types/LaunchTypes.sol";
 import {EconomicConfig} from "../../src/types/PayoutTypes.sol";
 
 /// @notice The immutable static trading fee across time, lifecycle, and governed economics.
-contract FeeStepDownTest is LaunchpadTest {
+contract StaticFeeTest is LaunchpadTest {
     function _assertStaticFee(PoolId id, PoolKey memory k) internal view {
         assertEq(k.fee, Bounds.TRADING_FEE_HUNDREDTHS_BIP, "key fee is one percent");
         assertEq(_baseFeeOf(id), Bounds.TRADING_FEE_HUNDREDTHS_BIP, "slot fee is one percent");

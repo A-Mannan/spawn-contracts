@@ -11,7 +11,7 @@ Every launch is exactly one Uniswap v4 pool: **ETH vs the token**, with a static
 
 ## Buying
 
-- Buys move the price **up** the bonding curve before graduation and against full-range liquidity after.
+- Buys move the price **up** the bonding curve before graduation and against full-range liquidity after. Post-graduation, a protocol-owned **wall** of single-sided token liquidity spanning the 880,000 levels above graduation sits behind the bounded full-range position — deep buy-side liquidity with a hard price floor at a ~$5,100 FDV.
 - There is no liquidity above the curve top until graduation, so an unbounded buy sweeps the curve and parks the price at the top. Frontends show **"graduation on next trade"** and route that trade through a deliberate, quoted graduation first.
 - Bounded buys into the curve may land at their target level or one rung above it — treat targets as minimums, not exacts.
 
@@ -22,7 +22,7 @@ Every launch is exactly one Uniswap v4 pool: **ETH vs the token**, with a static
 
 ## Fees — where they go
 
-The 1% fee is not a tip to LPs. Post-graduation it funds the protocol's economics: the ETH side mostly goes to the creator's revenue stream, the token side funds future ladder rungs and burns. See [how it works](how-it-works.md) for the exact splits.
+The 1% fee is not a tip to LPs. Post-graduation it funds the protocol's economics: the ETH side mostly goes to the creator's revenue stream, the token side funds future ladder rungs (and burns only once the fee-funded extension capacity is used up). See [how it works](how-it-works.md) for the exact splits.
 
 ## Flush timing
 

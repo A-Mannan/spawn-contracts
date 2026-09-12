@@ -22,15 +22,24 @@ contract MilestoneToken is ERC20 {
     /// @notice Supply minted at construction. Total supply can only ever fall from here, via burn.
     uint256 public immutable initialSupply;
 
+    /// @notice Off-chain metadata location, fixed at construction and never editable.
+    /// @dev The same posture flaunchgg and doppler take: the URI is a plain public string written by
+    /// the launch parameters. This token has no owner and no update path, so the URI is as permanent
+    /// as the supply.
+    string public tokenURI;
+
     error ZeroHook();
     error ZeroSupply();
 
-    constructor(string memory name_, string memory symbol_, uint256 supply_, address hook_) ERC20(name_, symbol_) {
+    constructor(string memory name_, string memory symbol_, string memory uri_, uint256 supply_, address hook_)
+        ERC20(name_, symbol_)
+    {
         if (hook_ == address(0)) revert ZeroHook();
         if (supply_ == 0) revert ZeroSupply();
 
         hook = hook_;
         initialSupply = supply_;
+        tokenURI = uri_;
         _mint(hook_, supply_);
     }
 

@@ -92,6 +92,19 @@
   },
   {
     "type": "function",
+    "name": "ACTION_SET_TRUSTED_OPERATOR",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "MAX_HARVEST_SERVICE_FEE_WAD",
     "inputs": [],
     "outputs": [
@@ -357,6 +370,24 @@
   },
   {
     "type": "function",
+    "name": "executeTrustedOperator",
+    "inputs": [
+      {
+        "name": "operator",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "salt",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "governanceDelay",
     "inputs": [],
     "outputs": [
@@ -514,6 +545,30 @@
         "name": "role",
         "type": "uint8",
         "internalType": "enum PluginRole"
+      },
+      {
+        "name": "salt",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "hashTrustedOperator",
+    "inputs": [
+      {
+        "name": "operator",
+        "type": "address",
+        "internalType": "address"
       },
       {
         "name": "salt",
@@ -784,6 +839,30 @@
   },
   {
     "type": "function",
+    "name": "scheduleTrustedOperator",
+    "inputs": [
+      {
+        "name": "operator",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "salt",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "operationId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "target",
     "inputs": [],
     "outputs": [
@@ -965,6 +1044,25 @@
     "inputs": [
       {
         "name": "target",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "TrustedOperatorUpdated",
+    "inputs": [
+      {
+        "name": "previousOperator",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "operator",
         "type": "address",
         "indexed": true,
         "internalType": "address"

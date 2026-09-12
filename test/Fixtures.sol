@@ -171,6 +171,7 @@ abstract contract LaunchpadTest is Test {
     /// @dev The creator signs, so it needs a key rather than just an address.
     uint256 internal constant CREATOR_PK = 0xA11CE;
     uint256 internal constant IMPOSTER_PK = 0xBADBEEF;
+    uint256 internal constant OPERATOR_PK = 0xC0FFEE;
 
     uint256 internal constant SUPPLY = 1_000_000_000 ether;
     uint64 internal constant CANONICAL_BUYBACK_TAKE_WAD = uint64((2 * WAD) / 9);
@@ -185,6 +186,7 @@ abstract contract LaunchpadTest is Test {
 
     address internal creator;
     address internal imposter;
+    address internal operator;
 
     PayoutPluginRegistry internal registry;
     ProtocolController internal controller;
@@ -204,6 +206,7 @@ abstract contract LaunchpadTest is Test {
     function setUp() public virtual {
         creator = vm.addr(CREATOR_PK);
         imposter = vm.addr(IMPOSTER_PK);
+        operator = vm.addr(OPERATOR_PK);
 
         _deployProtocol();
 
@@ -238,7 +241,8 @@ abstract contract LaunchpadTest is Test {
                 address(coldPaths),
                 address(payoutPaths),
                 address(controller),
-                PROTOCOL_RECIPIENT
+                PROTOCOL_RECIPIENT,
+                operator
             ),
             HOOK_ADDR
         );
@@ -288,12 +292,12 @@ abstract contract LaunchpadTest is Test {
         return (poolId_, key_, MilestoneToken(tokenAddr));
     }
 
-    /// @notice A relayed launch: the creator signs off-chain, `relayer` pays the gas.
+    /// @notice A relayed launch: the protocol's launch operator signs off-chain, `relayer` pays the gas.
     function _launchRelayed(LaunchConfig memory config, address relayer)
         internal
         returns (PoolId id, PoolKey memory k, MilestoneToken t)
     {
-        return _launchRelayedSignedBy(config, relayer, CREATOR_PK);
+        return _launchRelayedSignedBy(config, relayer, OPERATOR_PK);
     }
 
     /// @notice A relayed launch signed by an arbitrary key, for the tests that care *who* signed.
@@ -470,7 +474,7 @@ abstract contract LaunchpadTest is Test {
         return IPoolManager(address(manager)).getPositionLiquidity(
             poolId,
             Position.calculatePositionKey(
-                HOOK_ADDR, -Bounds.FULL_RANGE_TICK_BOUND, Bounds.FULL_RANGE_TICK_BOUND, hook.FULL_RANGE_SALT()
+                HOOK_ADDR, Bounds.FULL_RANGE_TICK_LOWER, Bounds.FULL_RANGE_TICK_UPPER, hook.FULL_RANGE_SALT()
             )
         );
     }

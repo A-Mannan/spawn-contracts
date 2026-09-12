@@ -57,7 +57,8 @@ contract MilestoneHookHarness is MilestoneHook {
         address coldPaths_,
         address payoutPaths_,
         address protocolController_,
-        address protocolRecipient_
+        address protocolRecipient_,
+        address trustedOperator_
     )
         MilestoneHook(
             poolManager_,
@@ -67,7 +68,8 @@ contract MilestoneHookHarness is MilestoneHook {
             coldPaths_,
             payoutPaths_,
             protocolController_,
-            protocolRecipient_
+            protocolRecipient_,
+            trustedOperator_
         )
     {}
 

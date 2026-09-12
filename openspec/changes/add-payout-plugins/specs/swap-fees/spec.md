@@ -86,11 +86,11 @@ Any address SHALL be able to collect accrued full-range fees. Collection SHALL a
 - **THEN** the active global distribution alone determines all destinations
 
 ### Requirement: Milestone-fund diversion of token-denominated fees
-While another permitted band can use inventory, the system SHALL divert the active globally configured share of token fees to milestone inventory without performing a swap and SHALL burn the exact remainder. The default diverted share SHALL be 20%, and the immutable maximum SHALL be 50%. Quote fees SHALL never be diverted. When no future band is permitted or useful, diversion SHALL be zero and all collected token fees SHALL burn. Executed updates SHALL affect future collections for every pool without changing already routed value.
+While another permitted band can use inventory, the system SHALL divert the active globally configured share of token fees to milestone inventory without performing a swap and SHALL burn the exact remainder. The default diverted share SHALL be 100%, and the immutable maximum SHALL be 100%. Quote fees SHALL never be diverted. When no future band is permitted or useful, diversion SHALL be zero and all collected token fees SHALL burn. Executed updates SHALL affect future collections for every pool without changing already routed value.
 
-#### Scenario: Default token routing funds 20 and burns 80
+#### Scenario: Default token routing funds the whole token fee while capacity remains
 - **WHEN** token fees are collected under defaults while useful ladder capacity remains
-- **THEN** 20% funds milestone inventory and the remainder burns
+- **THEN** the whole token fee funds milestone inventory and nothing burns
 
 #### Scenario: Active token distribution applies globally
 - **WHEN** a valid queued token-fund update executes
@@ -119,11 +119,11 @@ While another permitted band can use inventory, the system SHALL divert the acti
 ## ADDED Requirements
 
 ### Requirement: Governed global economic configuration
-The protocol SHALL maintain one active, versioned economic configuration containing milestone service-fee, quote creator, and token milestone-fund percentages. Defaults SHALL be 10%, 75%, and 20%. Protocol quote share and token burn share SHALL be exact remainders. Only the configurable protocol administrator SHALL queue or cancel updates, and executed updates SHALL affect future harvests and fee collections for every existing and future pool. Immutable validation SHALL enforce service fee at most 20%, quote creator at most 90%, and token milestone funding at most 50%. Trading fee, graduation split, and all post-graduation LP compounding SHALL remain outside this configuration.
+The protocol SHALL maintain one active, versioned economic configuration containing milestone service-fee, quote creator, and token milestone-fund percentages. Defaults SHALL be 10%, 75%, and 100%. Protocol quote share and token burn share SHALL be exact remainders. Only the configurable protocol administrator SHALL queue or cancel updates, and executed updates SHALL affect future harvests and fee collections for every existing and future pool. Immutable validation SHALL enforce service fee at most 20%, quote creator at most 90%, and token milestone funding at most 100%. Trading fee, graduation split, and all post-graduation LP compounding SHALL remain outside this configuration.
 
 #### Scenario: Default global configuration is published
 - **WHEN** the protocol is deployed
-- **THEN** defaults are 10% harvest service fee, 75 25 quote routing, and 20 80 pre-cap token routing
+- **THEN** defaults are 10% harvest service fee, 75 25 quote routing, and 100 0 pre-cap token routing
 
 #### Scenario: Valid update affects every pool prospectively
 - **WHEN** a queued economic update executes
@@ -138,7 +138,7 @@ The protocol SHALL maintain one active, versioned economic configuration contain
 - **THEN** it is rejected and the protocol remainder cannot fall below 10%
 
 #### Scenario: Token-fund cap is enforced
-- **WHEN** an update proposes more than 50% pre-cap milestone funding
+- **WHEN** an update proposes more than 100% pre-cap milestone funding
 - **THEN** it is rejected
 
 #### Scenario: Exact cap values are accepted

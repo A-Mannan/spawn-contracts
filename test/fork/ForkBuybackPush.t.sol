@@ -62,7 +62,7 @@ contract ForkBuybackPushTest is BaseForkTest {
         uint256 supplyBeforeFlush = token.totalSupply();
 
         vm.prank(STRANGER);
-        hook.flush(poolId);
+        hook.flushTo(poolId, STRANGER);
 
         assertEq(hook.payoutPot(poolId), 0, "the whole new pot was redeemed once");
         assertEq(STRANGER.balance - flusherBefore, tip, "the arbitrary flusher received one percent");

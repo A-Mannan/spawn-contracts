@@ -43,6 +43,16 @@
             "internalType": "int24"
           },
           {
+            "name": "bandFirstStepLevels",
+            "type": "int24",
+            "internalType": "int24"
+          },
+          {
+            "name": "bandStepDecayLevels",
+            "type": "int24",
+            "internalType": "int24"
+          },
+          {
             "name": "bandWidthLevels",
             "type": "int24",
             "internalType": "int24"
@@ -128,6 +138,11 @@
         "name": "protocolRecipient_",
         "type": "address",
         "internalType": "address"
+      },
+      {
+        "name": "trustedOperator_",
+        "type": "address",
+        "internalType": "address"
       }
     ],
     "stateMutability": "nonpayable"
@@ -139,6 +154,19 @@
   {
     "type": "function",
     "name": "FULL_RANGE_SALT",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "WALL_SALT",
     "inputs": [],
     "outputs": [
       {
@@ -1189,6 +1217,30 @@
   },
   {
     "type": "function",
+    "name": "claimCreatorPathBatch",
+    "inputs": [
+      {
+        "name": "pools",
+        "type": "bytes32[]",
+        "internalType": "PoolId[]"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "successes",
+        "type": "bool[]",
+        "internalType": "bool[]"
+      },
+      {
+        "name": "attemptedAmounts",
+        "type": "uint256[]",
+        "internalType": "uint256[]"
+      }
+    ],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "claimProtocol",
     "inputs": [],
     "outputs": [
@@ -1285,7 +1337,45 @@
   },
   {
     "type": "function",
+    "name": "creatorPathBatchGasCeiling",
+    "inputs": [
+      {
+        "name": "pools",
+        "type": "bytes32[]",
+        "internalType": "PoolId[]"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "ceiling",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "creatorPathClaimable",
+    "inputs": [
+      {
+        "name": "poolId",
+        "type": "bytes32",
+        "internalType": "PoolId"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "creatorPathGasCeiling",
     "inputs": [
       {
         "name": "poolId",
@@ -1406,12 +1496,73 @@
   },
   {
     "type": "function",
-    "name": "flush",
+    "name": "flushBatch",
+    "inputs": [
+      {
+        "name": "pools",
+        "type": "bytes32[]",
+        "internalType": "PoolId[]"
+      },
+      {
+        "name": "tipTo",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "flushBatchGasCeiling",
+    "inputs": [
+      {
+        "name": "pools",
+        "type": "bytes32[]",
+        "internalType": "PoolId[]"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "ceiling",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "flushGasCeiling",
     "inputs": [
       {
         "name": "poolId",
         "type": "bytes32",
         "internalType": "PoolId"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "ceiling",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "flushTo",
+    "inputs": [
+      {
+        "name": "poolId",
+        "type": "bytes32",
+        "internalType": "PoolId"
+      },
+      {
+        "name": "tipTo",
+        "type": "address",
+        "internalType": "address"
       }
     ],
     "outputs": [],
@@ -1563,6 +1714,11 @@
           },
           {
             "name": "symbol",
+            "type": "string",
+            "internalType": "string"
+          },
+          {
+            "name": "uri",
             "type": "string",
             "internalType": "string"
           },
@@ -1975,6 +2131,21 @@
             "name": "fullRangeTickUpper",
             "type": "int24",
             "internalType": "int24"
+          },
+          {
+            "name": "wallLiquidity",
+            "type": "uint128",
+            "internalType": "uint128"
+          },
+          {
+            "name": "wallTickLower",
+            "type": "int24",
+            "internalType": "int24"
+          },
+          {
+            "name": "wallTickUpper",
+            "type": "int24",
+            "internalType": "int24"
           }
         ]
       }
@@ -2109,6 +2280,19 @@
   },
   {
     "type": "function",
+    "name": "setTrustedOperator",
+    "inputs": [
+      {
+        "name": "operator",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "template",
     "inputs": [],
     "outputs": [
@@ -2134,6 +2318,16 @@
           },
           {
             "name": "bandLevelSpacing",
+            "type": "int24",
+            "internalType": "int24"
+          },
+          {
+            "name": "bandFirstStepLevels",
+            "type": "int24",
+            "internalType": "int24"
+          },
+          {
+            "name": "bandStepDecayLevels",
             "type": "int24",
             "internalType": "int24"
           },
@@ -2229,6 +2423,19 @@
         "name": "",
         "type": "uint256",
         "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "trustedOperator",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "address"
       }
     ],
     "stateMutability": "view"
@@ -2676,6 +2883,12 @@
         "type": "uint128",
         "indexed": false,
         "internalType": "uint128"
+      },
+      {
+        "name": "wallLiquidity",
+        "type": "uint128",
+        "indexed": false,
+        "internalType": "uint128"
       }
     ],
     "anonymous": false
@@ -2726,6 +2939,24 @@
         "type": "address",
         "indexed": true,
         "internalType": "address"
+      },
+      {
+        "name": "name",
+        "type": "string",
+        "indexed": false,
+        "internalType": "string"
+      },
+      {
+        "name": "symbol",
+        "type": "string",
+        "indexed": false,
+        "internalType": "string"
+      },
+      {
+        "name": "uri",
+        "type": "string",
+        "indexed": false,
+        "internalType": "string"
       },
       {
         "name": "totalSupply",
@@ -2864,7 +3095,7 @@
         "internalType": "PoolId"
       },
       {
-        "name": "flusher",
+        "name": "recipient",
         "type": "address",
         "indexed": true,
         "internalType": "address"
@@ -3065,6 +3296,19 @@
     "anonymous": false
   },
   {
+    "type": "event",
+    "name": "TrustedOperatorSet",
+    "inputs": [
+      {
+        "name": "operator",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      }
+    ],
+    "anonymous": false
+  },
+  {
     "type": "error",
     "name": "ClaimBackingInsolvent",
     "inputs": [
@@ -3161,6 +3405,27 @@
       },
       {
         "name": "farLevel",
+        "type": "int24",
+        "internalType": "int24"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "FarTickOutsideFullRange",
+    "inputs": [
+      {
+        "name": "farTick",
+        "type": "int24",
+        "internalType": "int24"
+      },
+      {
+        "name": "lower",
+        "type": "int24",
+        "internalType": "int24"
+      },
+      {
+        "name": "upper",
         "type": "int24",
         "internalType": "int24"
       }
@@ -3416,6 +3681,17 @@
     "inputs": [
       {
         "name": "token",
+        "type": "address",
+        "internalType": "address"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "UnauthorizedLaunchSigner",
+    "inputs": [
+      {
+        "name": "recovered",
         "type": "address",
         "internalType": "address"
       }

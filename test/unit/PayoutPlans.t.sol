@@ -21,7 +21,7 @@ contract PayoutPlansTest is PayoutTestFixture {
         (PoolId id,,) = _launchWithPlan("Plan", "PLAN", _plan(firstIndex, secondIndex));
         _fundPot(id, 0, 100 ether);
 
-        hook.flush(id);
+        hook.flushTo(id, STRANGER);
 
         assertEq(first.totalReceived(), 17.82 ether);
         assertEq(second.totalReceived(), 26.73 ether);
@@ -77,7 +77,7 @@ contract PayoutPlansTest is PayoutTestFixture {
     function test_emptyPlanPaysTheCreator() public {
         _fundPot(poolId, 0, 100 ether);
         vm.prank(STRANGER);
-        hook.flush(poolId);
+        hook.flushTo(poolId, STRANGER);
         assertEq(hook.creatorPathClaimable(poolId), 89.1 ether);
     }
 
@@ -88,7 +88,7 @@ contract PayoutPlansTest is PayoutTestFixture {
         uint8 index = _registerPayoutPlugin(address(plugin), take);
         (PoolId id,,) = _launchWithPlan("Dust", "DUST", _plan(index));
         _fundPot(id, 0, 1001 wei);
-        hook.flush(id);
+        hook.flushTo(id, STRANGER);
         uint256 distributable = 892;
         assertEq(hook.creatorPathClaimable(id), distributable - FullMath.mulDiv(distributable, take, WAD));
     }
@@ -108,7 +108,7 @@ contract PayoutPlansTest is PayoutTestFixture {
         (PoolId id,,) = _launchWithPlan("Stable", "STBL", _plan(index));
         _registerPayoutPlugin(address(new RecordingPayoutPlugin()), 0.4e18);
         _fundPot(id, 0, 100 ether);
-        hook.flush(id);
+        hook.flushTo(id, STRANGER);
         assertEq(original.totalReceived(), 17.82 ether);
         assertEq(hook.payoutPlan(id), _plan(index));
     }

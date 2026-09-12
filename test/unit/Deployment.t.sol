@@ -62,7 +62,8 @@ contract DeploymentTest is Test {
             selfIssuesCreate2: true,
             bootstrapAdministrator: address(deployScript),
             protocolAdmin: PROTOCOL_ADMIN,
-            protocolRecipient: PROTOCOL_RECIPIENT
+            protocolRecipient: PROTOCOL_RECIPIENT,
+            trustedOperator: address(0xF00DFACE)
         });
 
         deployed = deployScript.deploy(params, template);
@@ -295,7 +296,7 @@ contract DeploymentTest is Test {
         EconomicConfig memory economics = deployed.hook.economicConfig();
         assertEq(economics.harvestServiceFeeWad, 0.1e18, "harvest fee");
         assertEq(economics.quoteCreatorShareWad, 0.75e18, "creator quote share");
-        assertEq(economics.tokenMilestoneFundShareWad, 0.2e18, "token fund share");
+        assertEq(economics.tokenMilestoneFundShareWad, 1e18, "token fund share");
         assertEq(economics.version, 1, "economic version");
     }
 

@@ -51,6 +51,6 @@ EIP-170 limits contracts to 24 KB. The hook's logic cannot fit in one artifact, 
 
 ## Coordinate system
 
-Native ETH is `currency0`, the launch token `currency1`, so raw v4 price is token-per-ETH and **ticks run opposite to price**. The protocol's user-facing coordinate is `level = -tick`, which rises as the token pumps; derived values are exact: `ethPerToken = 1.0001^level`, `FDV = totalSupply × 1.0001^level`. Convert at the pool boundary once, then do everything in level space. Template distances: 6931 levels per 2x, 2235 per ladder rung, 447 band width.
+Native ETH is `currency0`, the launch token `currency1`, so raw v4 price is token-per-ETH and **ticks run opposite to price**. The protocol's user-facing coordinate is `level = -tick`, which rises as the token pumps; derived values are exact: `ethPerToken = 1.0001^level`, `FDV = totalSupply × 1.0001^level`. Convert at the pool boundary once, then do everything in level space. Template distances: 6931 levels per 2x, a 13,862-level curve span (two 2x spans), and 447-wide bands on a decaying ladder schedule — first step 2x, decaying to the 2,235-level (1.2504x) floor spacing.
 
 The full integration surface — flows, quoting, the event catalog, view reads, batching — is in the [integration guide](integration.md).

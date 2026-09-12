@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import {PoolId} from "v4-core/src/types/PoolId.sol";
 import {LaunchpadTest} from "../Fixtures.sol";
 import {IPayoutPlugin} from "../../src/interfaces/IPayoutPlugin.sol";
+import {MilestoneBase} from "../../src/MilestoneBase.sol";
 import {MilestoneToken} from "../../src/MilestoneToken.sol";
 import {LaunchSignature} from "../../src/libraries/LaunchSignature.sol";
 import {LaunchConfig, Phase} from "../../src/types/LaunchTypes.sol";
@@ -13,8 +14,9 @@ contract SignaturePayoutPlugin is IPayoutPlugin {
     function onPayout(PoolId, address) external payable {}
 }
 
-/// @notice Unit tests for task 15.3 — the signed-config relay (design Decision 19): EIP-712 hashing, the
-/// deadline, creator identity, and the CREATE2 salt that makes a token address knowable and reserved.
+/// @notice Unit tests for task 15.3 — the operator-signed relay (design Decision 19): EIP-712 hashing,
+/// the deadline, creator identity, and the CREATE2 salt that makes a token address knowable and
+/// reserved.
 ///
 /// @dev The whole point of this mechanism is that launching costs the creator nothing and *anyone* may
 /// relay, so the tests are mostly about what a hostile relayer cannot do: alter a field, claim the
@@ -27,16 +29,16 @@ contract LaunchSignatureTest is LaunchpadTest {
         index = controller.executeRegisterPlugin(address(plugin), takeWad, 100_000, PluginRole.PAYOUT, salt);
     }
 
-    // --- Scenario: Relayer launches for the signer ---
+    // --- Scenario: Relayer launches for the operator ---
 
     function test_aRelayerCanLaunchOnTheCreatorsBehalf() public {
         LaunchConfig memory config = _defaultConfig("Relayed", "RLY");
 
         (PoolId id,, MilestoneToken t) = _launchRelayed(config, RELAYER);
 
-        assertEq(hook.poolState(id).creator, creator, "the signer is the creator, not the relayer");
+        assertEq(hook.poolState(id).creator, creator, "the declared creator is recorded, not the relayer");
         assertTrue(hook.poolState(id).creator != RELAYER, "the relayer is not the creator");
-        assertEq(nft.ownerOf(uint256(PoolId.unwrap(id))), creator, "the revenue NFT went to the signer");
+        assertEq(nft.ownerOf(uint256(PoolId.unwrap(id))), creator, "the revenue NFT went to the declared creator");
         assertEq(uint8(hook.poolPhase(id)), uint8(Phase.BONDING_CURVE), "the pool is live");
 
         // The whole supply is in protocol custody, split between the hook's own balance and the curve
@@ -51,14 +53,63 @@ contract LaunchSignatureTest is LaunchpadTest {
         assertEq(t.balanceOf(creator), 0, "and neither does the creator");
     }
 
-    /// @dev No allowlist, no approval, no privileged role: the property is that an arbitrary address the
-    /// protocol has never seen can relay. `STRANGER` is used nowhere else in this suite.
+    /// @dev No allowlist, no approval, no privileged relayer role: the property is that an arbitrary
+    /// address the protocol has never seen can relay an operator-signed launch. `STRANGER` is used
+    /// nowhere else in this suite.
     function test_anyAddressCanRelayWithoutAuthorisation() public {
         LaunchConfig memory config = _defaultConfig("Stranger", "STR");
 
-        (PoolId id,,) = _launchRelayedSignedBy(config, STRANGER, CREATOR_PK);
+        (PoolId id,,) = _launchRelayedSignedBy(config, STRANGER, OPERATOR_PK);
 
-        assertEq(hook.poolState(id).creator, creator, "identity comes from the signature alone");
+        assertEq(hook.poolState(id).creator, creator, "identity comes from the configuration alone");
+    }
+
+    // --- Scenario: Only the trusted operator can sign launches ---
+
+    /// @dev A signature by any key other than the on-chain trusted operator is rejected outright, even
+    /// though the configuration itself is perfectly launchable — the operator is the launch authority.
+    function test_onlyTheTrustedOperatorCanSignLaunches() public {
+        LaunchConfig memory config = _defaultConfig("Unauthorized", "UNZ");
+        assertEq(hook.trustedOperator(), operator, "the fixture wired the operator");
+
+        // Sign first: `_sign` makes its own calls, and `vm.expectRevert` would otherwise be
+        // consumed by the digest lookup rather than by the launch it is meant to police.
+        bytes memory signature = _sign(config, CREATOR_PK);
+        vm.prank(RELAYER);
+        vm.expectRevert(abi.encodeWithSelector(MilestoneBase.UnauthorizedLaunchSigner.selector, creator));
+        hook.launch(config, signature);
+    }
+
+    // --- Scenario: Operator rotation is governance-configurable ---
+
+    /// @dev Rotation is a typed governance operation like every other administrative change: scheduled,
+    /// executed, and emitted. Afterwards the old key is dead for launches and the new key works, while
+    /// the declared-creator semantics are unchanged.
+    function test_operatorRotationIsGovernanceConfigurable() public {
+        uint256 nextOperatorPk = 0x9999;
+        address nextOperator = vm.addr(nextOperatorPk);
+        bytes32 salt = keccak256("rotate-operator");
+
+        vm.prank(PROTOCOL_ADMIN);
+        controller.scheduleTrustedOperator(nextOperator, salt);
+        vm.prank(PROTOCOL_ADMIN);
+        controller.executeTrustedOperator(nextOperator, salt);
+
+        assertEq(hook.trustedOperator(), nextOperator, "the hook names the new operator");
+
+        // The old key no longer authorizes. Sign before arming the expectation, since `_sign`'s
+        // own calls would otherwise consume the `vm.expectRevert` slot.
+        LaunchConfig memory config = _defaultConfig("Rotated", "ROT");
+        bytes memory staleSignature = _sign(config, OPERATOR_PK);
+        vm.prank(RELAYER);
+        vm.expectRevert(abi.encodeWithSelector(MilestoneBase.UnauthorizedLaunchSigner.selector, operator));
+        hook.launch(config, staleSignature);
+
+        // The new one does, with the same declared-creator semantics.
+        bytes memory freshSignature = _sign(config, nextOperatorPk);
+        vm.prank(RELAYER);
+        (PoolId id,,) = hook.launch(config, freshSignature);
+        assertEq(hook.poolState(id).creator, creator, "the declared creator is recorded under the new operator");
     }
 
     // --- Scenario: Creator launches directly ---
@@ -92,9 +143,9 @@ contract LaunchSignatureTest is LaunchpadTest {
     /// submits the edit, which is exactly the attack: the relayer holds a valid signature for *something*
     /// and wants it to authorise something else.
     ///
-    /// The revert is `CreatorMismatch` rather than a signature-shape error, and that is the mechanism
-    /// working as designed — the edit recovers some unrelated address, and comparing that against the
-    /// configuration's declared creator is what rejects it. Recovering the creator *from* the signature
+    /// The revert is a bare failure rather than a signature-shape error, and that is the mechanism
+    /// working as designed — the edit changes the digest, so recovery yields some address that is not
+    /// the trusted operator, and the launch path rejects it. Recovering the creator *from* the signature
     /// instead would have launched every one of these edits, credited to the recovered address.
     ///
     /// Each edit is built fresh rather than copied from the signed configuration: `LaunchConfig memory x =
@@ -103,9 +154,9 @@ contract LaunchSignatureTest is LaunchpadTest {
     function test_aRelayerCannotAlterTheConfiguration() public {
         LaunchConfig memory signed = _defaultConfig("Honest", "HON");
         uint8 planIndex = _registerPayoutPlugin(0.2e18, keccak256("all-fields-plan"));
-        bytes memory signature = _sign(signed, CREATOR_PK);
+        bytes memory signature = _sign(signed, OPERATOR_PK);
 
-        uint256 fieldCount = 7;
+        uint256 fieldCount = 8;
         for (uint256 i = 0; i < fieldCount; i++) {
             LaunchConfig memory edited = _editedConfig(i, planIndex);
 
@@ -132,10 +183,12 @@ contract LaunchSignatureTest is LaunchpadTest {
         } else if (index == 2) {
             edited.symbol = "HOS";
         } else if (index == 3) {
-            edited.totalSupply = edited.totalSupply * 2;
+            edited.uri = "https://hostile.test/rewritten.json";
         } else if (index == 4) {
-            edited.devBuyShareWad = 0.05e18;
+            edited.totalSupply = edited.totalSupply * 2;
         } else if (index == 5) {
+            edited.devBuyShareWad = 0.05e18;
+        } else if (index == 6) {
             edited.payoutPlan = uint256(1) << planIndex;
         } else {
             edited.deadline -= 1;
@@ -146,7 +199,7 @@ contract LaunchSignatureTest is LaunchpadTest {
 
     function test_relayerCannotAlterAPlanBit() public {
         LaunchConfig memory signed = _defaultConfig("Plan", "PLN");
-        bytes memory signature = _sign(signed, CREATOR_PK);
+        bytes memory signature = _sign(signed, OPERATOR_PK);
         uint8 planIndex = _registerPayoutPlugin(0.2e18, keccak256("signature-plan"));
 
         signed.payoutPlan = uint256(1) << planIndex;
@@ -160,7 +213,7 @@ contract LaunchSignatureTest is LaunchpadTest {
     function test_aRelayerCannotExtendTheDeadline() public {
         LaunchConfig memory config = _defaultConfig("Deadline", "DLN");
         config.deadline = launchTime + 1 hours;
-        bytes memory signature = _sign(config, CREATOR_PK);
+        bytes memory signature = _sign(config, OPERATOR_PK);
 
         config.deadline = launchTime + 365 days;
 
@@ -176,7 +229,7 @@ contract LaunchSignatureTest is LaunchpadTest {
         LaunchConfig memory first = _defaultConfig("First", "ONE");
         LaunchConfig memory second = _defaultConfig("Second", "TWO");
 
-        bytes memory signatureForFirst = _sign(first, CREATOR_PK);
+        bytes memory signatureForFirst = _sign(first, OPERATOR_PK);
 
         vm.prank(RELAYER);
         vm.expectRevert();
@@ -190,7 +243,7 @@ contract LaunchSignatureTest is LaunchpadTest {
     /// failing rather than from a protocol check, which is why it is asserted as a bare revert.
     function test_replayIsRejected() public {
         LaunchConfig memory config = _defaultConfig("Replay", "RPL");
-        bytes memory signature = _sign(config, CREATOR_PK);
+        bytes memory signature = _sign(config, OPERATOR_PK);
 
         vm.prank(RELAYER);
         hook.launch(config, signature);
@@ -209,7 +262,7 @@ contract LaunchSignatureTest is LaunchpadTest {
         _launchRelayed(config, RELAYER);
 
         config.deadline = launchTime + 2 hours;
-        bytes memory reSigned = _sign(config, CREATOR_PK);
+        bytes memory reSigned = _sign(config, OPERATOR_PK);
 
         vm.prank(RELAYER);
         vm.expectRevert();
@@ -233,7 +286,7 @@ contract LaunchSignatureTest is LaunchpadTest {
     function test_anExpiredSignatureIsRejected() public {
         LaunchConfig memory config = _defaultConfig("Expiring", "EXP");
         config.deadline = launchTime + 1 hours;
-        bytes memory signature = _sign(config, CREATOR_PK);
+        bytes memory signature = _sign(config, OPERATOR_PK);
 
         vm.warp(launchTime + 1 hours + 1);
 
@@ -251,7 +304,7 @@ contract LaunchSignatureTest is LaunchpadTest {
     function test_aSignatureIsValidInItsDeadlineSecond() public {
         LaunchConfig memory config = _defaultConfig("Boundary", "BND");
         config.deadline = launchTime + 1 hours;
-        bytes memory signature = _sign(config, CREATOR_PK);
+        bytes memory signature = _sign(config, OPERATOR_PK);
 
         vm.warp(launchTime + 1 hours);
 
@@ -295,25 +348,26 @@ contract LaunchSignatureTest is LaunchpadTest {
 
         address predicted = support.predictToken(config, HOOK_ADDR);
 
-        (,, MilestoneToken t) = _launchRelayedSignedBy(config, STRANGER, CREATOR_PK);
+        (,, MilestoneToken t) = _launchRelayedSignedBy(config, STRANGER, OPERATOR_PK);
 
         assertEq(address(t), predicted, "an unexpected relayer does not move the address");
     }
 
-    // --- Scenario: Different signer cannot occupy the address ---
+    // --- Scenario: Different creator cannot occupy the address ---
 
     /// @dev Two halves. An imposter who signs the creator's configuration *as published* is rejected
-    /// outright, because the declared creator is part of what the signature must match. An imposter who
-    /// rewrites the declaration to themselves gets a launch — but a different token at a different
-    /// address, credited to them — and the creator's advertised address is untouched and still available.
-    function test_aDifferentSignerCannotOccupyTheAdvertisedAddress() public {
+    /// outright, because only the trusted operator's signature authorizes a relayed launch. An imposter
+    /// who gets the operator to sign a configuration declaring *them* as creator gets a launch — but a
+    /// different token at a different address, credited to them — and the creator's advertised address
+    /// is untouched and still available.
+    function test_aDifferentCreatorCannotOccupyTheAdvertisedAddress() public {
         LaunchConfig memory published = _defaultConfig("Contested", "CON");
         address advertised = support.predictToken(published, HOOK_ADDR);
 
         // The imposter signs the published configuration verbatim and relays it first.
         bytes memory imposterSignature = _sign(published, IMPOSTER_PK);
         vm.prank(imposter);
-        vm.expectRevert(abi.encodeWithSelector(LaunchSignature.CreatorMismatch.selector, creator, imposter));
+        vm.expectRevert(abi.encodeWithSelector(MilestoneBase.UnauthorizedLaunchSigner.selector, imposter));
         hook.launch(published, imposterSignature);
 
         // So the imposter's only option is to claim the creator slot, which moves the address. Built
@@ -321,7 +375,7 @@ contract LaunchSignatureTest is LaunchpadTest {
         // mutating an alias here would rewrite the very configuration whose address is under test.
         LaunchConfig memory theirs = _defaultConfig("Contested", "CON");
         theirs.creator = imposter;
-        (PoolId imposterPool,, MilestoneToken imposterToken) = _launchRelayedSignedBy(theirs, imposter, IMPOSTER_PK);
+        (PoolId imposterPool,, MilestoneToken imposterToken) = _launchRelayedSignedBy(theirs, imposter, OPERATOR_PK);
 
         assertTrue(address(imposterToken) != advertised, "a separate token at a different address");
         assertEq(hook.poolState(imposterPool).creator, imposter, "credited to the imposter");
@@ -416,7 +470,7 @@ contract LaunchSignatureTest is LaunchpadTest {
     /// @dev A signature is bound to one chain, so a fork cannot replay it onto the other.
     function test_aSignatureIsBoundToItsChain() public {
         LaunchConfig memory config = _defaultConfig("Chained", "CHN");
-        bytes memory signature = _sign(config, CREATOR_PK);
+        bytes memory signature = _sign(config, OPERATOR_PK);
 
         vm.chainId(block.chainid + 1);
 
@@ -430,7 +484,7 @@ contract LaunchSignatureTest is LaunchpadTest {
         LaunchConfig memory config = _defaultConfig("Bound", "BND");
 
         bytes32 wrongDomainDigest = support.launchDigest(config, address(coldPaths));
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(CREATOR_PK, wrongDomainDigest);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(OPERATOR_PK, wrongDomainDigest);
 
         vm.prank(RELAYER);
         vm.expectRevert();
@@ -474,7 +528,7 @@ contract LaunchSignatureTest is LaunchpadTest {
         LaunchConfig memory config = _defaultConfig("Invalid", "INV");
         config.devBuyShareWad = 0.5e18; // above the 10% cap
 
-        bytes memory signature = _sign(config, CREATOR_PK);
+        bytes memory signature = _sign(config, OPERATOR_PK);
 
         vm.prank(RELAYER);
         vm.expectRevert(abi.encodeWithSignature("DevBuyAboveCap(uint64)", 0.5e18));

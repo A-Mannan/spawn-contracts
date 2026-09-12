@@ -38,7 +38,7 @@ contract ForkSmokeTest is BaseForkTest {
         assertEq(address(router).balance, FORK_FLOAT, "router float");
     }
 
-    // --- Scenario (token-launch): Relayer launches for the signer ---
+    // --- Scenario (token-launch): Relayer launches for the operator ---
 
     function test_aRelayerCanLaunchOnTheCreatorsBehalf() public view {
         PoolState memory state = hook.poolState(poolId);

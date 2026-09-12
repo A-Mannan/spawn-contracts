@@ -13,6 +13,11 @@
         "internalType": "string"
       },
       {
+        "name": "uri_",
+        "type": "string",
+        "internalType": "string"
+      },
+      {
         "name": "supply_",
         "type": "uint256",
         "internalType": "uint256"
@@ -160,6 +165,19 @@
   {
     "type": "function",
     "name": "symbol",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "string",
+        "internalType": "string"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "tokenURI",
     "inputs": [],
     "outputs": [
       {

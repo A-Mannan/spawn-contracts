@@ -52,7 +52,6 @@ abstract contract MilestoneBase is ImmutableState {
     enum UnlockAction {
         GENESIS,
         GRADUATE,
-        REDEEM_QUOTE,
         COLLECT_FEES,
         REDEEM_PAYOUT_POT,
         REDEEM_PROTOCOL_BACKING
@@ -66,10 +65,26 @@ abstract contract MilestoneBase is ImmutableState {
         MILESTONE_HARVEST
     }
 
+    /// @dev Bundles the curve-walk geometry so the deployment frame stays small. "no-via_ir stack limit"
+    /// marks shapes that exist only for the fast test profile's no-via_ir build: under the legacy
+    /// codegen that profile compiles with, deep frames overflow where via_ir compiles fine. Behavior
+    /// is identical either way.
+    struct CurveGeometry {
+        uint16 positions;
+        int24 opening;
+        int24 far;
+        uint256 curveSupply;
+    }
+
     /// @notice Salt of the single full-range position seeded at graduation.
     /// @dev A hash rather than a small number so it can never collide with a curve position salt, which
     /// is a small index in the low bits.
     bytes32 public constant FULL_RANGE_SALT = keccak256("milestone-launchpad.full-range");
+
+    /// @notice Salt of the wall position seeded at graduation above the full-range position.
+    /// @dev Same hash family as {FULL_RANGE_SALT} and disjoint from it, from the curve salts (low bits),
+    /// and from the band salts (top bit) by construction.
+    bytes32 public constant WALL_SALT = keccak256("milestone-launchpad.wall");
 
     /// @dev Top bit set, so a band salt can never coincide with a curve salt — whose highest set bit is
     /// below bit 8 for a 32-position template — nor with {FULL_RANGE_SALT}.
@@ -100,6 +115,8 @@ abstract contract MilestoneBase is ImmutableState {
     uint16 internal immutable curvePositions;
     int24 internal immutable curveSpanLevels;
     int24 internal immutable bandLevelSpacing;
+    int24 internal immutable bandFirstStepLevels;
+    int24 internal immutable bandStepDecayLevels;
     int24 internal immutable bandWidthLevels;
     uint8 internal immutable coreBandCount;
     uint8 internal immutable maxFeeFundedBands;
@@ -127,6 +144,13 @@ abstract contract MilestoneBase is ImmutableState {
     /// @notice Recipient of the protocol's global revenue ledger.
     /// @dev Mutable only through the typed protocol controller, alongside the versioned economic tuple.
     address public protocolRecipient;
+
+    /// @notice The off-chain launch operator whose EIP-712 signature authorizes relayed launches.
+    /// @dev This is the protocol's trust-and-safety key: creators declare themselves in the
+    /// configuration and the operator vouches for the launch, which is what lets a first buyer relay
+    /// it without the creator ever signing. Zero disables the relayed path entirely (direct creator
+    /// launches still work). Mutable only through the typed protocol controller.
+    address public trustedOperator;
 
     /// @notice Per-pool lifecycle state.
     mapping(PoolId poolId => PoolState) internal _pools;
@@ -165,6 +189,7 @@ abstract contract MilestoneBase is ImmutableState {
         uint64 tokenMilestoneFundShareWad
     );
     event ProtocolRecipientSet(address indexed recipient);
+    event TrustedOperatorSet(address indexed operator);
 
     /// @notice Emitted whenever ETH accrues to the creator's claimable balance.
     event CreatorAccrued(PoolId indexed poolId, uint256 amount, AccrualSource source, uint64 economicVersion);
@@ -175,14 +200,19 @@ abstract contract MilestoneBase is ImmutableState {
     event CreatorClaimed(PoolId indexed poolId, address indexed holder, uint256 amount);
     event ProtocolClaimed(address indexed recipient, uint256 amount);
 
-    /// @notice Emitted once per launch, carrying everything needed to reconstruct the pool's geometry
-    /// off-chain without reading storage.
+    /// @notice Emitted once per launch, carrying the token's metadata and everything needed to
+    /// reconstruct the pool's geometry off-chain without reading storage.
     /// @dev Band ticks need only this event's `openingLevel`, {Graduated}'s `graduationLevel`, and the
     /// template — which is immutable and published — so the ladder is recomputable from logs alone.
+    /// The metadata triple is what a token page needs before it can render: name, symbol, and the
+    /// off-chain URI the token contract stores as {MilestoneToken.tokenURI}.
     event Launched(
         PoolId indexed poolId,
         address indexed creator,
         address indexed token,
+        string name,
+        string symbol,
+        string uri,
         uint256 totalSupply,
         int24 openingLevel,
         int24 farLevel,
@@ -211,7 +241,10 @@ abstract contract MilestoneBase is ImmutableState {
     );
 
     event PayoutPotRedeemed(PoolId indexed poolId, uint256 amount);
-    event PayoutTipPaid(PoolId indexed poolId, address indexed flusher, uint256 amount);
+
+    /// @notice Emitted when a flush pays the 1% tip. The recipient is the immediate caller for
+    /// {MilestonePayoutPaths.flush} or the caller-directed recipient for {MilestonePayoutPaths.flushTo}.
+    event PayoutTipPaid(PoolId indexed poolId, address indexed recipient, uint256 amount);
     event PluginPayoutDelivered(
         PoolId indexed poolId,
         uint8 indexed pluginIndex,
@@ -239,7 +272,9 @@ abstract contract MilestoneBase is ImmutableState {
     event CreatorPathClaimed(PoolId indexed poolId, address indexed holder, uint256 amount);
     event CreatorPathClaimFailed(PoolId indexed poolId, address indexed holder, uint256 amount);
 
-    /// @notice Emitted when a pool graduates, recording the split and the seeded position.
+    /// @notice Emitted when a pool graduates, recording the split and the seeded positions.
+    /// @dev Both seeded positions' liquidity rides the event so an indexer observes the pool's post-grad
+    /// depth without a state read; their bounds are derived constants.
     event Graduated(
         PoolId indexed poolId,
         int24 graduationLevel,
@@ -247,7 +282,8 @@ abstract contract MilestoneBase is ImmutableState {
         uint256 lpSeedQuote,
         uint256 creatorQuote,
         uint256 protocolQuote,
-        uint128 fullRangeLiquidity
+        uint128 fullRangeLiquidity,
+        uint128 wallLiquidity
     );
 
     /// @notice Emitted when bonding curve positions are minted just in time ahead of a swap.
@@ -312,6 +348,7 @@ abstract contract MilestoneBase is ImmutableState {
     error NotAContract(address target);
     error NotRevenueNftHolder(PoolId poolId, address caller);
     error NotProtocolRecipient(address caller);
+    error UnauthorizedLaunchSigner(address recovered);
     error EthTransferFailed(address to, uint256 amount);
     error NotPoolManagerUnlock();
     error UnknownUnlockAction();
@@ -324,6 +361,7 @@ abstract contract MilestoneBase is ImmutableState {
     error NotCreator(PoolId poolId, address caller);
     error NotInBondingCurvePhase(PoolId poolId, Phase phase);
     error FarLevelNotReached(int24 currentLevel, int24 farLevel);
+    error FarTickOutsideFullRange(int24 farTick, int24 lower, int24 upper);
     error InvalidTemplate();
     error Insolvent(uint256 backing, uint256 liabilities);
     error ClaimBackingInsolvent(uint256 backing, uint256 liabilities);
@@ -371,6 +409,7 @@ abstract contract MilestoneBase is ImmutableState {
         if (
             template_.openingFdvWei == 0 || template_.curvePositions == 0 || template_.curvePositions > 32
                 || template_.curveSpanLevels <= 0 || template_.coreBandCount == 0 || template_.bandLevelSpacing <= 0
+                || template_.bandFirstStepLevels < template_.bandLevelSpacing || template_.bandStepDecayLevels <= 0
                 || template_.bandWidthLevels <= 0 || template_.bandWidthLevels >= template_.bandLevelSpacing
                 || template_.bandInventoryCapMultiple == 0 || template_.maxDeploysPerSwap == 0
                 || template_.maxHarvestsPerSwap == 0 || template_.tradingFeeHundredthsBip != 10_000
@@ -384,6 +423,8 @@ abstract contract MilestoneBase is ImmutableState {
         curvePositions = template_.curvePositions;
         curveSpanLevels = template_.curveSpanLevels;
         bandLevelSpacing = template_.bandLevelSpacing;
+        bandFirstStepLevels = template_.bandFirstStepLevels;
+        bandStepDecayLevels = template_.bandStepDecayLevels;
         bandWidthLevels = template_.bandWidthLevels;
         coreBandCount = template_.coreBandCount;
         maxFeeFundedBands = template_.maxFeeFundedBands;
@@ -399,9 +440,9 @@ abstract contract MilestoneBase is ImmutableState {
         maxHarvestsPerSwap = template_.maxHarvestsPerSwap;
 
         _economicConfig = EconomicConfig({
-            harvestServiceFeeWad: 0.1e18,
-            quoteCreatorShareWad: 0.75e18,
-            tokenMilestoneFundShareWad: 0.2e18,
+            harvestServiceFeeWad: Bounds.DEFAULT_HARVEST_SERVICE_FEE_WAD,
+            quoteCreatorShareWad: Bounds.DEFAULT_QUOTE_CREATOR_SHARE_WAD,
+            tokenMilestoneFundShareWad: Bounds.DEFAULT_TOKEN_MILESTONE_FUND_SHARE_WAD,
             version: 1
         });
 
@@ -639,48 +680,47 @@ abstract contract MilestoneBase is ImmutableState {
     {
         PoolState storage state = _pools[poolId];
 
-        uint16 positions = curvePositions;
-        int24 opening = state.openingLevel;
-        int24 far = state.farLevel;
-        uint256 curveSupply = FullMath.mulDiv(state.totalSupply, curveSupplyShareWad, WAD);
+        // no-via_ir stack limit: the geometry travels as one memory struct, four locals collapsed into one.
+        CurveGeometry memory g = CurveGeometry({
+            positions: curvePositions,
+            opening: state.openingLevel,
+            far: state.farLevel,
+            curveSupply: FullMath.mulDiv(state.totalSupply, curveSupplyShareWad, WAD)
+        });
 
-        (uint160 sqrtPriceX96, int24 tick,,) = poolManager.getSlot0(poolId);
-        uint256 index = CurveLib.firstPositionAbove(opening, far, positions, Orientation.toLevel(tick));
-        if (index >= positions) return;
-
-        uint32 deployedBits = state.curveDeployed;
+        LadderLib.Walk memory walk;
+        uint256 index;
+        {
+            (uint160 sqrtPriceX96, int24 tick,,) = poolManager.getSlot0(poolId);
+            walk = LadderLib.Walk({
+                sqrtPriceX96: sqrtPriceX96,
+                amountRemaining: amountSpecified,
+                sqrtPriceLimitX96: sqrtPriceLimitX96,
+                feePips: tradingFeeHundredthsBip
+            });
+            index = CurveLib.firstPositionAbove(g.opening, g.far, g.positions, Orientation.toLevel(tick));
+        }
+        if (index >= g.positions) return;
 
         // In-range liquidity: every deployed position whose start sits at or below spot. Positions are
-        // nested, so this is a prefix sum rather than a search.
-        uint128 liquidity;
-        for (uint256 i = 0; i < index; i++) {
-            if (deployedBits & (uint32(1) << uint8(i)) != 0) {
-                liquidity += CurveLib.positionLiquidity(opening, far, positions, curveSupply, i);
-            }
-        }
-
-        LadderLib.Walk memory walk = LadderLib.Walk({
-            sqrtPriceX96: sqrtPriceX96,
-            amountRemaining: amountSpecified,
-            sqrtPriceLimitX96: sqrtPriceLimitX96,
-            feePips: tradingFeeHundredthsBip
-        });
+        // nested, so this is a prefix sum rather than a search. Its loop lives in its own frame.
+        uint128 liquidity = _deployedCurveLiquidityBelow(state, g, index);
 
         uint256 minted;
         uint256 owed;
 
-        for (; index < positions; index++) {
-            int24 start = CurveLib.positionStart(opening, far, positions, index);
-            if (start >= far) break;
+        for (; index < g.positions; index++) {
+            int24 start = CurveLib.positionStart(g.opening, g.far, g.positions, index);
+            if (start >= g.far) break;
             // The swap's budget or its price limit stops it below this position's start, so nothing at
             // or above it will be touched.
             if (!LadderLib.advance(walk, LadderLib.sqrtPriceAtLevel(start), liquidity)) break;
 
-            uint128 positionLiquidity = CurveLib.positionLiquidity(opening, far, positions, curveSupply, index);
+            uint128 positionLiquidity = CurveLib.positionLiquidity(g.opening, g.far, g.positions, g.curveSupply, index);
 
-            if (deployedBits & (uint32(1) << uint8(index)) == 0 && positionLiquidity != 0) {
-                owed += _mintCurvePosition(key, start, far, index, positionLiquidity);
-                deployedBits |= (uint32(1) << uint8(index));
+            if (state.curveDeployed & (uint32(1) << uint8(index)) == 0 && positionLiquidity != 0) {
+                owed += _mintCurvePosition(key, start, g.far, index, positionLiquidity);
+                state.curveDeployed |= uint32(1) << uint8(index);
                 minted += 1;
             }
 
@@ -691,10 +731,23 @@ abstract contract MilestoneBase is ImmutableState {
 
         if (minted == 0) return;
 
-        state.curveDeployed = deployedBits;
         _settleCurrency(key.currency1, owed);
 
-        emit CurvePositionsDeployed(poolId, minted, deployedBits, owed);
+        emit CurvePositionsDeployed(poolId, minted, state.curveDeployed, owed);
+    }
+
+    /// @dev no-via_ir stack limit: the prefix sum of deployed curve liquidity at or below `index`, in its
+    /// own frame.
+    function _deployedCurveLiquidityBelow(PoolState storage state, CurveGeometry memory g, uint256 index)
+        private
+        view
+        returns (uint128 liquidity)
+    {
+        for (uint256 i = 0; i < index; i++) {
+            if (state.curveDeployed & (uint32(1) << uint8(i)) != 0) {
+                liquidity += CurveLib.positionLiquidity(g.opening, g.far, g.positions, g.curveSupply, i);
+            }
+        }
     }
 
     /// @dev Mints one curve position and reports the token it owes, for the caller to settle in one go.

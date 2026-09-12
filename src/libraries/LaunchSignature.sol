@@ -39,7 +39,7 @@ library LaunchSignature {
     bytes32 private constant _DOMAIN_VERSION_HASH = keccak256("1");
 
     bytes32 private constant _LAUNCH_CONFIG_TYPEHASH = keccak256(
-        "LaunchConfig(address creator,string name,string symbol,uint256 totalSupply,uint64 devBuyShareWad,uint256 payoutPlan,uint256 deadline)"
+        "LaunchConfig(address creator,string name,string symbol,string uri,uint256 totalSupply,uint64 devBuyShareWad,uint256 payoutPlan,uint256 deadline)"
     );
 
     /// @notice Thrown when a relayed launch arrives after its signature's deadline.
@@ -82,6 +82,7 @@ library LaunchSignature {
                 config.creator,
                 keccak256(bytes(config.name)),
                 keccak256(bytes(config.symbol)),
+                keccak256(bytes(config.uri)),
                 config.totalSupply,
                 config.devBuyShareWad,
                 config.payoutPlan
@@ -97,6 +98,7 @@ library LaunchSignature {
                 config.creator,
                 keccak256(bytes(config.name)),
                 keccak256(bytes(config.symbol)),
+                keccak256(bytes(config.uri)),
                 config.totalSupply,
                 config.devBuyShareWad,
                 config.payoutPlan,
@@ -110,18 +112,14 @@ library LaunchSignature {
         return keccak256(abi.encodePacked(hex"1901", domainSeparator(verifyingContract), structHash(config)));
     }
 
-    /// @notice Verifies a signed configuration against its declared creator, enforcing the deadline.
+    /// @notice Verifies a signed configuration's freshness and returns its recovered signer.
     ///
-    /// @dev Returns `config.creator` rather than the recovered address, because the two are asserted
-    /// equal. That assertion is what makes "a relayer cannot alter the configuration" a *revert* rather
-    /// than a misattribution. With an inferred creator, editing a field would change {structHash}, yield
-    /// some unrelated address, and launch a perfectly valid token credited to that address — the edit
-    /// would succeed, silently, against a creator who never agreed to it. Comparing against a declared
-    /// field turns every such edit into `CreatorMismatch`.
-    ///
-    /// `ECDSA.recover` rejects malleable and malformed signatures by reverting, so a bad signature cannot
-    /// silently resolve to some unrelated address either.
-    function recoverCreator(LaunchConfig memory config, bytes memory signature, address verifyingContract)
+    /// @dev The caller decides what the signer is authorized to do — the launch path compares it
+    /// against the on-chain trusted operator, since the operator is the protocol's launch authority.
+    /// The declared creator is *not* proven by the signature under the operator model; it is data the
+    /// operator vouches for. `ECDSA.recover` rejects malleable and malformed signatures by reverting,
+    /// so a bad signature cannot silently resolve to some unrelated address either.
+    function recoverSigner(LaunchConfig memory config, bytes memory signature, address verifyingContract)
         internal
         view
         returns (address)
@@ -130,8 +128,6 @@ library LaunchSignature {
 
         address signer = ECDSA.recover(digest(config, verifyingContract), signature);
         if (signer == address(0)) revert InvalidSignature();
-        if (signer != config.creator) revert CreatorMismatch(config.creator, signer);
-
         return signer;
     }
 

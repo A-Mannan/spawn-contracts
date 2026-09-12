@@ -20,11 +20,13 @@ import {Orientation} from "./Orientation.sol";
 ///
 /// - **Any observer can compute the ladder** from the protocol template plus the graduation level, with
 ///   no protocol state and no privileged read.
-/// - **Uniform level spacing is geometric in market cap.** Level is `-tick` and price is `1.0001^tick`,
-///   so a constant level step is a constant price *ratio*: 2235 levels is `1.0001^2235 ~= 1.2504x`, and
-///   every band is the same multiple above the one below it.
-/// - **One geometry applies to every band and every launch**, because the spacing and width are
-///   template immutables rather than per-launch fields (design Decision 16).
+/// - **The schedule decays from a wide first step to a constant-ratio floor.** Level is `-tick` and
+///   price is `1.0001^tick`, so a constant level step is a constant price *ratio*: the first band sits
+///   a 2x multiple above graduation, each following step shrinks by a fixed number of levels, and from
+///   the twelfth step on every band is the floor spacing's `1.0001^2235 ~= 1.2504x` above the one below
+///   it. Early milestones are spaced for reachability; later ones for steady ratio.
+/// - **One geometry applies to every band and every launch**, because the schedule is template
+///   immutables rather than per-launch fields (design Decision 16).
 ///
 /// The first band starts one full step *above* graduation rather than at it, so graduating does not
 /// instantly fill a milestone. Fee-funded bands (index `>= coreBandCount`) continue the same formula,
@@ -75,26 +77,57 @@ library LadderLib {
 
     /// @notice Level bounds of band `index`.
     ///
-    /// @dev Returns `exists == false` instead of reverting when the band would run past the top of tick
+    /// @dev The ladder's steps are not uniform: band `i+1` starts
+    /// `max(levelSpacing, firstStepLevels - stepDecayLevels*i)` levels above band `i`, so early
+    /// milestones sit at wide market-cap multiples (the first step is a 2x) and later ones settle at the
+    /// floor spacing's constant ratio. The cumulative offset has a closed form. With
+    /// `k = (firstStepLevels - levelSpacing) / stepDecayLevels` (floor division) the first `k + 1` steps
+    /// are still at or above the floor, so for `m <= k + 1` bands the offset is
+    /// `firstStepLevels*m - stepDecayLevels*m*(m-1)/2`, and beyond it the offset grows at the constant
+    /// floor spacing. Both branches agree at the seam, so the schedule is continuous.
+    ///
+    /// Returns `exists == false` instead of reverting when the band would run past the top of tick
     /// space. That case is reachable — the fee-funded extension can address a level above
     /// `Orientation.MAX_LEVEL` — and it is evaluated inside `beforeSwap`, so the only acceptable outcome
     /// is "the ladder ends here", not a reverted swap.
     ///
     /// Arithmetic runs in `int256`: `index` is bounded only by the extension cap, so the product leaves
     /// `int24` long before it leaves `int256`.
-    function bandLevels(int24 graduationLevel, int24 levelSpacing, int24 widthLevels, uint256 index)
-        internal
-        pure
-        returns (int24 levelLower, int24 levelUpper, bool exists)
-    {
-        int256 lower = int256(graduationLevel) + (int256(index) + 1) * int256(levelSpacing);
+    function bandLevels(
+        int24 graduationLevel,
+        int24 firstStepLevels,
+        int24 stepDecayLevels,
+        int24 levelSpacing,
+        int24 widthLevels,
+        uint256 index
+    ) internal pure returns (int24 levelLower, int24 levelUpper, bool exists) {
+        int256 m = int256(index) + 1;
+
+        // no-via_ir stack limit: the offset's closed form, in its own frame.
+        int256 lower = int256(graduationLevel) + _cumulativeOffset(firstStepLevels, stepDecayLevels, levelSpacing, m);
         int256 upper = lower + int256(widthLevels);
 
-        // Only the top needs checking: the spacing and width are both positive template values, so
+        // Only the top needs checking: the steps and width are all positive template values, so
         // `lower > graduationLevel >= Orientation.MIN_LEVEL` and `upper > lower`.
         if (upper > int256(Orientation.MAX_LEVEL)) return (0, 0, false);
 
         return (int24(lower), int24(upper), true);
+    }
+
+    /// @dev no-via_ir stack limit: the cumulative level offset through `m` schedule steps, in its own
+    /// frame. See {bandLevels} for the closed form.
+    function _cumulativeOffset(int24 firstStepLevels, int24 stepDecayLevels, int24 levelSpacing, int256 m)
+        private
+        pure
+        returns (int256 offset)
+    {
+        int256 k = (int256(firstStepLevels) - int256(levelSpacing)) / int256(stepDecayLevels);
+
+        if (m <= k + 1) {
+            return int256(firstStepLevels) * m - (int256(stepDecayLevels) * m * (m - 1)) / 2;
+        }
+        return int256(firstStepLevels) * (k + 1) - (int256(stepDecayLevels) * k * (k + 1)) / 2
+            + (m - k - 1) * int256(levelSpacing);
     }
 
     /// @notice The token inventory each of the `coreBandCount` core bands is entitled to.

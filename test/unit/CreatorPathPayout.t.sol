@@ -19,7 +19,7 @@ contract CreatorPathPayoutTest is PayoutTestFixture {
         _fundPot(poolId, 0, 100 ether);
         uint256 creatorBefore = creator.balance;
         vm.prank(STRANGER);
-        hook.flush(poolId);
+        hook.flushTo(poolId, STRANGER);
         assertEq(creator.balance, creatorBefore);
         assertEq(hook.creatorPathClaimable(poolId), 89.1 ether);
     }
@@ -27,7 +27,7 @@ contract CreatorPathPayoutTest is PayoutTestFixture {
     // --- Scenario: Creator value follows NFT ownership ---
     function test_creatorValueFollowsNftOwnership() public {
         _fundPot(poolId, 0, 100 ether);
-        hook.flush(poolId);
+        hook.flushTo(poolId, STRANGER);
         uint256 tokenId = nft.tokenIdOf(poolId);
         vm.prank(creator);
         nft.transferFrom(creator, STRANGER, tokenId);
@@ -46,7 +46,7 @@ contract CreatorPathPayoutTest is PayoutTestFixture {
     function test_creatorPathAndDirectLedgersRemainSeparate() public {
         payoutHook.accrueDirectCreator{value: 3 ether}(poolId, 3 ether);
         _fundPot(poolId, 0, 100 ether);
-        hook.flush(poolId);
+        hook.flushTo(poolId, STRANGER);
         assertEq(hook.creatorClaimable(poolId), 3 ether);
         assertEq(hook.creatorPathClaimable(poolId), 89.1 ether);
     }
@@ -96,6 +96,61 @@ contract CreatorPathPayoutTest is PayoutTestFixture {
         assertEq(plugin.totalReceived(), 0);
     }
 
+    // --- Scenario: A creator batch pays every pool's complete entitlement ---
+    function test_aCreatorBatchPaysEveryPoolsCompleteEntitlement() public {
+        _fundPot(poolId, 0, 100 ether);
+        (PoolId idB,,) = _launchWithPlan("Batch Two", "BT2", 0);
+        _fundPot(idB, 0, 60 ether);
+        uint256 before = creator.balance;
+
+        PoolId[] memory pools = new PoolId[](2);
+        pools[0] = poolId;
+        pools[1] = idB;
+        vm.prank(creator);
+        (bool[] memory successes, uint256[] memory attempted) = hook.claimCreatorPathBatch(pools);
+
+        assertTrue(successes[0], "pool one failed");
+        assertTrue(successes[1], "pool two failed");
+        // Each pool attempts its post-tip entitlement plus its retained self-flush tip.
+        assertEq(attempted[0], 90 ether, "pool one attempted amount wrong");
+        assertEq(attempted[1], 54 ether, "pool two attempted amount wrong");
+        assertEq(creator.balance - before, 144 ether, "the holder was not paid every pool in full");
+        assertEq(hook.creatorPathClaimable(poolId), 0, "ledger one not emptied");
+        assertEq(hook.creatorPathClaimable(idB), 0, "ledger two not emptied");
+        assertEq(hook.payoutPot(poolId), 0, "pot one survived the batch");
+        assertEq(hook.payoutPot(idB), 0, "pot two survived the batch");
+    }
+
+    // --- Scenario: Creator batch reverts on ownership change ---
+    function test_creatorBatchRevertsOnOwnershipChange() public {
+        OwnershipChangingPayoutPlugin plugin = new OwnershipChangingPayoutPlugin();
+        uint8 index = _registerPayoutPlugin(address(plugin), 0.5e18);
+        (PoolId idA,,) = _launchWithPlan("Move A", "MVA", _plan(index));
+        (PoolId idB,,) = _launchWithPlan("Move B", "MVB", 0);
+
+        // The caller holds both NFTs; pool A's plugin is approved to move pool A's token mid-delivery.
+        uint256 tokenIdA = nft.tokenIdOf(idA);
+        vm.prank(creator);
+        nft.approve(address(plugin), tokenIdA);
+        plugin.configureOwnershipChangeFrom(IRevenueTransfer(address(nft)), tokenIdA, creator, STRANGER);
+
+        _fundPot(idA, 0, 100 ether);
+        _fundPot(idB, 0, 100 ether);
+
+        PoolId[] memory pools = new PoolId[](2);
+        pools[0] = idA;
+        pools[1] = idB;
+        vm.expectRevert(abi.encodeWithSelector(MilestoneBase.RevenueNftOwnerChanged.selector, idA, creator, STRANGER));
+        vm.prank(creator);
+        hook.claimCreatorPathBatch(pools);
+
+        // The complete batch rolled back: both pots intact, the plugin's delivery undone.
+        assertEq(hook.payoutPot(idA), 90 ether, "pool A's pot did not restore");
+        assertEq(hook.payoutPot(idB), 90 ether, "pool B's pot did not restore");
+        assertEq(nft.ownerOf(tokenIdA), creator, "the ownership change survived the revert");
+        assertEq(plugin.totalReceived(), 0, "the plugin's delivery survived the revert");
+    }
+
     // --- Scenario: Failed recipient transfer preserves entitlement ---
     function test_failedRecipientTransferPreservesEntitlement() public {
         RejectingRevenueHolder holder = new RejectingRevenueHolder();
@@ -135,7 +190,7 @@ contract DirectAndPathLedgerSeparationTest is PayoutTestFixture {
 
         plugin.setShouldRevert(true);
         _fundPot(id, 0, 100 ether);
-        hook.flush(id);
+        hook.flushTo(id, STRANGER);
         uint256 carry = hook.pluginCarry(id, index);
         assertEq(carry, DISTRIBUTABLE / 2, "the failed delivery is sitting in carry");
 
@@ -171,7 +226,7 @@ contract DirectAndPathLedgerSeparationTest is PayoutTestFixture {
         _fundPot(id, 0, 100 ether);
         assertEq(hook.creatorClaimable(id), 0, "harvest accounting credits no direct revenue");
 
-        hook.flush(id);
+        hook.flushTo(id, STRANGER);
         assertEq(hook.creatorClaimable(id), 0, "and neither does the flush");
         assertEq(hook.creatorPathClaimable(id), DISTRIBUTABLE / 2, "the whole remainder went to the path");
 
@@ -185,7 +240,7 @@ contract DirectAndPathLedgerSeparationTest is PayoutTestFixture {
     /// incoming holder is paid the entitlement recorded before the transfer rather than some share of it.
     function test_newHolderReceivesUnpaidCreatorPathValue() public {
         _fundPot(poolId, 0, 100 ether);
-        hook.flush(poolId);
+        hook.flushTo(poolId, STRANGER);
         uint256 unpaid = hook.creatorPathClaimable(poolId);
         assertEq(unpaid, DISTRIBUTABLE, "there is unpaid creator-path value to carry across");
 
@@ -223,7 +278,7 @@ contract DirectAndPathLedgerSeparationTest is PayoutTestFixture {
         first.setShouldRevert(true);
         second.setShouldRevert(true);
         _fundPot(id, 0, 100 ether);
-        hook.flush(id);
+        hook.flushTo(id, STRANGER);
 
         assertEq(first.calls(), 0, "neither plugin accepted delivery");
         assertEq(second.calls(), 0, "neither plugin accepted delivery");
@@ -252,7 +307,7 @@ contract DirectAndPathLedgerSeparationTest is PayoutTestFixture {
 
         payoutHook.accrueDirectCreator{value: 2 ether}(id, 2 ether);
         _fundPot(id, 0, 100 ether);
-        hook.flush(id);
+        hook.flushTo(id, STRANGER);
 
         assertEq(plugin.totalReceived(), DISTRIBUTABLE / 2, "the plugin took its half");
         assertEq(hook.creatorPathClaimable(id), DISTRIBUTABLE / 2, "the remainder is creator-path entitlement");

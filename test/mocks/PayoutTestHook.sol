@@ -22,8 +22,9 @@ contract PayoutTestHook is MilestoneHook {
         address coldPaths,
         address payoutPaths,
         address controller,
-        address recipient
-    ) MilestoneHook(manager, nft, support, template, coldPaths, payoutPaths, controller, recipient) {}
+        address recipient,
+        address trustedOperator
+    ) MilestoneHook(manager, nft, support, template, coldPaths, payoutPaths, controller, recipient, trustedOperator) {}
 
     function fundPayoutPot(PoolId poolId, uint32 milestoneIndex, uint256 grossQuote) external payable {
         require(msg.value == grossQuote, "value");

@@ -44,7 +44,7 @@ contract BuybackPluginTest is Test {
     function setUp() public {
         manager = new MockPoolManager();
         hook = new MockPayoutHook();
-        token = new MilestoneToken("Launch", "LCH", 1_000_000 ether, address(this));
+        token = new MilestoneToken("Launch", "LCH", "", 1_000_000 ether, address(this));
 
         key = PoolKey({
             currency0: Currency.wrap(address(0)),
@@ -162,7 +162,7 @@ contract BuybackCarryTest is PayoutTestFixture {
         _fundPot(id, 0, 100 ether);
         uint256 distributable = 90 ether - 0.9 ether;
         uint256 attempted = (distributable * CANONICAL_BUYBACK_TAKE_WAD) / 1e18;
-        hook.flush(id);
+        hook.flushTo(id, STRANGER);
 
         assertEq(hook.pluginCarry(id, index), attempted, "complete buyback share carried");
         assertEq(hook.carryBitmap(id), uint256(1) << index, "carry index remains pending");

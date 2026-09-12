@@ -99,9 +99,9 @@ contract MilestoneFundDiversionTest is LadderFundFixture {
     /// fees for the clamp to be the binding constraint rather than the share.
     uint256 internal constant FREE_CAPACITY = 1_000;
 
-    // --- Scenario: Default token routing funds 20 and burns 80 ---
+    // --- Scenario: Default token routing funds the whole token fee while capacity remains ---
 
-    function test_defaultTokenRoutingFunds20AndBurns80() public {
+    function test_defaultTokenRoutingFundsTheWholeTokenFee() public {
         assertEq(hook.poolState(poolId).milestoneFundAccrued, 0, "nothing accrued yet");
 
         _sell(MEASURED_SELL);
@@ -109,10 +109,10 @@ contract MilestoneFundDiversionTest is LadderFundFixture {
         Collected memory c = _collectAndCapture();
 
         uint64 share = hook.economicConfig().tokenMilestoneFundShareWad;
-        assertEq(share, 0.2e18, "the active global share is 20%");
+        assertEq(share, 1e18, "the active global share is 100%");
         assertGt(c.tokenFees, 0, "the sell paid in token");
         assertEq(c.diverted, (c.tokenFees * share) / WAD, "the active share was diverted");
-        assertEq(c.tokensBurned, c.tokenFees - c.diverted, "the remaining 80% was burned");
+        assertEq(c.tokensBurned, c.tokenFees - c.diverted, "so nothing burned while capacity remains");
         assertEq(supplyBefore - token.totalSupply(), c.tokensBurned, "supply fell by exactly the burned amount");
         assertEq(hook.poolState(poolId).milestoneFundAccrued, c.diverted, "and is held for the next band");
     }
@@ -158,8 +158,8 @@ contract MilestoneFundDiversionTest is LadderFundFixture {
 
         assertGt(c.quoteFees, 0, "both sides accrued");
         assertGt(c.tokenFees, 0, "both sides accrued");
-        assertEq(c.diverted, (c.tokenFees * 2) / 10, "20% of the token side");
-        assertLt(c.diverted, (c.tokenFees * 2) / 10 + (c.quoteFees * 2) / 10, "and not a wei of the quote side");
+        assertEq(c.diverted, c.tokenFees, "the whole token side");
+        assertLt(c.diverted, c.tokenFees + c.quoteFees, "and not a wei of the quote side");
         assertEq(c.creatorQuote + c.protocolQuote, c.quoteFees, "quote routed in full");
     }
 
@@ -180,7 +180,7 @@ contract MilestoneFundDiversionTest is LadderFundFixture {
         assertEq(_countLogs(logs, IPoolManager.Swap.selector), 0, "no swap was performed");
         assertEq(_sqrtPriceOf(poolId), priceBefore, "and the price did not move");
         assertEq(_level(), levelBefore, "at all");
-        assertGt(supplyBefore - token.totalSupply(), 0, "the routed remainder burned during collection");
+        assertEq(supplyBefore - token.totalSupply(), 0, "nothing burned while the fund has capacity");
         assertGt(hook.poolState(poolId).milestoneFundAccrued, 0, "yet the fund accrued");
     }
 
@@ -274,16 +274,15 @@ contract MilestoneFundDiversionTest is LadderFundFixture {
 ///
 /// @dev The parked version of this suite launched with a deliberately tiny ladder share, so that fee-derived
 /// accrual was a large multiple of one band rather than a rounding error against it. Design Decision 16
-/// moved those shares into the immutable template, so that lever is gone: at the shipped template a band is
-/// 21,666,666 tokens while a 1% fee on the largest sell the pool can absorb diverts a few hundred thousand,
-/// which puts the cap thousands of collections away.
+/// moved those shares into the immutable template, so that lever is gone.
 ///
 /// The cap is still reachable, just from the other funding source. A band's inventory is its own share plus
 /// *carried* inventory plus the accrued fund, and a skipped band carries a whole share — so two bands
 /// stranded above spot put three shares in front of the band that deploys next, and the cap bites. That is
 /// the driver these tests use, and it exercises exactly the same {LadderLib.sizeInventory} branch the
 /// parked accrual-driven version did. The accrual path keeps the first test, where its scale is enough to
-/// show up.
+/// show up. At the shipped template a band is 4,545,454 tokens and a 1% fee on the largest sell the pool
+/// can absorb diverts well under one.
 contract BandInventorySizingTest is LadderFundFixture {
     /// @notice The whole ladder allocation, the pool every band's share is drawn from.
     function _ladderSupply() internal view returns (uint256) {

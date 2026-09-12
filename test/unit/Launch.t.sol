@@ -36,7 +36,9 @@ contract LaunchTest is LaunchpadTest {
 
     function _freshConfig() internal returns (LaunchConfig memory) {
         nonce += 1;
-        return _defaultConfig(string.concat("Launch ", vm.toString(nonce)), "LNCH");
+        LaunchConfig memory config = _defaultConfig(string.concat("Launch ", vm.toString(nonce)), "LNCH");
+        config.uri = string.concat("https://example.test/", vm.toString(nonce), ".json");
+        return config;
     }
 
     // --- Launch mechanics with no scenario of their own ---
@@ -152,7 +154,7 @@ contract LaunchTest is LaunchpadTest {
     }
 
     function test_forgedPoolOnAFreshTokenIsRejected() public {
-        MilestoneToken rogue = new MilestoneToken("Rogue", "RGE", 1 ether, address(this));
+        MilestoneToken rogue = new MilestoneToken("Rogue", "RGE", "", 1 ether, address(this));
 
         PoolKey memory forged = PoolKey({
             currency0: CurrencyLibrary.ADDRESS_ZERO,
@@ -233,28 +235,29 @@ contract LaunchTest is LaunchpadTest {
         );
 
         Vm.Log memory launched = logs[_firstLogAt(logs, MilestoneBase.Launched.selector)];
-        (uint256 totalSupply, int24 openingLevel, int24 farLevel,) =
-            abi.decode(launched.data, (uint256, int24, int24, bytes32));
+        (
+            string memory name,
+            string memory symbol,
+            string memory uri,
+            uint256 totalSupply,
+            int24 openingLevel,
+            int24 farLevel,
+            bytes32 configHash
+        ) = abi.decode(launched.data, (string, string, string, uint256, int24, int24, bytes32));
 
         assertEq(totalSupply, SUPPLY, "supply is in the log");
+        assertTrue(bytes(name).length != 0, "name is in the log");
+        assertTrue(bytes(symbol).length != 0, "symbol is in the log");
         assertLt(openingLevel, farLevel, "the curve spans upward in level space");
         assertEq(farLevel - openingLevel, template.curveSpanLevels, "and spans the template's curve");
 
-        // Everything from here uses only `farLevel` and the template.
-        for (uint256 i = 0; i < template.coreBandCount; i++) {
-            (int24 lower, int24 upper, bool exists) =
-                LadderLib.bandLevels(farLevel, template.bandLevelSpacing, template.bandWidthLevels, i);
-            (int24 hookLower, int24 hookUpper, bool hookExists) = hook.bandLevels(id, i);
-
-            assertTrue(exists, "the observer computes a band");
-            assertEq(hookExists, exists, "existence agrees");
-            assertEq(hookLower, lower, "lower level agrees");
-            assertEq(hookUpper, upper, "upper level agrees");
-        }
+        // Everything from here uses only `farLevel` and the template. no-via_ir stack limit: the loop
+        // lives in its own frame.
+        _assertObserverBandAgreement(id, farLevel);
 
         // The first rung clears the graduation level by a full spacing, so no band overlaps the curve.
         (int24 firstLower,,) = hook.bandLevels(id, 0);
-        assertEq(firstLower, farLevel + template.bandLevelSpacing, "band 0 sits one rung above graduation");
+        assertEq(firstLower, farLevel + template.bandFirstStepLevels, "band 0 sits one rung above graduation");
     }
 
     /// @dev Decodes the log rather than using `expectEmit`, so the pool id, creator, and token in the
@@ -271,13 +274,43 @@ contract LaunchTest is LaunchpadTest {
         assertEq(address(uint160(uint256(launched.topics[2]))), config.creator, "creator topic");
         assertEq(address(uint160(uint256(launched.topics[3]))), address(t), "token topic");
 
-        (uint256 totalSupply, int24 openingLevel, int24 farLevel, bytes32 configHash) =
-            abi.decode(launched.data, (uint256, int24, int24, bytes32));
+        (
+            string memory name,
+            string memory symbol,
+            string memory uri,
+            uint256 totalSupply,
+            int24 openingLevel,
+            int24 farLevel,
+            bytes32 configHash
+        ) = abi.decode(launched.data, (string, string, string, uint256, int24, int24, bytes32));
 
+        assertEq(name, config.name, "name");
+        assertEq(symbol, config.symbol, "symbol");
+        assertEq(uri, config.uri, "uri");
         assertEq(totalSupply, config.totalSupply, "supply");
         assertEq(openingLevel, hook.poolState(id).openingLevel, "opening level");
         assertEq(farLevel, hook.poolState(id).farLevel, "far level");
         assertEq(farLevel, hook.poolState(id).graduationLevel, "graduation level starts at far");
         assertTrue(configHash != bytes32(0), "the signed configuration is identified");
+    }
+
+    /// @dev no-via_ir stack limit: the observer-vs-geometry comparison, in its own frame.
+    function _assertObserverBandAgreement(PoolId id, int24 farLevel) internal view {
+        for (uint256 i = 0; i < template.coreBandCount; i++) {
+            (int24 lower, int24 upper, bool exists) = LadderLib.bandLevels(
+                farLevel,
+                template.bandFirstStepLevels,
+                template.bandStepDecayLevels,
+                template.bandLevelSpacing,
+                template.bandWidthLevels,
+                i
+            );
+            (int24 hookLower, int24 hookUpper, bool hookExists) = hook.bandLevels(id, i);
+
+            assertTrue(exists, "the observer computes a band");
+            assertEq(hookExists, exists, "existence agrees");
+            assertEq(hookLower, lower, "lower level agrees");
+            assertEq(hookUpper, upper, "upper level agrees");
+        }
     }
 }

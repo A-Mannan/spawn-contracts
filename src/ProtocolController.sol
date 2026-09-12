@@ -9,13 +9,14 @@ import {IProtocolConfigurationTarget, IPayoutPluginRegistry} from "./interfaces/
 contract ProtocolController {
     uint64 public constant MAX_HARVEST_SERVICE_FEE_WAD = 0.2e18;
     uint64 public constant MAX_QUOTE_CREATOR_SHARE_WAD = 0.9e18;
-    uint64 public constant MAX_TOKEN_MILESTONE_FUND_SHARE_WAD = 0.5e18;
+    uint64 public constant MAX_TOKEN_MILESTONE_FUND_SHARE_WAD = 1e18;
 
     uint8 public constant ACTION_REGISTER_PLUGIN = 1;
     uint8 public constant ACTION_SET_PLUGIN_SUSPENDED = 2;
     uint8 public constant ACTION_SET_ECONOMIC_CONFIG = 3;
     uint8 public constant ACTION_SET_PROTOCOL_RECIPIENT = 4;
     uint8 public constant ACTION_SET_DELAY = 5;
+    uint8 public constant ACTION_SET_TRUSTED_OPERATOR = 6;
 
     IPayoutPluginRegistry public immutable registry;
     IProtocolConfigurationTarget public target;
@@ -43,6 +44,7 @@ contract ProtocolController {
     );
     event ProtocolRecipientUpdated(address indexed previousRecipient, address indexed recipient);
     event GovernanceDelayUpdated(uint64 previousDelay, uint64 newDelay);
+    event TrustedOperatorUpdated(address indexed previousOperator, address indexed operator);
 
     error NotAdministrator();
     error NotPendingAdministrator();
@@ -70,10 +72,12 @@ contract ProtocolController {
             target = IProtocolConfigurationTarget(target_);
             emit ProtocolTargetBound(target_);
         }
+        // The version-1 tuple the hook's own constructor installs; the deployment gate asserts the two
+        // agree, so a change here must be mirrored in Bounds' DEFAULT_ constants and vice versa.
         _economicConfig = EconomicConfig({
             harvestServiceFeeWad: 0.1e18,
             quoteCreatorShareWad: 0.75e18,
-            tokenMilestoneFundShareWad: 0.2e18,
+            tokenMilestoneFundShareWad: 1e18,
             version: 1
         });
     }
@@ -254,6 +258,29 @@ contract ProtocolController {
 
     function hashGovernanceDelay(uint64 newDelay, bytes32 salt) public view returns (bytes32) {
         return _operationId(ACTION_SET_DELAY, abi.encode(newDelay), salt);
+    }
+
+    function scheduleTrustedOperator(address operator, bytes32 salt)
+        external
+        onlyAdministrator
+        nonReentrantExecution
+        returns (bytes32 operationId)
+    {
+        operationId = hashTrustedOperator(operator, salt);
+        _schedule(operationId, ACTION_SET_TRUSTED_OPERATOR, salt);
+    }
+
+    function executeTrustedOperator(address operator, bytes32 salt) external nonReentrantExecution {
+        bytes32 operationId = hashTrustedOperator(operator, salt);
+        _consume(operationId);
+        address previous = _target().trustedOperator();
+        _target().setTrustedOperator(operator);
+        emit TrustedOperatorUpdated(previous, operator);
+        emit OperationExecuted(operationId);
+    }
+
+    function hashTrustedOperator(address operator, bytes32 salt) public view returns (bytes32) {
+        return _operationId(ACTION_SET_TRUSTED_OPERATOR, abi.encode(operator), salt);
     }
 
     function cancel(bytes32 operationId) external onlyAdministrator nonReentrantExecution {

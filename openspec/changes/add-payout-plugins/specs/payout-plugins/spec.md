@@ -157,7 +157,7 @@ Each pool SHALL have an isolated payout pot containing net milestone proceeds no
 - **THEN** the recipient's claim redeems exactly the protocol-backed subset and leaves every payout pot fully claim-backed
 
 ### Requirement: Permissionless whole-pot cold flush
-Any address SHALL be able to flush one pool. A flush SHALL remove the complete newly accrued pot from available accounting before external calls, redeem it exactly once in its own PoolManager unlock, and perform delivery outside all swap callbacks. The flusher tip SHALL equal the floor of 1% of the newly redeemed post-service-fee pot. An ordinary flush SHALL transfer that tip before plugin delivery and failure of that transfer SHALL revert the complete flush atomically. Plan takes SHALL apply to the remaining 99%. Previously failed carry SHALL be retried without another tip. The protocol SHALL expose no multi-pool batch-flush entry point.
+Any address SHALL be able to flush one pool. A flush SHALL remove the complete newly accrued pot from available accounting before external calls, redeem it exactly once — alone or together with other pools' pots in one shared PoolManager unlock — and perform delivery outside all swap callbacks. The flusher tip SHALL equal the floor of 1% of the newly redeemed post-service-fee pot. An ordinary flush SHALL transfer that tip before plugin delivery to the caller-provided tip recipient, and failure of that transfer SHALL revert the complete flush atomically. Plan takes SHALL apply to the remaining 99%. Previously failed carry SHALL be retried without another tip. A batch flush over many pools SHALL share one redemption unlock and one combined tip transfer to the batch's tip recipient, SHALL zero every pot before any delivery, SHALL attribute each pot's redemption and tip per pool, and SHALL be all-or-nothing: any pool's unrecoverable failure reverts the complete batch with every pool's accounting unchanged.
 
 #### Scenario: Any address can flush one pool
 - **WHEN** an arbitrary caller requests a flush for a valid pool
@@ -165,11 +165,23 @@ Any address SHALL be able to flush one pool. A flush SHALL remove the complete n
 
 #### Scenario: Whole new pot is redeemed once
 - **WHEN** a pool has newly accrued pot value
-- **THEN** one cold unlock redeems the complete new pot and the pot is zeroed before delivery
+- **THEN** the complete new pot is redeemed exactly once and the pot is zeroed before delivery
 
 #### Scenario: Flusher receives one percent of the net new pot
 - **WHEN** a new pot is flushed
-- **THEN** the immediate flusher receives floor(new pot times 1%) and plan allocations use the remainder
+- **THEN** the directed tip recipient receives floor(new pot times 1%) and plan allocations use the remainder
+
+#### Scenario: A batch redeems every pot in one unlock
+- **WHEN** a batch flushes several pools with accrued pots
+- **THEN** one shared unlock redeems the complete total and each pot is zeroed before delivery
+
+#### Scenario: Batch tips transfer once
+- **WHEN** a batch flushes several pools
+- **THEN** each pool's tip is attributed per pot and the combined tips reach the recipient in one transfer
+
+#### Scenario: A batch is all-or-nothing
+- **WHEN** any pool in a batch fails unrecoverably
+- **THEN** the complete batch reverts with every pool's pot, carry, liabilities, plugin state, events, and transfers unchanged
 
 #### Scenario: Protocol service fee is never tipped
 - **WHEN** a gross harvest is later flushed
@@ -188,7 +200,7 @@ Any address SHALL be able to flush one pool. A flush SHALL remove the complete n
 - **THEN** the call performs no unlock or value transfer
 
 #### Scenario: Ordinary flusher tip failure is atomic
-- **WHEN** an ordinary flush cannot transfer the 1% tip to its immediate caller
+- **WHEN** an ordinary flush cannot transfer the 1% tip to the directed recipient
 - **THEN** the complete flush reverts with pot, carry, liabilities, plugin state, events, and transfers unchanged
 
 #### Scenario: Ordinary swaps do not flush
@@ -239,7 +251,7 @@ A flush SHALL process selected destinations in ascending registry-index order. E
 - **THEN** tip, successful deliveries, creator value, redirects, and remaining carry equal all new pot and retried carry value
 
 ### Requirement: Creator payout entitlement
-The implicit mandatory creator sink SHALL receive every post-tip amount not allocated to active selected plugins, including rounding dust, suspended-plugin redirects, and codehash-mismatch redirects. The creator path SHALL credit a separate per-pool entitlement ledger without pushing ETH to the holder during an arbitrary flush. Entitlement SHALL belong to the current RevenueNFT owner and SHALL remain distinct from the hook's direct creator-revenue ledger. A creator-path claim SHALL authenticate the initiating owner, flush first, query RevenueNFT ownership again after every plugin interaction, and revert the complete call if ownership changed. It SHALL then attempt the complete entitlement including its self-flush tip. Failure of this final transfer SHALL NOT revert: the complete attempted amount SHALL be restored to creator-path entitlement and aggregate liability, an event SHALL identify pool, holder, attempted amount, and failure, and the call SHALL return explicit `(success, attemptedAmount)` observability.
+The implicit mandatory creator sink SHALL receive every post-tip amount not allocated to active selected plugins, including rounding dust, suspended-plugin redirects, and codehash-mismatch redirects. The creator path SHALL credit a separate per-pool entitlement ledger without pushing ETH to the holder during an arbitrary flush. Entitlement SHALL belong to the current RevenueNFT owner and SHALL remain distinct from the hook's direct creator-revenue ledger. A creator-path claim SHALL authenticate the initiating owner, flush first, query RevenueNFT ownership again after every plugin interaction, and revert the complete call if ownership changed. It SHALL then attempt the complete entitlement including its self-flush tip. Failure of this final transfer SHALL NOT revert: the complete attempted amount SHALL be restored to creator-path entitlement and aggregate liability, an event SHALL identify pool, holder, attempted amount, and failure, and the call SHALL return explicit `(success, attemptedAmount)` observability. A creator-path claim SHALL also be available as a batch over many pools that shares one redemption unlock, authenticates the caller as every pool's current holder, keeps per-pool ownership rechecks and per-pool final transfers, and reverts the complete batch if any pool's ownership changed; a failed per-pool final transfer SHALL restore only that pool's entitlement and SHALL NOT revert the batch.
 
 #### Scenario: Arbitrary flush records rather than pushes creator value
 - **WHEN** a third party flushes a pool
@@ -264,6 +276,14 @@ The implicit mandatory creator sink SHALL receive every post-tip amount not allo
 #### Scenario: Ownership change during plugins reverts payout
 - **WHEN** RevenueNFT ownership differs after plugin interactions from the owner authenticated at creator-payout entry
 - **THEN** the complete flush and payout revert before any creator-path transfer
+
+#### Scenario: A creator batch pays every pool's complete entitlement
+- **WHEN** the holder of every pool's RevenueNFT invokes a creator batch over several pools
+- **THEN** one shared redemption delivers every pool's pot, and each pool's complete entitlement including its retained tip is attempted for the holder
+
+#### Scenario: Creator batch reverts on ownership change
+- **WHEN** any pool's RevenueNFT ownership changes during a creator batch
+- **THEN** the complete batch reverts with every pool's accounting unchanged
 
 #### Scenario: Failed recipient transfer preserves entitlement
 - **WHEN** the complete creator-path transfer to the current holder fails

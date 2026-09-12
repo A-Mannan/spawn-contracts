@@ -1,11 +1,19 @@
 ## MODIFIED Requirements
 
 ### Requirement: Signed-config launch with permissionless relay
-The creator SHALL sign the complete EIP-712 launch configuration, including deadline and exact 256-bit payout plan, and any address SHALL be able to relay it. A creator MAY launch directly without a signature. The recorded creator SHALL be the recovered signer or direct sender, never the relayer. Altering any field or payout-plan bit SHALL invalidate the signature. The configuration SHALL contain no harvest percentages, preset name, dev-buy vesting duration, or active governance-version snapshot. Existing replay and deadline protections SHALL remain.
+The protocol's trusted operator SHALL sign the complete EIP-712 launch configuration, including deadline and exact 256-bit payout plan, and any address SHALL be able to relay it. A creator MAY launch directly without a signature. The recorded creator SHALL be the creator declared in the configuration — vouched for by the trusted operator on the relayed path, or proven as the sender on the direct path — never the relayer. The trusted operator SHALL be stored on chain and replaceable only through typed governance; a signature that does not recover to the current trusted operator SHALL be rejected. Altering any field or payout-plan bit SHALL invalidate the signature. The configuration SHALL contain no harvest percentages, preset name, dev-buy vesting duration, or active governance-version snapshot. Existing replay and deadline protections SHALL remain.
 
-#### Scenario: Relayer launches for the signer
-- **WHEN** any address submits a valid creator-signed configuration before its deadline
-- **THEN** one token and pool launch with the signer recorded as creator
+#### Scenario: Relayer launches for the operator
+- **WHEN** any address submits a valid operator-signed configuration before its deadline
+- **THEN** one token and pool launch with the declared creator recorded as creator
+
+#### Scenario: Only the trusted operator can sign launches
+- **WHEN** a relayed launch carries a signature recovering to any address other than the on-chain trusted operator
+- **THEN** the launch is rejected
+
+#### Scenario: Operator rotation is governance-configurable
+- **WHEN** the administrator schedules and executes a trusted-operator replacement
+- **THEN** future signed launches verify against the new operator and completed launches are unaffected
 
 #### Scenario: Creator launches directly
 - **WHEN** the creator submits the same configuration without a signature
@@ -32,11 +40,15 @@ The creator SHALL sign the complete EIP-712 launch configuration, including dead
 - **THEN** each pool, token, plan, and accounting state remains isolated
 
 ### Requirement: Per-launch configuration
-Per-launch configuration SHALL contain token metadata, total supply, optional creator dev-buy share capped at 10%, payout-plan bitset, and deadline. All geometry, the static 1% trading fee, graduation split, and work caps SHALL remain protocol-defined. No launch SHALL configure harvest percentages, vesting duration, economic-governance values, or preset name. Plan validation SHALL enforce registered active payout roles, fixed takes totaling at most one whole, and no more than eight enabled plugins. An empty plan and a plan totaling exactly one whole SHALL be valid.
+Per-launch configuration SHALL contain token metadata, the protocol-pinned total supply, optional creator dev-buy share capped at 10%, payout-plan bitset, and deadline. Supply SHALL equal the protocol constant, and any other value SHALL be rejected, because the seeded positions' bounds are derived from the graduation valuation that supply produces. All geometry, the static 1% trading fee, graduation split, and work caps SHALL remain protocol-defined. No launch SHALL configure harvest percentages, vesting duration, economic-governance values, or preset name. Plan validation SHALL enforce registered active payout roles, fixed takes totaling at most one whole, and no more than eight enabled plugins. An empty plan and a plan totaling exactly one whole SHALL be valid.
 
 #### Scenario: Geometry is not configurable
 - **WHEN** a launch is constructed
 - **THEN** it contains no band, curve, fee, or work-cap override
+
+#### Scenario: Supply is the protocol constant
+- **WHEN** a launch declares a total supply other than the pinned constant
+- **THEN** launch is rejected before the token deploys
 
 #### Scenario: Harvest percentages are not configurable
 - **WHEN** a creator chooses payout behavior
@@ -77,9 +89,9 @@ The system SHALL deploy one standard ERC20 via CREATE2 with a salt derived from 
 - **WHEN** an observer knows the configuration and creator
 - **THEN** they can derive the token address before launch
 
-#### Scenario: Different signer cannot occupy the address
-- **WHEN** another signer uses otherwise identical data
-- **THEN** their token address differs
+#### Scenario: Different creator cannot occupy the address
+- **WHEN** otherwise identical data declares a different creator
+- **THEN** that configuration's token address differs
 
 #### Scenario: Re-signing preserves the address
 - **WHEN** only the deadline and signature are refreshed
@@ -99,6 +111,21 @@ The system SHALL deploy one standard ERC20 via CREATE2 with a salt derived from 
 
 ### Requirement: Hook address encodes required permissions
 The hook address SHALL encode exactly the lifecycle callback permissions required by the launchpad: before-initialize, after-initialize, before-swap, after-swap, before-add-liquidity, and before-remove-liquidity. No dynamic-fee flag SHALL be part of pool configuration or treated as a hook-address permission.
+
+### Requirement: Phase-gated liquidity admission
+While a pool is in its bonding-curve phase, only the protocol SHALL add or remove liquidity: the curve, and later the ladder, are the mechanism, and no external deposit may sit outside the simulation that sizes protocol positions. After graduation the pool SHALL admit external liquidity — any address MAY add positions for itself and remove or collect on them like any Uniswap v4 position. Protocol-authored positions SHALL remain protocol-owned on both phases: v4 keys positions to their owner, so no third party can modify, collect on, or remove the hook's curve, band, or full-range positions, and the full-range principal SHALL remain permanently locked by the structural absence of any removal path.
+
+#### Scenario: External liquidity is rejected on the curve
+- **WHEN** an external address attempts to add or remove liquidity while the pool is in its bonding-curve phase
+- **THEN** the attempt is rejected
+
+#### Scenario: Graduated pools accept external liquidity
+- **WHEN** an external address adds a position of its own after graduation and later removes or collects on it
+- **THEN** every step succeeds like an ordinary Uniswap v4 position
+
+#### Scenario: Protocol positions are not externally reachable
+- **WHEN** an external address targets a protocol position's range and salt after graduation
+- **THEN** v4 resolves the attempt to the caller's own position space, and the protocol position and its accrued fees are untouched
 
 #### Scenario: Deployed hook has required callback flags
 - **WHEN** the hook is deployed and a pool initializes

@@ -270,11 +270,11 @@ class ScenarioGateTests(unittest.TestCase):
             self.assertEqual(SCENARIOS.report(result, strict_duplicates=False), 0)
         self.assertEqual(permissive_stderr.getvalue(), strict_stderr.getvalue())
 
-    def test_repository_inventory_is_215_unique_scenarios(self):
+    def test_repository_inventory_is_225_unique_scenarios(self):
         root = TOOLS.parent
         scenarios = SCENARIOS.load_specs(root / "openspec/changes/add-payout-plugins/specs")
-        self.assertEqual(len(scenarios), 215)
-        self.assertEqual(len({row["name"] for row in scenarios}), 215)
+        self.assertEqual(len(scenarios), 225)
+        self.assertEqual(len({row["name"] for row in scenarios}), 225)
 
 
 if __name__ == "__main__":

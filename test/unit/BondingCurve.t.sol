@@ -196,7 +196,7 @@ contract BondingCurveTest is LaunchpadTest {
 
     /// @dev The exit is taken years later, with no keeper having touched the pool in between.
     function test_holdersAreNeverTrappedEvenLongAfterLaunch() public {
-        _buy(5 ether);
+        _buy(0.5 ether);
         uint256 held = token.balanceOf(address(router));
 
         vm.warp(launchTime + 5 * 365 days);

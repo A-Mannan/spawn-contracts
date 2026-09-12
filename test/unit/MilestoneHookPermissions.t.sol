@@ -39,7 +39,8 @@ contract MilestoneHookPermissionsTest is LaunchpadTest {
             address(coldPaths),
             address(payoutPaths),
             address(controller),
-            PROTOCOL_RECIPIENT
+            PROTOCOL_RECIPIENT,
+            operator
         );
     }
 
@@ -142,7 +143,8 @@ contract MilestoneHookPermissionsTest is LaunchpadTest {
                 address(coldPaths),
                 address(payoutPaths),
                 address(controller),
-                PROTOCOL_RECIPIENT
+                PROTOCOL_RECIPIENT,
+                operator
             )
         );
 
@@ -160,7 +162,8 @@ contract MilestoneHookPermissionsTest is LaunchpadTest {
                 address(coldPaths),
                 address(payoutPaths),
                 address(controller),
-                PROTOCOL_RECIPIENT
+                PROTOCOL_RECIPIENT,
+                operator
             )
         );
 
@@ -178,7 +181,8 @@ contract MilestoneHookPermissionsTest is LaunchpadTest {
                 address(coldPaths),
                 address(payoutPaths),
                 address(0),
-                PROTOCOL_RECIPIENT
+                PROTOCOL_RECIPIENT,
+                operator
             )
         );
 
@@ -196,7 +200,8 @@ contract MilestoneHookPermissionsTest is LaunchpadTest {
                 address(coldPaths),
                 address(payoutPaths),
                 address(controller),
-                address(0)
+                address(0),
+                operator
             )
         );
 
@@ -216,7 +221,8 @@ contract MilestoneHookPermissionsTest is LaunchpadTest {
                 address(0xC0DE),
                 address(payoutPaths),
                 address(controller),
-                PROTOCOL_RECIPIENT
+                PROTOCOL_RECIPIENT,
+                operator
             )
         );
 
@@ -234,7 +240,8 @@ contract MilestoneHookPermissionsTest is LaunchpadTest {
                 address(coldPaths),
                 address(0xBEEF),
                 address(controller),
-                PROTOCOL_RECIPIENT
+                PROTOCOL_RECIPIENT,
+                operator
             )
         );
 
@@ -370,7 +377,7 @@ contract MilestoneHookPermissionsTest is LaunchpadTest {
 
     function test_payoutPathsRejectDirectFlush() public {
         vm.expectRevert(MilestonePayoutPaths.NotDelegated.selector);
-        payoutPaths.flush(poolId);
+        payoutPaths.flushTo(poolId, address(this));
     }
 
     function test_payoutPathsRejectDirectCreatorClaim() public {

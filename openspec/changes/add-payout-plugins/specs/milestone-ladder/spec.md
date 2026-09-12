@@ -81,6 +81,27 @@ The system SHALL permit swaps in both directions at every price after graduation
 - **WHEN** any selected payout plugin is reverting, suspended, or out of gas
 - **THEN** an ordinary swap and its bounded harvest accounting remain executable
 
+## ADDED Requirements
+
+### Requirement: The decaying schedule, bounded seed, and wall reserve
+The template SHALL define the ladder schedule as a first step above graduation that decays by a fixed per-step level amount to the floor spacing: band `i+1` SHALL start `max(bandLevelSpacing, bandFirstStepLevels - bandStepDecayLevels * i)` levels above band `i`, and the fee-funded extensions SHALL continue at the floor spacing. Launch supply SHALL be pinned to the protocol constant so the seeded positions' bounds are protocol constants too. Graduation SHALL seed the full-range position over the template's bounded market-cap range from the LP seed share, and SHALL place every token the seed does not consume into a single-sided wall position spanning the levels directly above graduation. The wall SHALL hold no quote currency at mint, SHALL have no removal path anywhere in the protocol, and SHALL realise its accrued quote fees through the same collection waterfall as the full-range position. The deployment walk SHALL price the wall's liquidity into the simulated swap path.
+
+#### Scenario: The schedule decays from a wide first step to the floor spacing
+- **WHEN** an observer computes band bounds from the template and the graduation level alone
+- **THEN** the steps follow the decaying schedule, lock at the floor spacing, and agree with the library's closed form
+
+#### Scenario: Graduation seeds the bounded full range and its wall
+- **WHEN** graduation seeds the pool
+- **THEN** the full-range position spans the bounded range and consumes the whole seed on the quote side, the wall absorbs the unconsumed token share with no quote charged, and the residue is rounding dust only
+
+#### Scenario: Realised wall fees join the same waterfall
+- **WHEN** a collection realises fees after trades through the wall's range
+- **THEN** the wall's quote fees route through the same waterfall as the full-range position's and the wall's liquidity is unchanged
+
+#### Scenario: The deployment walk prices the wall in
+- **WHEN** the hook simulates a buy too small to reach the ladder through the wall's liquidity
+- **THEN** no band deploys, because the walk's budget is consumed before the first band's lower bound
+
 ## REMOVED Requirements
 
 ### Requirement: Settlement is reentrancy-guarded

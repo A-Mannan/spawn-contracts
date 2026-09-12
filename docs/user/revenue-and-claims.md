@@ -11,7 +11,7 @@ Three streams accrue to a launch's creator:
 
 | Stream | Source |
 | --- | --- |
-| Graduation share | 55% of curve proceeds at graduation |
+| Graduation share | 70% of curve proceeds at graduation |
 | Direct fee share | 75% of post-graduation ETH-side swap fees |
 | Creator-path entitlement | Whatever the payout plan's plugins do not take from milestone pots, plus payments redirected away from failed plugins |
 

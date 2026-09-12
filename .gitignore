@@ -1,6 +1,8 @@
 # Foundry
 out/
 cache/
+out-fast/
+cache-fast/
 broadcast/
 foundry-out/
 .forge-snapshots/

@@ -16,12 +16,14 @@ icon: sliders
 
 | Constant | Value |
 | --- | --- |
-| `openingFdvWei` | 125e18 ETH FDV, every launch |
-| Curve positions / span | 32 / 6931 levels (2x) |
-| Band spacing / width | 2235 (1.2504x) / 447 levels |
-| Core bands / fee-funded bands | 30 / 30 |
-| Supply split (curve / ladder / full-range) | 25% / 65% / 10% |
-| Graduation split (LP / creator / protocol) | 40% / 55% / 5% |
+| `openingFdvWei` | 2e18 ETH FDV, every launch |
+| Total supply | Pinned to 1,000,000,000 tokens — any other declared value reverts (`SupplyNotFixed`) |
+| Curve positions / span | 32 / 13,862 levels (4x opening, two 2x spans) |
+| Band spacing / width | first step 6,932 levels (2x), decaying by 391 per band to the 2,235-level (1.2504x) floor / 447 levels |
+| Core bands / fee-funded bands | 22 / 30 |
+| Supply split (curve / ladder / graduation LP + wall) | 25% / 10% / 65% |
+| Graduation split (LP / creator / protocol) | 20% / 70% / 10% |
+| Full-range range / wall | bounded ~$5,100 to ~$150B FDV / 880,000 levels above graduation |
 | Trading fee | 10 000 hundredths-bip (**1%**, static) |
 | Tick spacing | 1 |
 | Dev-buy cap | 10% of supply |
@@ -33,7 +35,7 @@ icon: sliders
 | --- | --- | --- |
 | `harvestServiceFeeWad` | 0.10e18 | 0.20e18 |
 | `quoteCreatorShareWad` | 0.75e18 | 0.90e18 |
-| `tokenMilestoneFundShareWad` | 0.20e18 | 0.50e18 |
+| `tokenMilestoneFundShareWad` | 1.00e18 | 1.00e18 |
 | `version` | 1 | increments per replacement |
 
 Changes are **prospectively applied**: each accrual and flush stamps the `economicVersion` it used, so history stays auditable. Indexers should treat `version` as part of every payout record.

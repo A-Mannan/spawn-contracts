@@ -26,7 +26,7 @@ Claims cover pots plus the claim-backed protocol ledger; raw ETH covers carry, c
 ## Invariants the suite pins
 
 - **No drain of unaccrued value** — claims are bounded by accrual; the claim paths recheck ownership mid-flight and restore entitlement on recipient failure.
-- **No third-party liquidity** — the hook rejects every external add/remove; the full-range position is code-locked.
+- **No third-party liquidity** — the hook rejects every external add/remove; the full-range position and the wall are code-locked.
 - **No straddle deadlock** — a ladder band can always either deploy or skip; the property is proven, not assumed.
 - **Payout delivery cannot be trapped** — plugin reverts become carry and retry; suspended/changed-code entries are permanently redirected to the creator path; the pre-mutation in-flight guard prevents double delivery under reentrancy.
 - **Every action reaches effect** — the invariant handler drives every unlock action to observable state change.

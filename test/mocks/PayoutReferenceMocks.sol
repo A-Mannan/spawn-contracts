@@ -255,7 +255,7 @@ contract ReturndataPayoutPlugin {
 }
 
 interface IPayoutAttackTarget {
-    function flush(PoolId poolId) external;
+    function flushTo(PoolId poolId, address tipTo) external;
     function claimProtocol() external returns (uint256 amount);
     function claimCreator(PoolId poolId) external returns (uint256 amount);
 }
@@ -284,7 +284,7 @@ contract ReentrantPayoutPlugin is RecordingPayoutPlugin {
 
     function onPayout(PoolId poolId, address token) external payable override {
         bytes memory payload;
-        if (attack == Attack.FLUSH) payload = abi.encodeCall(IPayoutAttackTarget.flush, (attackPool));
+        if (attack == Attack.FLUSH) payload = abi.encodeCall(IPayoutAttackTarget.flushTo, (attackPool, address(this)));
         if (attack == Attack.PROTOCOL_CLAIM) payload = abi.encodeCall(IPayoutAttackTarget.claimProtocol, ());
         if (attack == Attack.CREATOR_CLAIM) payload = abi.encodeCall(IPayoutAttackTarget.claimCreator, (attackPool));
         if (payload.length != 0) {
@@ -306,12 +306,26 @@ interface IRevenueTransfer {
 contract OwnershipChangingPayoutPlugin is RecordingPayoutPlugin {
     IRevenueTransfer public revenueNft;
     uint256 public revenueTokenId;
+    address public currentOwner;
     address public nextOwner;
     bool public moved;
 
     function configureOwnershipChange(IRevenueTransfer nft_, uint256 tokenId_, address nextOwner_) external {
         revenueNft = nft_;
         revenueTokenId = tokenId_;
+        currentOwner = address(this);
+        nextOwner = nextOwner_;
+        moved = false;
+    }
+
+    /// @dev Variant for an NFT the plugin does not hold: the configured owner must have approved the
+    /// plugin, which is what lets a delivery move the token out from under a creator-path batch.
+    function configureOwnershipChangeFrom(IRevenueTransfer nft_, uint256 tokenId_, address from_, address nextOwner_)
+        external
+    {
+        revenueNft = nft_;
+        revenueTokenId = tokenId_;
+        currentOwner = from_;
         nextOwner = nextOwner_;
         moved = false;
     }
@@ -321,7 +335,7 @@ contract OwnershipChangingPayoutPlugin is RecordingPayoutPlugin {
     }
 
     function onPayout(PoolId poolId, address token) external payable override {
-        revenueNft.transferFrom(address(this), nextOwner, revenueTokenId);
+        revenueNft.transferFrom(currentOwner, nextOwner, revenueTokenId);
         moved = true;
         _record(poolId, token);
     }
@@ -360,12 +374,12 @@ contract CallbackSwapPayoutPlugin is RecordingPayoutPlugin {
 }
 
 interface IFlushTarget {
-    function flush(PoolId poolId) external;
+    function flushTo(PoolId poolId, address tipTo) external;
 }
 
 contract RejectingPayoutCaller {
-    function flush(address target, PoolId poolId) external {
-        IFlushTarget(target).flush(poolId);
+    function flushTo(address target, PoolId poolId) external {
+        IFlushTarget(target).flushTo(poolId, address(this));
     }
 
     receive() external payable {

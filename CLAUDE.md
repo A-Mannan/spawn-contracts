@@ -37,6 +37,9 @@ permission to weaken a requirement.
 ```bash
 make build              # forge build
 make test               # == test-unit: forge test --no-match-path '{test/fork/**,test/invariant/**}'
+make test-fast          # same suite under FOUNDRY_PROFILE=fast: no via_ir, seconds not minutes.
+                        # Semantics are identical (via_ir only affects deployed bytecode size);
+                        # use it for iteration. Artifacts land in out-fast/cache-fast.
 make test-invariant     # test/invariant/** — the handler-driven suite
 make test-fork          # needs BASE_RPC_URL; runs FOUNDRY_PROFILE=fork
 make deep               # 10k fuzz / 1k invariant runs
@@ -68,11 +71,15 @@ Four custom gates matter as much as the tests, and CI runs all of them on every 
   match `MilestoneBase` slot-for-slot and that every state-changing satellite entry carries
   `onlyDelegated`. **Run this after touching state variables or adding a satellite entry point.**
 - **`make lock-check`** — source-level assertion that no `modifyLiquidity` call site combines a negative
-  `liquidityDelta` with `FULL_RANGE_SALT` anywhere in the three-implementation architecture.
+  `liquidityDelta` with `FULL_RANGE_SALT` or `WALL_SALT` anywhere in the three-implementation
+  architecture, and that the only positive mints under either salt are the two graduation seeds.
 - **`make pins`** — verifies `lib/v4-core @ 5f00c84` and `lib/v4-periphery @ 9628c36`.
 
 `via_ir = true` is load-bearing (it is what fits the hook under EIP-170), so a cold build takes minutes.
-Budget for that; don't assume a fast edit-compile loop.
+For test iteration use `make test-fast` instead: the `fast` profile compiles without via_ir — semantics
+identical, seconds per run — and its artifacts live in `out-fast`/`cache-fast` so they never mix with
+the release build. The size and layout gates run under the DEFAULT profile, so never audit or deploy
+`out-fast` artifacts.
 
 ## Architecture
 
@@ -117,15 +124,16 @@ A single-sided sell band is therefore a range strictly *below* the current tick,
 
 ### Immutable template, signed plan, global economics
 
-Band geometry, curve shape, supply split, the 40/55/5 graduation split, literal 1% trading fee, and
-per-swap work caps live in `ProtocolTemplate` and are immutable across the generation. A launch chooses
-only creator, metadata, supply, an immediate dev buy of at most 10%, an exact registry-index bitset, and
+Band geometry (including the decaying ladder schedule), curve shape, supply split, the 10/20/70
+graduation split, literal 1% trading fee, and per-swap work caps live in `ProtocolTemplate` and are
+immutable across the generation. Total supply is pinned to a protocol constant (1B), so a launch chooses
+only creator, metadata, an immediate dev buy of at most 10%, an exact registry-index bitset, and
 deadline. The bitset is signed and CREATE2-bound; at most eight active payout entries may be selected and
 their immutable takes may total at most `WAD`. The creator is the mandatory arithmetic remainder.
 
 The versioned global `EconomicConfig` separately controls prospective distribution: 10% default harvest
-service fee, 75% default quote-fee creator share, and 20% default token-fee milestone-fund share, under
-immutable 20%/90%/50% caps. Governance cannot change pool geometry, the trading fee, graduation split,
+service fee, 75% default quote-fee creator share, and 100% default token-fee milestone-fund share, under
+immutable 20%/90%/100% caps. Governance cannot change pool geometry, the trading fee, graduation split,
 plugin terms, or a launched pool's plan.
 
 ### Lifecycle
@@ -136,11 +144,17 @@ reached `farLevel` (Decision 18), and permissionless `graduate()` races it for a
 pay that gas deliberately. Both read the live tick at call time, so a pool that touched the far level and
 fell back has not graduated.
 
-Launch is **signed-config with permissionless relay** (Decision 19): the creator signs an EIP-712 digest
-over the whole config and any address may relay it, or the creator sends their own transaction with an
-empty signature. The token address is CREATE2-derived from the config hash and the recovered signer, so
-it is knowable before launch. A dev buy rides **only** the creator's own transaction; a relayed launch
-leaves that share as curve inventory.
+Launch is **operator-signed config with permissionless relay** (Decision 19): the protocol's trusted
+operator (an off-chain server key, stored on chain and rotatable through typed governance) signs an
+EIP-712 digest over the whole config and any address may relay it, or the creator sends their own
+transaction with an empty signature. The token address is CREATE2-derived from the config hash and the
+declared creator, so it is knowable before launch. A dev buy rides **only** the creator's own
+transaction; a relayed launch leaves that share as curve inventory.
+
+Post-graduation, the pool admits **external liquidity**: any address may add, remove, or collect on its
+own positions like any v4 LP. On the bonding curve the guard still rejects everyone but the hook, and
+protocol positions (curve, bands, full-range) are unreachable by third parties on both phases because
+v4 keys positions to their owner.
 
 Launch runs: validate → deploy token → `initialize` → `unlock` → in `unlockCallback` (`GENESIS`) mint
 **curve position 0 only**, settle the token side, execute the optional dev buy. Positions 1–31 deploy
@@ -148,16 +162,19 @@ just-in-time as the simulated swap path reaches them (Decisions 15 and 17). Gene
 in `afterInitialize` because `initialize` does not unlock the manager and `modifyLiquidity` is
 `onlyWhenUnlocked` (Decision 5).
 
-Graduation burns the curves, splits proceeds 40 LP seed / 55 creator / 5 protocol, and seeds the single
-full-range position. That position is **code-locked**: no removal path exists, which `make lock-check`
-enforces structurally.
+Graduation burns the curves, splits proceeds 10 protocol / 20 LP seed / 70 creator, and seeds the single
+full-range position (bounded $5,100-$150B market-cap range, ETH-limited seed) plus the **wall**: a
+single-sided token-only position over the 880,000 levels above graduation that absorbs every token the
+seed does not consume. Both positions are **code-locked**: no removal path exists, which `make
+lock-check` enforces structurally.
 
 ### Ladder: derived geometry, bitmap state
 
-Bands are computed, never stored: `levelLower(i) = graduationLevel + (i+1) * bandLevelSpacing`,
-`levelUpper = levelLower + bandWidthLevels`. Uniform level spacing is geometric in market cap — the
-template's 2235 levels are a 1.25× step, and the 447-level wall is exactly a fifth of that gap. 30 core
-bands reach roughly 800× the graduation valuation; up to 30 fee-funded extensions continue from there.
+Bands are computed, never stored: band `i+1` starts
+`max(2235, 6932 - 391*i)` levels above band `i` (`levelUpper = levelLower + 447`). The schedule opens
+with a 2× market-cap step and decays to the floor spacing's constant 1.2504× step (2,235 levels, of
+which the 447-level band is exactly a fifth). 22 core bands reach roughly 2,900× the graduation
+valuation (~$58M at the reference $2,500/ETH); up to 30 fee-funded extensions continue at the floor.
 
 What needs storage is which bands exist and which are finished, so state is three bitmaps plus a cursor
 (Decision 4, **revised** — the single-`LiveBand` invariant is gone): `deployedBands & ~completedBands` is
@@ -201,7 +218,10 @@ active `PAYOUT` entries whose takes total at most `WAD`. Delivery rechecks suspe
 identity. An inactive or codehash-invalid entry is never called: its current share and complete carry are
 permanently redirected to creator-path entitlement.
 
-Anyone may call `flush(poolId)`. A new pot pays a floor-1% tip to the immediate caller, then allocates the
+Anyone may call `flushTo(poolId, tipTo)` — the tip recipient is always explicit, so bundlers and relays
+that accept no bare ETH direct the tip to the real beneficiary — or `flushBatch(pools, tipTo)` to flush
+many pools under one shared redemption unlock and one combined tip transfer; the batch is all-or-nothing,
+and singles are batches of one. A new pot pays a floor-1% tip to the directed recipient, then allocates the
 post-tip amount to selected entries in ascending index order. Each plugin receives plain ETH at
 `onPayout(PoolId,address)` under its immutable gas stipend; only the EVM call-success bit matters and all
 returndata is ignored. Failure preserves the complete attempted value as carry without blocking later
@@ -226,8 +246,8 @@ that position's liquidity.
 One versioned global economics snapshot routes each collection. Quote fees accrue 75% by default to the
 pool's direct creator ledger and the exact remainder to global protocol revenue, under the immutable 90%
 creator-share cap. Token fees may fund still-available fee-funded extension capacity using the default
-20% share and immutable 50% cap; every token not admitted to that capacity burns immediately. At zero
-remaining capacity, 100% burns. Collected fees never add liquidity, and there is no LP carry.
+100% share under the immutable 100% cap; every token not admitted to that capacity burns immediately. At
+zero remaining capacity, 100% burns. Collected fees never add liquidity, and there is no LP carry.
 
 ### Governance and other cross-cutting mechanisms
 
@@ -243,7 +263,7 @@ remaining capacity, 100% burns. Collected fees never add liquidity, and there is
 - **Position salts:** `FULL_RANGE_SALT`, top-bit band salts, and low-index curve salts are disjoint and
   recomputed rather than stored.
 - **Unlock dispatch:** manager interactions fail closed through typed actions: `GENESIS`, `GRADUATE`,
-  `REDEEM_QUOTE`, `COLLECT_FEES`, `REDEEM_PAYOUT_POT`, and `REDEEM_PROTOCOL_BACKING`.
+  `COLLECT_FEES`, `REDEEM_PAYOUT_POT`, and `REDEEM_PROTOCOL_BACKING`.
 - **Plugin gas:** the payout satellite uses the published 15,000 fixed-call overhead, 100,000 per remaining
   call, 100,000 finalization reserve, 500,000 stipend cap, and exact EIP-150 margin preflight. Insufficient
   outer gas reverts the whole flush; it is not recorded as plugin failure.

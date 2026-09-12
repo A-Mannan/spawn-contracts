@@ -24,7 +24,7 @@ contract LaunchpadHandler is CommonBase, StdUtils {
     using StateLibrary for IPoolManager;
     using PoolIdLibrary for PoolKey;
 
-    int24 internal constant MAX_LEVEL = Bounds.FULL_RANGE_TICK_BOUND;
+    int24 internal constant MAX_LEVEL = Bounds.WALL_WIDTH_LEVELS;
 
     enum Action {
         BUY,
@@ -253,7 +253,7 @@ contract LaunchpadHandler is CommonBase, StdUtils {
     function flush(uint256 poolSeed) external {
         uint256 i = _poolIndex(poolSeed);
         _begin(i);
-        try hook.flush(pools[i].id) {
+        try hook.flushTo(pools[i].id, address(this)) {
             _end(Action.FLUSH, true);
         } catch {
             _end(Action.FLUSH, false);
@@ -480,7 +480,7 @@ contract LaunchpadHandler is CommonBase, StdUtils {
         return manager.getPositionLiquidity(
             pools[i].id,
             Position.calculatePositionKey(
-                address(hook), -Bounds.FULL_RANGE_TICK_BOUND, Bounds.FULL_RANGE_TICK_BOUND, hook.FULL_RANGE_SALT()
+                address(hook), Bounds.FULL_RANGE_TICK_LOWER, Bounds.FULL_RANGE_TICK_UPPER, hook.FULL_RANGE_SALT()
             )
         );
     }

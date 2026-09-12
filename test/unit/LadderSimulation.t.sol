@@ -15,13 +15,13 @@ import {PoolState} from "../../src/types/LaunchTypes.sol";
 /// {MilestoneHookHarness}'s `afterSwap` snapshots rather than against getters.
 ///
 /// The geometry these tests are sized against, all derived from the default template: graduation level
-/// −152025, band `i` spanning `[-149790 + 2235i, -149343 + 2235i]`, so spacing 2235, width 447, and a
-/// 1788-level gap between one band's top and the next one's bottom. Reaching band 0 from graduation costs
-/// roughly 59 ETH against the seeded full-range liquidity.
+/// −186448, band `i` starting `max(2235, 6932 - 391i)` levels above band `i-1` (so band 0 spans
+/// `[-179517, -179070]`), width 447, and the decaying schedule closing to the 2235-level floor. The wall
+/// and full-range positions sit in the path, so crossing band 0 from graduation costs roughly 0.3 ETH.
 contract LadderSimulationTest is HarnessLaunchpadTest {
-    /// @dev Level spacing and width, restated as constants so a test can name a band boundary without
-    /// re-deriving it. Asserted against the hook's own geometry in {test_geometryPremise}.
-    int24 internal constant GRADUATION_LEVEL = -152025;
+    /// @dev Geometry restated as constants so a test can name a band boundary without re-deriving it.
+    /// Asserted against the hook's own geometry in {test_geometryPremise}.
+    int24 internal constant GRADUATION_LEVEL = -186448;
     int24 internal constant BAND_SPACING = 2235;
     int24 internal constant BAND_WIDTH = 447;
 
@@ -34,9 +34,24 @@ contract LadderSimulationTest is HarnessLaunchpadTest {
         for (uint256 i = 0; i < 10; i++) {
             (int24 lower, int24 upper, bool exists) = hook.bandLevels(poolId, i);
             assertTrue(exists, "band exists");
-            assertEq(lower, GRADUATION_LEVEL + int24(int256(i + 1)) * BAND_SPACING, "band lower");
+            assertEq(lower, _expectedLower(i), "band lower");
             assertEq(upper, lower + BAND_WIDTH, "band upper");
         }
+    }
+
+    /// @dev Cumulative level offset through band `i`'s lower bound: the schedule's steps summed.
+    function _firstStepSum(uint256 i) internal view returns (int24) {
+        int24 cumulative;
+        for (uint256 j = 0; j <= i; j++) {
+            int24 step = template.bandFirstStepLevels - int24(int256(j)) * template.bandStepDecayLevels;
+            if (step < BAND_SPACING) step = BAND_SPACING;
+            cumulative += step;
+        }
+        return cumulative;
+    }
+
+    function _expectedLower(uint256 i) internal view returns (int24) {
+        return GRADUATION_LEVEL + _firstStepSum(i);
     }
 
     // --- Scenario: A buy crossing multiple undeployed bands deploys each before filling it ---

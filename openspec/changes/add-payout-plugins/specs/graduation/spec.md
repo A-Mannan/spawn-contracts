@@ -1,11 +1,11 @@
 ## MODIFIED Requirements
 
 ### Requirement: Bonding curve proceeds split
-Graduation SHALL retain the immutable 40% locked-LP seed, 55% direct creator, and 5% protocol split. The protocol share SHALL enter the single global protocol ledger with source-pool attribution; the creator share SHALL enter the pool's direct RevenueNFT ledger. Administrative economic updates SHALL NOT change this graduation split. Unbought curve token inventory and curve token fees SHALL return to ladder inventory.
+Graduation SHALL retain the immutable 20% locked-LP seed, 70% direct creator, and 10% protocol split. The protocol share SHALL enter the single global protocol ledger with source-pool attribution; the creator share SHALL enter the pool's direct RevenueNFT ledger. Administrative economic updates SHALL NOT change this graduation split. Unbought curve token inventory and curve token fees SHALL return to ladder inventory.
 
 #### Scenario: Default split is applied
 - **WHEN** graduation completes
-- **THEN** 40% seeds locked liquidity, 55% credits direct creator revenue, and 5% credits the global protocol ledger
+- **THEN** 20% seeds locked liquidity, 70% credits direct creator revenue, and 10% credits the global protocol ledger
 
 #### Scenario: Protocol graduation revenue accrues globally
 - **WHEN** any pool graduates
@@ -13,7 +13,7 @@ Graduation SHALL retain the immutable 40% locked-LP seed, 55% direct creator, an
 
 #### Scenario: Economic updates do not alter graduation split
 - **WHEN** the administrator changes service-fee or swap-fee distributions
-- **THEN** future graduations still use 40 55 5
+- **THEN** future graduations still use 20 70 10
 
 #### Scenario: Curve tokens become ladder inventory
 - **WHEN** graduation releases unbought token inventory or token-denominated curve fees
@@ -34,7 +34,7 @@ Graduation SHALL continue to seed the initial permanently locked full-range posi
 
 #### Scenario: Graduation seeds both sides from original allocations
 - **WHEN** graduation completes
-- **THEN** the locked position uses the immutable token allocation and 40% quote seed
+- **THEN** the locked position uses the immutable token allocation and 20% quote seed
 
 #### Scenario: Quote fees do not compound
 - **WHEN** quote fees are collected after graduation

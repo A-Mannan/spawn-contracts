@@ -8,7 +8,7 @@ icon: rocket
 ## Before you start
 
 - You need an EOA-capable signer (the launch signature is a plain 65-byte EIP-712 signature — smart wallets must sign via an EOA-capable path).
-- Decide your token's **name**, **symbol**, **total supply**, and optional **dev buy** (up to 10% of supply).
+- Decide your token's **name**, **symbol**, and optional **dev buy** (up to 10% of supply). Total supply is not a choice — it is pinned to **1,000,000,000 tokens**, and any other value is rejected.
 - Choose the launch's [payout plan](payout-plugins.md) — which plugins share milestone proceeds.
 
 ## The flow
@@ -17,7 +17,7 @@ icon: rocket
 {% step %}
 ### Build your configuration
 
-Your launch is a fixed struct: creator (you), name, symbol, total supply, dev-buy share, payout plan, and a signing deadline. A frontend builds it for you.
+Your launch is a fixed struct: creator (you), name, symbol, total supply (always 1,000,000,000), dev-buy share, payout plan, and a signing deadline. A frontend builds it for you.
 {% endstep %}
 
 {% step %}
@@ -46,7 +46,7 @@ Send `MilestoneHook.launch(config, signature)`. Two ways:
 | Self-send | You | Dev-buy budget | You receive exactly `totalSupply × devBuyShare` tokens; unused ETH auto-refunds |
 | Relayed | Anyone | Nothing | Token launches; the dev-buy share stays on the curve for the market |
 
-Either way, the token mints to the hook, the pool goes live at the standard 125 ETH opening valuation, and the whole fixed supply is accounted for: 25% curve, 65% milestone ladder, 10% full-range backing.
+Either way, the token mints to the hook, the pool goes live at the standard 2 ETH opening valuation (~$5,000 at the $2,500/ETH reference), and the whole fixed supply is accounted for: 25% curve, 10% milestone ladder, 65% graduation backing (the full-range seed plus its wall).
 {% endstep %}
 {% endstepper %}
 

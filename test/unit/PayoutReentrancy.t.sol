@@ -21,7 +21,7 @@ contract PayoutReentrancyTest is PayoutTestFixture {
         (PoolId id,,) = _launchWithPlan("Same", "SAME", _plan(index));
         plugin.configure(IPayoutAttackTarget(address(hook)), id, ReentrantPayoutPlugin.Attack.FLUSH, true);
         _fundPot(id, 0, 100 ether);
-        hook.flush(id);
+        hook.flushTo(id, STRANGER);
         assertFalse(plugin.nestedSucceeded());
         assertEq(plugin.totalReceived(), 44.55 ether);
         assertEq(hook.pluginCarry(id, index), 0);
@@ -36,7 +36,7 @@ contract PayoutReentrancyTest is PayoutTestFixture {
         plugin.configure(IPayoutAttackTarget(address(hook)), other, ReentrantPayoutPlugin.Attack.FLUSH, false);
         _fundPot(source, 0, 100 ether);
         _fundPot(other, 0, 20 ether);
-        hook.flush(source);
+        hook.flushTo(source, STRANGER);
         assertFalse(plugin.nestedSucceeded());
         assertEq(hook.pluginCarry(source, index), 44.55 ether);
         assertEq(hook.payoutPot(other), 18 ether);
@@ -53,7 +53,7 @@ contract PayoutReentrancyTest is PayoutTestFixture {
         _fundPot(other, 0, 10 ether);
         plugin.configure(IPayoutAttackTarget(address(hook)), other, ReentrantPayoutPlugin.Attack.PROTOCOL_CLAIM, true);
         _fundPot(source, 0, 100 ether);
-        hook.flush(source);
+        hook.flushTo(source, STRANGER);
         assertFalse(plugin.nestedSucceeded());
         assertEq(hook.creatorClaimable(other), 3 ether);
         assertEq(hook.protocolClaimable(), 13 ether);
@@ -73,7 +73,7 @@ contract PayoutReentrancyTest is PayoutTestFixture {
             ICallbackSwapRouter(address(router)), targetKey, -int256(1 wei), _sqrtAtLevel(beforeLevel + 1)
         );
         _fundPot(source, 0, 100 ether);
-        hook.flush(source);
+        hook.flushTo(source, STRANGER);
         assertTrue(plugin.nestedSucceeded());
         assertEq(hook.poolState(poolId).nextBandIndex, beforeNextBand);
         assertEq(hook.payoutPot(source), 0);
@@ -88,9 +88,9 @@ contract PayoutReentrancyTest is PayoutTestFixture {
         plugin.configure(IPayoutAttackTarget(address(hook)), other, ReentrantPayoutPlugin.Attack.FLUSH, true);
         _fundPot(source, 0, 100 ether);
         _fundPot(other, 0, 20 ether);
-        hook.flush(source);
+        hook.flushTo(source, STRANGER);
         assertFalse(plugin.nestedSucceeded());
-        hook.flush(other);
+        hook.flushTo(other, STRANGER);
         assertEq(hook.payoutPot(other), 0);
         assertEq(hook.creatorPathClaimable(other), 17.82 ether);
     }
@@ -145,7 +145,7 @@ contract PayoutReentrancyTest is PayoutTestFixture {
         (PoolId carried,,) = _launchWithPlan("Carry Reserve", "CRSV", _plan(index));
         plugin.setShouldRevert(true);
         _fundPot(carried, 0, 100 ether);
-        hook.flush(carried);
+        hook.flushTo(carried, STRANGER);
         _fundPot(poolId, 0, 20 ether);
         payoutHook.accrueDirectCreator{value: 3 ether}(poolId, 3 ether);
         uint256 carryBefore = hook.pluginCarry(carried, index);
@@ -161,7 +161,7 @@ contract PayoutReentrancyTest is PayoutTestFixture {
         payoutHook.accrueDirectCreator{value: 3 ether}(poolId, 3 ether);
         payoutHook.accrueRawProtocol{value: 2 ether}(poolId, 2 ether);
         _fundPot(poolId, 0, 100 ether);
-        hook.flush(poolId);
+        hook.flushTo(poolId, STRANGER);
         uint256 creatorPath = hook.creatorPathClaimable(poolId);
         vm.prank(PROTOCOL_RECIPIENT);
         hook.claimProtocol();
@@ -182,7 +182,7 @@ contract PayoutReentrancyTest is PayoutTestFixture {
     function test_flushLeavesDirectCreatorRevenueUnchanged() public {
         payoutHook.accrueDirectCreator{value: 3 ether}(poolId, 3 ether);
         _fundPot(poolId, 0, 100 ether);
-        hook.flush(poolId);
+        hook.flushTo(poolId, STRANGER);
         assertEq(hook.creatorClaimable(poolId), 3 ether);
     }
 
@@ -194,7 +194,7 @@ contract PayoutReentrancyTest is PayoutTestFixture {
         plugin.setShouldRevert(true);
         payoutHook.accrueDirectCreator{value: 3 ether}(id, 3 ether);
         _fundPot(id, 0, 100 ether);
-        hook.flush(id);
+        hook.flushTo(id, STRANGER);
         assertEq(hook.creatorClaimable(id), 3 ether);
         vm.prank(creator);
         assertEq(hook.claimCreator(id), 3 ether);

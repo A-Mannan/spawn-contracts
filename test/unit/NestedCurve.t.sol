@@ -132,8 +132,10 @@ contract NestedCurveTest is LaunchpadTest {
         PoolState memory state = hook.poolState(poolId);
         uint256 curveSupply = _curveSupply();
 
-        // A buy small enough not to reach position 1's start, so the book is position 0 alone.
-        _buy(0.005 ether);
+        // A buy small enough not to reach position 1's start, so the book is position 0 alone. Position
+        // 0 holds an eighth of the curve over the whole span, so a fifth of a percent of the span in
+        // ETH terms keeps the price well inside its first nested step.
+        _buy(0.0001 ether);
 
         uint128 atOpening = _poolLiquidity(poolId);
         assertEq(_deployedCurveCount(), 1, "still only position 0 is deployed");

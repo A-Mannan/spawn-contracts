@@ -18,7 +18,7 @@ contract MilestoneTokenTest is Test {
     uint256 internal constant SUPPLY = 1_000_000_000 ether;
 
     function setUp() public {
-        token = new MilestoneToken("Milestone", "MILE", SUPPLY, HOOK);
+        token = new MilestoneToken("Milestone", "MILE", "https://example.test/mile.json", SUPPLY, HOOK);
     }
 
     /// @dev Asserts a selector is not callable on the token: with no matching function and no
@@ -46,19 +46,19 @@ contract MilestoneTokenTest is Test {
         vm.assume(supply > 0);
         vm.assume(hook != address(0));
 
-        MilestoneToken t = new MilestoneToken("N", "S", supply, hook);
+        MilestoneToken t = new MilestoneToken("N", "S", "", supply, hook);
         assertEq(t.balanceOf(hook), supply, "hook holds everything");
         assertEq(t.totalSupply(), supply, "supply matches");
     }
 
     function test_rejectsZeroHook() public {
         vm.expectRevert(MilestoneToken.ZeroHook.selector);
-        new MilestoneToken("N", "S", SUPPLY, address(0));
+        new MilestoneToken("N", "S", "", SUPPLY, address(0));
     }
 
     function test_rejectsZeroSupply() public {
         vm.expectRevert(MilestoneToken.ZeroSupply.selector);
-        new MilestoneToken("N", "S", 0, HOOK);
+        new MilestoneToken("N", "S", "", 0, HOOK);
     }
 
     // --- Scenario: Supply is fixed after launch ---
@@ -116,6 +116,19 @@ contract MilestoneTokenTest is Test {
         assertEq(token.name(), "Milestone", "name");
         assertEq(token.symbol(), "MILE", "symbol");
         assertEq(token.decimals(), 18, "decimals");
+        // The URI is part of the same launch metadata: stored once at construction, never editable.
+        assertEq(token.tokenURI(), "https://example.test/mile.json", "uri");
+    }
+
+    // --- Token URI is fixed at launch: derived, no scenario of its own ---
+
+    function test_tokenUriIsNotEditable() public {
+        // There is no setter at all: the only address holding the URI is the token's own storage,
+        // and no function writes it after construction. Prove the absence against the selector space.
+        (bool ok,) =
+            address(token).call(abi.encodeWithSignature("setTokenURI(string)", "https://evil.test/rewritten.json"));
+        assertFalse(ok, "a URI setter exists");
+        assertEq(token.tokenURI(), "https://example.test/mile.json", "uri changed");
     }
 
     function test_transferMovesExactAmount() public {

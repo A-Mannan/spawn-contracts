@@ -120,14 +120,19 @@ contract MilestoneColdPaths is MilestoneBase {
         // live registry state: a tampered bit that happens to name a suspended or over-subscribed entry
         // would otherwise revert with a registry error, reporting a configuration problem for what is
         // actually a forgery. Recovering first makes the relayer's alteration the reported cause in every
-        // case, and leaves validation to judge only configurations the creator really signed.
+        // case, and leaves validation to judge only configurations the operator really signed.
         address creator = config.creator;
         if (signature.length == 0) {
             // The direct path proves identity by transaction origin instead of by signature. Checking
             // the declaration rather than overwriting it keeps one address derivation for both entries.
             if (msg.sender != creator) revert LaunchSignature.CreatorMismatch(creator, msg.sender);
         } else {
-            LaunchSignature.recoverCreator(config, signature, address(this));
+            // The relayed path is authorized by the protocol's off-chain launch operator: whoever
+            // recovered here must be the on-chain trusted operator. The creator is declared data the
+            // operator vouches for — which is exactly what lets a first buyer relay a launch the
+            // creator never signed. Key rotation is governance's answer to a compromised operator.
+            address signer = LaunchSignature.recoverSigner(config, signature, address(this));
+            if (signer != trustedOperator) revert UnauthorizedLaunchSigner(signer);
         }
 
         launchSupport.validate(config);
@@ -139,6 +144,7 @@ contract MilestoneColdPaths is MilestoneBase {
         token = launchSupport.deploy(
             config.name,
             config.symbol,
+            config.uri,
             config.totalSupply,
             address(this),
             LaunchSignature.tokenSalt(configHash, creator)
@@ -166,16 +172,43 @@ contract MilestoneColdPaths is MilestoneBase {
         int24 opening = CurveLib.openingLevel(config.totalSupply, openingFdvWei);
         int24 far = CurveLib.farLevel(opening, curveSpanLevels);
 
+        // The graduation seed's bounds are protocol constants — the template's $5,100-$150B market-cap
+        // range — so the graduation tick this configuration produces must sit strictly inside them. With
+        // supply pinned and the template anchored that always holds; asserting it per launch is what
+        // keeps the seeding's two-sided-mint guarantee a construction rather than a convention if the
+        // template is ever redeployed with new values. The same inequality also bounds the wall's
+        // derived range inside usable tick space.
+        int24 farTick = -far;
+        if (farTick <= Bounds.FULL_RANGE_TICK_LOWER || farTick >= Bounds.FULL_RANGE_TICK_UPPER) {
+            revert FarTickOutsideFullRange(farTick, Bounds.FULL_RANGE_TICK_LOWER, Bounds.FULL_RANGE_TICK_UPPER);
+        }
+
         _recordLaunch(poolId, config, token, creator, opening, far);
 
         poolManager.initialize(key, TickMath.getSqrtPriceAtTick(Orientation.toTickChecked(opening)));
 
         revenueNFT.mint(poolId, creator);
 
-        emit Launched(poolId, creator, token, config.totalSupply, opening, far, configHash);
+        _emitLaunched(poolId, creator, token, config, opening, far, configHash);
         emit LaunchConfigured(poolId, config.payoutPlan, config.devBuyShareWad);
 
         _openGenesis(poolId, key, token, config, creator);
+    }
+
+    /// @dev The metadata triple rides the geometry in one event. no-via_ir stack limit: split out of
+    /// `launch`, whose frame cannot also hold it.
+    function _emitLaunched(
+        PoolId poolId,
+        address creator,
+        address token,
+        LaunchConfig calldata config,
+        int24 opening,
+        int24 far,
+        bytes32 configHash
+    ) private {
+        emit Launched(
+            poolId, creator, token, config.name, config.symbol, config.uri, config.totalSupply, opening, far, configHash
+        );
     }
 
     /// @dev Writes the immutable per-pool launch shape and the initial mutable state.
@@ -375,12 +408,6 @@ contract MilestoneColdPaths is MilestoneBase {
             return "";
         }
 
-        if (raw == uint8(UnlockAction.REDEEM_QUOTE)) {
-            (, uint256 amount) = abi.decode(data, (uint8, uint256));
-            _redeemQuote(amount);
-            return "";
-        }
-
         if (raw == uint8(UnlockAction.REDEEM_PROTOCOL_BACKING)) {
             (, uint256 amount) = abi.decode(data, (uint8, uint256));
             _redeemQuote(amount);
@@ -394,8 +421,8 @@ contract MilestoneColdPaths is MilestoneBase {
         }
 
         if (raw == uint8(UnlockAction.REDEEM_PAYOUT_POT)) {
-            (, PoolId poolId, uint256 amount) = abi.decode(data, (uint8, PoolId, uint256));
-            _redeemPayoutPot(poolId, amount);
+            (, PoolId[] memory pools, uint256[] memory amounts) = abi.decode(data, (uint8, PoolId[], uint256[]));
+            _redeemPayoutPots(pools, amounts);
             return "";
         }
 
@@ -412,12 +439,18 @@ contract MilestoneColdPaths is MilestoneBase {
         _takeCurrency(CurrencyLibrary.ADDRESS_ZERO, address(this), amount);
     }
 
-    /// @dev Dedicated whole-pot redemption. The payout satellite has already removed this exact amount
-    /// from the pool's pot liability before opening the unlock; poolId remains in the payload so traces
-    /// bind the redemption to its source pool rather than to ambient claim backing.
-    function _redeemPayoutPot(PoolId poolId, uint256 amount) private {
-        if (_pools[poolId].phase == Phase.NONE) revert NotInBondingCurvePhase(poolId, Phase.NONE);
-        _redeemQuote(amount);
+    /// @dev Dedicated whole-pot redemption, shared across a flush batch: one burn and one take of the
+    /// complete total, with the per-pot amounts in the payload so traces bind each redemption to its
+    /// source pool. The payout satellite has already removed every pot from its liability before opening
+    /// the unlock. The per-pool phase check stays here as defense in depth — a flush entry can only
+    /// reach this with live pools, and the callback refuses anything else.
+    function _redeemPayoutPots(PoolId[] memory pools, uint256[] memory amounts) private {
+        uint256 total;
+        for (uint256 i; i < pools.length; ++i) {
+            if (_pools[pools[i]].phase == Phase.NONE) revert NotInBondingCurvePhase(pools[i], Phase.NONE);
+            total += amounts[i];
+        }
+        _redeemQuote(total);
     }
 
     // --- Genesis ---
@@ -517,20 +550,20 @@ contract MilestoneColdPaths is MilestoneBase {
         returns (uint256 quote, uint256 token, uint256 undeployed)
     {
         PoolState storage state = _pools[poolId];
-        uint32 deployedBits = state.curveDeployed;
         int24 opening = state.openingLevel;
         int24 far = state.farLevel;
-        uint16 positions = curvePositions;
         uint256 curveSupply = FullMath.mulDiv(state.totalSupply, curveSupplyShareWad, WAD);
 
+        // no-via_ir stack limit: the deployed-bitmap and position-count locals the caller once held are
+        // re-read inline, keeping this frame small.
         int256 delta0;
         int256 delta1;
         uint256 deployedNominal;
 
-        for (uint256 i = 0; i < positions; i++) {
-            if (deployedBits & (uint32(1) << uint8(i)) == 0) continue;
+        for (uint256 i = 0; i < curvePositions; i++) {
+            if (state.curveDeployed & (uint32(1) << uint8(i)) == 0) continue;
 
-            deployedNominal += CurveLib.positionAmount(curveSupply, positions, i);
+            deployedNominal += CurveLib.positionAmount(curveSupply, curvePositions, i);
             (int128 d0, int128 d1) = _burnCurvePosition(key, poolId, opening, far, i);
             delta0 += d0;
             delta1 += d1;
@@ -542,7 +575,7 @@ contract MilestoneColdPaths is MilestoneBase {
         undeployed = curveSupply > deployedNominal ? curveSupply - deployedNominal : 0;
     }
 
-    /// @dev One curve position, in its own frame to keep {_burnCurves} inside the stack limit.
+    /// @dev no-via_ir stack limit: one curve position, in its own frame to keep {_burnCurves} small.
     ///
     /// Liquidity is read back from the pool rather than recomputed. Both would agree today, but reading
     /// is authoritative: it burns exactly what exists, so a rounding difference could never leave a
@@ -575,11 +608,11 @@ contract MilestoneColdPaths is MilestoneBase {
         return (delta.amount0(), delta.amount1());
     }
 
-    /// @dev Splits quote proceeds per the template, mints the full-range position, and nets settlement.
+    /// @dev Splits quote proceeds per the template, mints the full-range position and its wall reserve,
+    /// and nets settlement.
     ///
-    /// The position spans the whole usable tick range and there is no code path anywhere in this
-    /// protocol that removes liquidity from it — that absence, not a guard, is what "permanently locked"
-    /// means here.
+    /// Neither position has a code path anywhere in this protocol that removes its liquidity — that
+    /// absence, not a guard, is what "permanently locked" means here.
     ///
     /// Every token the curves released, plus every token their undeployed siblings never used, joins
     /// `carriedInventory`: it is ladder funding, and the `graduation` spec requires it reach the ladder
@@ -597,11 +630,55 @@ contract MilestoneColdPaths is MilestoneBase {
         uint256 creatorQuote = FullMath.mulDiv(quoteProceeds, proceedsCreatorWad, WAD);
         uint256 protocolQuote = quoteProceeds - lpSeedQuote - creatorQuote;
 
-        int24 tickLower = -Bounds.FULL_RANGE_TICK_BOUND;
-        int24 tickUpper = Bounds.FULL_RANGE_TICK_BOUND;
+        // no-via_ir stack limit: the position mint lives in its own frame; the full seeding frame would
+        // overflow.
+        (int256 owed0, int256 owed1, uint128 liquidity) = _seedFullRangePosition(key, poolId, lpSeedQuote);
+
+        // Net the burn credits against the seed obligations, then settle once per currency. Whatever the
+        // seed could not use stays in hook custody, which is where the creator and protocol shares are
+        // paid from.
+        _netSettle(key.currency0, int256(quoteProceeds) + owed0);
+        _netSettle(key.currency1, int256(tokenReturned) + owed1);
+
+        state.carriedInventory += tokenReturned + undeployedCurveTokens;
+
+        _accrueCreator(poolId, creatorQuote, AccrualSource.CURVE_PROCEEDS);
+        _accrueProtocol(poolId, protocolQuote, AccrualSource.CURVE_PROCEEDS);
+        _assertSolvent();
+
+        emit Graduated(
+            poolId,
+            state.graduationLevel,
+            quoteProceeds,
+            lpSeedQuote,
+            creatorQuote,
+            protocolQuote,
+            liquidity,
+            state.wallLiquidity
+        );
+    }
+
+    /// @dev Mints the graduation full-range position from its seed and reports the settlement deltas.
+    ///
+    /// The position spans the template's bounded market-cap range rather than the whole usable tick
+    /// range: concentrating the seed into [$5,100, $150B] of FDV doubles the per-price depth, and its
+    /// lower bound becomes the pool's hard price floor — the entire seed sits between the graduation
+    /// price and that tick, and nothing provides liquidity below it.
+    ///
+    /// Whatever token share the seed does not consume becomes the wall: a single-sided, token-only
+    /// position spanning the levels directly above graduation. Like the full-range position it has no
+    /// removal path anywhere in this protocol.
+    function _seedFullRangePosition(PoolKey memory key, PoolId poolId, uint256 lpSeedQuote)
+        private
+        returns (int256 owed0, int256 owed1, uint128 liquidity)
+    {
+        PoolState storage state = _pools[poolId];
+
+        int24 tickLower = Bounds.FULL_RANGE_TICK_LOWER;
+        int24 tickUpper = Bounds.FULL_RANGE_TICK_UPPER;
         (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(poolId);
 
-        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
+        liquidity = LiquidityAmounts.getLiquidityForAmounts(
             sqrtPriceX96,
             TickMath.getSqrtPriceAtTick(tickLower),
             TickMath.getSqrtPriceAtTick(tickUpper),
@@ -609,8 +686,6 @@ contract MilestoneColdPaths is MilestoneBase {
             FullMath.mulDiv(state.totalSupply, fullRangeSupplyShareWad, WAD)
         );
 
-        int256 owed0;
-        int256 owed1;
         if (liquidity != 0) {
             (BalanceDelta delta,) = poolManager.modifyLiquidity(
                 key,
@@ -630,20 +705,67 @@ contract MilestoneColdPaths is MilestoneBase {
             state.fullRangeTickUpper = tickUpper;
         }
 
-        // Net the burn credits against the seed obligations, then settle once per currency. Whatever the
-        // seed could not use stays in hook custody, which is where the creator and protocol shares are
-        // paid from.
-        _netSettle(key.currency0, int256(quoteProceeds) + owed0);
-        _netSettle(key.currency1, int256(tokenReturned) + owed1);
+        // The wall absorbs whatever the seed did not consume, so nothing from the LP share is left
+        // unplaced in custody. Like the full-range position it has no removal path anywhere in this
+        // protocol.
+        owed1 += _seedWall(key, poolId, state, owed1 < 0 ? uint256(-owed1) : 0);
+    }
 
-        state.carriedInventory += tokenReturned + undeployedCurveTokens;
+    /// @dev no-via_ir stack limit: the wall mint, in its own frame.
+    ///
+    /// The wall must be single-sided: its whole range at or below the current tick, in tick terms. Spot
+    /// at graduation sits at the far level or one level above it, so the nominal top — one level above
+    /// graduation — already satisfies that; the clamp handles the boundary case exactly and keeps the
+    /// property true even if spot ever sat deeper inside the nominal range.
+    function _seedWall(PoolKey memory key, PoolId poolId, PoolState storage state, uint256 consumed)
+        private
+        returns (int256 owed1)
+    {
+        uint256 offered = FullMath.mulDiv(state.totalSupply, fullRangeSupplyShareWad, WAD);
+        if (offered <= consumed) return 0;
 
-        _accrueCreator(poolId, creatorQuote, AccrualSource.CURVE_PROCEEDS);
-        _accrueProtocol(poolId, protocolQuote, AccrualSource.CURVE_PROCEEDS);
-        _assertSolvent();
+        (int24 wallLower, int24 wallUpper, uint128 wallLiquidity) = _wallPlacement(poolId, state, offered - consumed);
+        if (wallLiquidity == 0) return 0;
 
-        emit Graduated(
-            poolId, state.graduationLevel, quoteProceeds, lpSeedQuote, creatorQuote, protocolQuote, liquidity
+        (BalanceDelta wallDelta,) = poolManager.modifyLiquidity(
+            key,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: wallLower,
+                tickUpper: wallUpper,
+                liquidityDelta: int256(uint256(wallLiquidity)),
+                salt: WALL_SALT
+            }),
+            ""
+        );
+
+        state.wallLiquidity = wallLiquidity;
+        state.wallTickLower = wallLower;
+        state.wallTickUpper = wallUpper;
+
+        return wallDelta.amount1();
+    }
+
+    /// @dev no-via_ir stack limit: the wall's derived placement, in its own frame.
+    ///
+    /// The wall must be single-sided: its whole range at or below the current tick, in tick terms. Spot
+    /// at graduation sits at the far level or one level above it, so the nominal top — one level above
+    /// graduation — already satisfies that; the clamp handles the boundary case exactly and keeps the
+    /// property true even if spot ever sat deeper inside the nominal range.
+    function _wallPlacement(PoolId poolId, PoolState storage state, uint256 surplus)
+        private
+        view
+        returns (int24 wallLower, int24 wallUpper, uint128 wallLiquidity)
+    {
+        int24 wallTop = state.farLevel + 1;
+        (, int24 tick,,) = poolManager.getSlot0(poolId);
+        int24 spotLevel = Orientation.toLevel(tick);
+        if (spotLevel > wallTop) wallTop = spotLevel;
+        int24 wallBottom = state.farLevel + Bounds.WALL_WIDTH_LEVELS;
+        if (wallTop >= wallBottom) return (0, 0, 0);
+
+        (wallLower, wallUpper) = Orientation.levelRangeToTicks(wallTop, wallBottom);
+        wallLiquidity = LadderLib.boundedLiquidity(
+            TickMath.getSqrtPriceAtTick(wallLower), TickMath.getSqrtPriceAtTick(wallUpper), surplus
         );
     }
 
@@ -680,6 +802,27 @@ contract MilestoneColdPaths is MilestoneBase {
         int128 fee1 = feesAccrued.amount1();
         quoteFees = fee0 > 0 ? uint256(uint128(fee0)) : 0;
         tokenFees = fee1 > 0 ? uint256(uint128(fee1)) : 0;
+
+        // The wall earns quote fees on every buy that traverses its range — buys are the only trades
+        // that can enter it, since a sell moves the price away from everything above spot. A zero-delta
+        // collect realises them without touching the locked principal, and they join the same waterfall.
+        if (state.wallLiquidity != 0) {
+            (, BalanceDelta wallFees) = poolManager.modifyLiquidity(
+                key,
+                IPoolManager.ModifyLiquidityParams({
+                    tickLower: state.wallTickLower,
+                    tickUpper: state.wallTickUpper,
+                    liquidityDelta: 0,
+                    salt: WALL_SALT
+                }),
+                ""
+            );
+            int128 wallFee0 = wallFees.amount0();
+            int128 wallFee1 = wallFees.amount1();
+            quoteFees += wallFee0 > 0 ? uint256(uint128(wallFee0)) : 0;
+            tokenFees += wallFee1 > 0 ? uint256(uint128(wallFee1)) : 0;
+        }
+
         if (quoteFees == 0 && tokenFees == 0) return (0, 0);
 
         _routeFees(key, poolId, state, quoteFees, tokenFees);

@@ -17,7 +17,7 @@ No. The hook rejects every third-party deposit and withdrawal — the pool's liq
 
 <summary>When exactly does graduation happen?</summary>
 
-When the price reaches the curve top (2x the opening valuation). It is evaluated at call time: the next buy auto-graduates, or anyone can call `graduate()` deliberately. Touching the top and falling back does not graduate the pool.
+When the price reaches the curve top (4x the opening valuation). It is evaluated at call time: the next buy auto-graduates, or anyone can call `graduate()` deliberately. Touching the top and falling back does not graduate the pool.
 
 </details>
 
@@ -73,7 +73,7 @@ The entire revenue stream — accrued-but-unclaimed and future — follows the N
 
 <summary>Is the token supply ever inflated?</summary>
 
-No. Supply is fixed at launch and can only decrease via explicit burns (sell-side fee residue, buyback-and-burn plugin).
+No. Supply is fixed — 1,000,000,000 tokens for every launch — and can only decrease via explicit burns (sell-side fee residue, buyback-and-burn plugin).
 
 </details>
 

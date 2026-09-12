@@ -34,6 +34,8 @@ struct LaunchConfig {
     address creator;
     string name;
     string symbol;
+    /// @dev Off-chain metadata location stored verbatim as the token's {MilestoneToken.tokenURI}.
+    string uri;
     uint256 totalSupply;
     uint64 devBuyShareWad;
     uint256 payoutPlan;
@@ -65,7 +67,13 @@ struct ProtocolTemplate {
     /// @dev Level distance from the opening level to the far (graduation) level.
     int24 curveSpanLevels;
     // --- Ladder geometry ---
+    /// @dev The first step above graduation and the per-step decay are template fields while the floor
+    /// is `bandLevelSpacing`: band `i+1` starts `max(bandLevelSpacing, bandFirstStepLevels -
+    /// bandStepDecayLevels*i)` levels above band `i`, so early milestones sit at wide market-cap
+    /// multiples and later ones settle at the floor's constant 1.2504x ratio.
     int24 bandLevelSpacing;
+    int24 bandFirstStepLevels;
+    int24 bandStepDecayLevels;
     int24 bandWidthLevels;
     uint8 coreBandCount;
     uint8 maxFeeFundedBands;
@@ -124,6 +132,13 @@ struct PoolState {
     uint128 fullRangeLiquidity;
     int24 fullRangeTickLower;
     int24 fullRangeTickUpper;
+    // --- Wall position, code-locked ---
+    /// @dev Single-sided token-only reserve seeded at graduation from whatever the full-range seed did
+    /// not consume. Its range starts one level above graduation and holds no currency0 by construction,
+    /// so it can never owe the pool ETH; its principal converts to locked pool liquidity as price climbs.
+    uint128 wallLiquidity;
+    int24 wallTickLower;
+    int24 wallTickUpper;
 }
 
 /// @notice Protocol-wide bounds every launch is validated against, plus the canonical template.
@@ -143,19 +158,56 @@ library Bounds {
     /// disagree with the advertised milestones.
     int24 internal constant POOL_TICK_SPACING = 1;
 
-    /// @notice Half-width of the "full range" position seeded at graduation.
+    /// @notice Tick bounds of the graduation full-range position, derived from its market-cap range.
     ///
-    /// @dev Deliberately inside `TickMath.MIN_TICK`/`MAX_TICK` rather than equal to them. If the position
-    /// spanned the literal extremes, a pool whose price had run to `MIN_SQRT_PRICE` would sit exactly on
-    /// the position's lower bound, and the liquidity-for-amount1 formula divides by `sqrtP - sqrtLower` —
-    /// one wei of denominator, an astronomically large liquidity, and a `SafeCastOverflow` that would
-    /// make graduation revert forever.
+    /// @dev The position spans the price band from a $150B fully diluted valuation down to a $5,100 one
+    /// at the reference $2,500/ETH: the expensive bound is level -28,135 and the cheap bound level
+    /// -200,114, which in tick space (level = -tick) is `[FULL_RANGE_TICK_LOWER, FULL_RANGE_TICK_UPPER]`
+    /// = `[28_135, 200_114]`. They are constants rather than derived per launch because total supply is
+    /// pinned to {FIXED_TOTAL_SUPPLY} and the template anchors the opening and graduation FDVs, so the
+    /// graduation tick is always 186,449 and always sits strictly inside these bounds — a property
+    /// {MilestoneColdPaths.launch} asserts for every launch rather than assumes.
     ///
-    /// That price is reachable: nothing provides liquidity above `farLevel` until graduation runs, so a
-    /// buy large enough to consume the last curve position pushes spot to the limit. Keeping the bounds
-    /// inside the extremes means such a price falls *outside* the position, where the single-sided
-    /// formula applies and no division degenerates.
-    int24 internal constant FULL_RANGE_TICK_BOUND = 880000;
+    /// The cheap bound doubles as the pool's hard price floor: the seed's entire ETH share sits between
+    /// the graduation price and this tick, so once price reaches it the position is exhausted and
+    /// nothing provides liquidity below. The narrow span is what concentrates that seed — the same ETH
+    /// spread over the old near-unlimited range would backstop twice the distance at half the depth.
+    int24 internal constant FULL_RANGE_TICK_LOWER = 28_135;
+    int24 internal constant FULL_RANGE_TICK_UPPER = 200_114;
+
+    /// @notice Level width of the wall position seeded at graduation above the full-range position.
+    ///
+    /// @dev The wall spans `[graduationLevel + 1, graduationLevel + WALL_WIDTH_LEVELS]` and absorbs every
+    /// token the full-range seed did not consume, so its width sets how thinly that inventory is spread.
+    /// At 880,000 levels the whole reserve sits at uniform liquidity across a range reaching roughly
+    /// `1.0001^880000 ~ 1.6e38` times the graduation price — effectively unbounded above — which makes
+    /// the wall permanent buy-side backing rather than a sellable treasury: only a thin layer sells per
+    /// price move (about 7% of it by the top of the core ladder), and its converted principal stays
+    /// locked in the pool exactly like the full-range position's.
+    int24 internal constant WALL_WIDTH_LEVELS = 880_000;
+
+    /// @notice The only total supply a launch may declare.
+    ///
+    /// @dev Supply determines the launch's opening and graduation levels from the template's anchored
+    /// FDVs, and the full-range and wall bounds above are constants that assume the graduation tick this
+    /// supply produces. Pinning supply makes that derivation a protocol invariant instead of a per-launch
+    /// variable, and makes every launch's geometry directly comparable.
+    uint256 internal constant FIXED_TOTAL_SUPPLY = 1_000_000_000 ether;
+
+    /// @notice Level width of the first step above graduation: a 2x market-cap multiple
+    /// (`1.0001^6932 ~= 2.0004`).
+    ///
+    /// @dev One level above the doubling width so the first milestone lands at or just above a clean 2x
+    /// the graduation valuation. The schedule decays from here, per {BAND_STEP_DECAY_LEVELS}, down to
+    /// {BAND_LEVEL_SPACING}.
+    int24 internal constant BAND_FIRST_STEP_LEVELS = 6_932;
+
+    /// @notice How many levels each successive step shrinks by, down to the {BAND_LEVEL_SPACING} floor.
+    ///
+    /// @dev With first step 6,932 and floor 2,235 the decay runs 12 shrinking steps (6,541 ... 2,240)
+    /// before locking at the floor, so the 22-band core ladder opens at 2x graduation and tops out near
+    /// 2,900x (~$58M at the reference ETH price) instead of the uniform schedule's ~$24M.
+    int24 internal constant BAND_STEP_DECAY_LEVELS = 391;
 
     /// @notice Levels in a 2x market-cap step: `ln(2) / ln(1.0001)`.
     int24 internal constant LEVELS_PER_DOUBLING = 6931;
@@ -181,10 +233,33 @@ library Bounds {
     uint24 internal constant TRADING_FEE_HUNDREDTHS_BIP = 10_000;
     uint64 internal constant DEFAULT_HARVEST_SERVICE_FEE_WAD = 0.1e18;
     uint64 internal constant DEFAULT_QUOTE_CREATOR_SHARE_WAD = 0.75e18;
-    uint64 internal constant DEFAULT_TOKEN_MILESTONE_FUND_SHARE_WAD = 0.2e18;
+    uint64 internal constant DEFAULT_TOKEN_MILESTONE_FUND_SHARE_WAD = 1e18;
     uint64 internal constant MAX_HARVEST_SERVICE_FEE_WAD = 0.2e18;
     uint64 internal constant MAX_QUOTE_CREATOR_SHARE_WAD = 0.9e18;
-    uint64 internal constant MAX_TOKEN_MILESTONE_FUND_SHARE_WAD = 0.5e18;
+    uint64 internal constant MAX_TOKEN_MILESTONE_FUND_SHARE_WAD = 1e18;
+
+    // --- Published plugin-delivery gas constants (payout-plugins spec) ---
+
+    /// @dev Conservative cover for the value-bearing `CALL` base, cold-account access, and the
+    /// instructions between the preflight check and the opcode.
+    uint256 internal constant CALL_FIXED_GAS = 15_000;
+
+    /// @dev One worst-case carry restoration, aggregate/bitmap update, event, and loop step per
+    /// unresolved call.
+    uint256 internal constant POST_CALL_GAS = 100_000;
+
+    /// @dev Creator credit, liability assertions, events, guard exit, and return.
+    uint256 internal constant FINALIZE_GAS = 100_000;
+
+    /// @dev Upper bound on a single untrusted plugin call and on the creator-path final transfer;
+    /// registration rejects stipends above it.
+    uint256 internal constant MAX_PLUGIN_CALL_GAS = 500_000;
+
+    /// @dev Gas allowance for a flush's machinery outside the plugin calls: the redemption unlock,
+    /// tip transfer, plan-walk base, events, and the closing solvency assertion. The unit suite
+    /// measures real flushes against the ceiling built from this constant, so a change that widens
+    /// the base path must raise it rather than let the ceiling go stale.
+    uint256 internal constant FLUSH_BASE_GAS = 250_000;
 
     /// @notice The canonical protocol template (design Decision 16).
     ///
@@ -192,27 +267,31 @@ library Bounds {
     /// immutables — but it is the single place the published numbers are written down, so the
     /// deployment script and the test fixtures cannot drift from each other or from the design.
     ///
-    /// The ladder's 2235-level spacing is a 1.25x market-cap step and its 447-level walls are a fifth of
-    /// that gap, roughly a 4.5% price band. 30 core bands at 1.25x reach about 800x the graduation
-    /// valuation; 30 fee-funded extensions continue from there.
+    /// The ladder opens with a 2x step above graduation and decays by 391 levels per band to the
+    /// 2,235-level (1.2504x) floor. 22 core bands carry that schedule to roughly 2,900x the graduation
+    /// valuation (~$58M at the reference $2,500/ETH); up to 30 fee-funded extensions continue from there
+    /// at the floor spacing. Supply is pinned to {FIXED_TOTAL_SUPPLY}: 25% trades the bonding curve, 10%
+    /// funds the ladder, and 65% seeds the graduation full-range position and its wall reserve.
     function defaultTemplate() internal pure returns (ProtocolTemplate memory t) {
-        t.openingFdvWei = 125 ether;
+        t.openingFdvWei = 2 ether;
 
         t.curvePositions = 32;
-        t.curveSpanLevels = LEVELS_PER_DOUBLING;
+        t.curveSpanLevels = 2 * LEVELS_PER_DOUBLING;
 
         t.bandLevelSpacing = BAND_LEVEL_SPACING;
+        t.bandFirstStepLevels = BAND_FIRST_STEP_LEVELS;
+        t.bandStepDecayLevels = BAND_STEP_DECAY_LEVELS;
         t.bandWidthLevels = BAND_WIDTH_LEVELS;
-        t.coreBandCount = 30;
+        t.coreBandCount = 22;
         t.maxFeeFundedBands = 30;
 
         t.curveSupplyShareWad = 0.25e18;
-        t.ladderSupplyShareWad = 0.65e18;
-        t.fullRangeSupplyShareWad = 0.1e18;
+        t.ladderSupplyShareWad = 0.1e18;
+        t.fullRangeSupplyShareWad = 0.65e18;
 
-        t.lpSeedWad = 0.4e18;
-        t.proceedsCreatorWad = 0.55e18;
-        t.proceedsProtocolWad = 0.05e18;
+        t.lpSeedWad = 0.2e18;
+        t.proceedsCreatorWad = 0.7e18;
+        t.proceedsProtocolWad = 0.1e18;
 
         t.tradingFeeHundredthsBip = TRADING_FEE_HUNDREDTHS_BIP;
         t.bandInventoryCapMultiple = 2;
@@ -231,6 +310,7 @@ library Bounds {
         config.creator = creator_;
         config.name = name_;
         config.symbol = symbol_;
+        config.uri = "";
         config.totalSupply = totalSupply_;
         config.devBuyShareWad = 0;
         config.payoutPlan = 0;

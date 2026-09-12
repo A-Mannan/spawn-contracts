@@ -248,8 +248,8 @@ contract LaunchpadInvariantsTest is LaunchpadTest {
             PoolState memory s = hook.poolState(handler.poolIdAt(i));
             assertEq(s.fullRangeLiquidity, handler.fullRangeLiquidityOf(i), "stored liquidity drifted");
             if (s.phase == Phase.GRADUATED) {
-                assertEq(s.fullRangeTickLower, -Bounds.FULL_RANGE_TICK_BOUND, "lower bound moved");
-                assertEq(s.fullRangeTickUpper, Bounds.FULL_RANGE_TICK_BOUND, "upper bound moved");
+                assertEq(s.fullRangeTickLower, Bounds.FULL_RANGE_TICK_LOWER, "lower bound moved");
+                assertEq(s.fullRangeTickUpper, Bounds.FULL_RANGE_TICK_UPPER, "upper bound moved");
             }
         }
     }
@@ -286,7 +286,7 @@ contract LaunchpadInvariantsTest is LaunchpadTest {
     }
 
     function test_handlerDrivesPayoutActionsToEffect() public {
-        int24 lower0 = hook.poolState(poolId1).graduationLevel + template.bandLevelSpacing;
+        int24 lower0 = hook.poolState(poolId1).graduationLevel + template.bandFirstStepLevels;
         handler.buy(1, 2_000 ether, _delta(poolId1, lower0 + template.bandWidthLevels + 300));
         assertGt(handler.bandHarvests(), 0, "no band was harvested");
         assertGt(hook.payoutPot(poolId1), 0, "harvest did not fund a pot");

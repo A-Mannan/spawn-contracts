@@ -93,7 +93,8 @@ contract ForkOrientationTest is BaseForkHarnessTest {
                 TickMath.getSqrtPriceAtTick(tickLower), TickMath.getSqrtPriceAtTick(tickUpper), liquidity, false
             );
             // The tripwire: an inverted conversion would have minted the step here instead.
-            assertEq(_liquidityAtTicks(start, state.farLevel, salt), 0, "nothing lives at the mirrored key");
+            // no-via_ir stack limit: the assertion lives in a helper call.
+            _assertNothingLivesAtMirroredRange(start, state.farLevel, salt);
         }
 
         (uint256 minted, uint256 tokenSettled) = _mintedCurvePositionsFromLogs(logs);
@@ -211,9 +212,7 @@ contract ForkOrientationTest is BaseForkHarnessTest {
         logs = vm.getRecordedLogs();
 
         for (uint256 i = 1; i <= SWEEP_TOP; i++) {
-            (int24 loggedLower, int24 loggedUpper) = _bandGeometryFromLogs(logs, uint32(i));
-            _assertBandGeometry(state.graduationLevel, i, loggedLower, loggedUpper);
-            assertLt(-loggedLower, tickBefore, "every band this buy minted was below the spot it started from");
+            _assertSweptBand(logs, state.graduationLevel, i, tickBefore);
         }
 
         assertEq(_deployedBandCount(), SWEEP_TOP + 1, "five bands were minted in all");
@@ -299,6 +298,18 @@ contract ForkOrientationTest is BaseForkHarnessTest {
         return IPoolManager(address(manager)).getPositionLiquidity(
             poolId, Position.calculatePositionKey(HOOK_ADDR, tickLower, tickUpper, salt)
         );
+    }
+
+    /// @dev no-via_ir stack limit: the inverted-conversion tripwire, in its own frame.
+    function _assertNothingLivesAtMirroredRange(int24 start, int24 farLevel, bytes32 salt) private view {
+        assertEq(_liquidityAtTicks(start, farLevel, salt), 0, "nothing lives at the mirrored key");
+    }
+
+    /// @dev no-via_ir stack limit: one swept band's geometry assertions, in their own frame.
+    function _assertSweptBand(Vm.Log[] memory logs, int24 graduationLevel, uint256 i, int24 tickBefore) private view {
+        (int24 loggedLower, int24 loggedUpper) = _bandGeometryFromLogs(logs, uint32(i));
+        _assertBandGeometry(graduationLevel, i, loggedLower, loggedUpper);
+        assertLt(-loggedLower, tickBefore, "every band this buy minted was below the spot it started from");
     }
 
     // --- Log decoders ---

@@ -2,8 +2,8 @@
 pragma solidity 0.8.26;
 
 import {Vm} from "forge-std/Vm.sol";
-
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {FixedPoint96} from "v4-core/src/libraries/FixedPoint96.sol";
 import {FullMath} from "v4-core/src/libraries/FullMath.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
@@ -274,19 +274,7 @@ contract ForkAdversarialTest is BaseForkTest {
         uint256 spammerEth = STRANGER.balance;
 
         for (uint256 i = 0; i < 5; i++) {
-            vm.recordLogs();
-            uint256 gasBefore = gasleft();
-            vm.prank(STRANGER);
-            (uint256 quoteFees, uint256 tokenFees) = hook.collectFees(key);
-            uint256 gasUsed = gasBefore - gasleft();
-            Vm.Log[] memory logs = vm.getRecordedLogs();
-
-            // Both early returns sit above the `FeesCollected` emit, so silence is the observable form of
-            // "nothing happened" — there is no zero-valued event to sift out of a log stream.
-            assertEq(logs.length, 0, "nothing happened, so nothing was announced");
-            assertEq(quoteFees, 0, "and nothing was collected");
-            assertEq(tokenFees, 0, "in either currency");
-            assertLt(gasUsed, workingGas / 4, "far cheaper than the call that did the work");
+            _assertZeroAccrualCollectionIsSilentAndCheap(key, workingGas);
         }
 
         assertEq(_fullRangeLiquidity(), liquidity, "the locked position never compounded");
@@ -314,5 +302,23 @@ contract ForkAdversarialTest is BaseForkTest {
             if (logs[i].topics[0] != MilestoneBase.MilestoneHarvested.selector) continue;
             (quote,,) = abi.decode(logs[i].data, (uint256, uint256, uint32));
         }
+    }
+
+    /// @dev One zero-accrual collection must be silent and cheap. no-via_ir stack limit: split out of
+    /// its caller.
+    function _assertZeroAccrualCollectionIsSilentAndCheap(PoolKey memory key, uint256 workingGas) private {
+        vm.recordLogs();
+        uint256 gasBefore = gasleft();
+        vm.prank(STRANGER);
+        (uint256 quoteFees, uint256 tokenFees) = hook.collectFees(key);
+        uint256 gasUsed = gasBefore - gasleft();
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        // Both early returns sit above the `FeesCollected` emit, so silence is the observable form of
+        // "nothing happened" — there is no zero-valued event to sift out of a log stream.
+        assertEq(logs.length, 0, "nothing happened, so nothing was announced");
+        assertEq(quoteFees, 0, "and nothing was collected");
+        assertEq(tokenFees, 0, "in either currency");
+        assertLt(gasUsed, workingGas / 4, "far cheaper than the call that did the work");
     }
 }

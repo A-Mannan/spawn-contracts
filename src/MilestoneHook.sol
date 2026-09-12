@@ -25,7 +25,7 @@ import {LadderLib} from "./libraries/LadderLib.sol";
 import {Orientation} from "./libraries/Orientation.sol";
 import {TransientLock} from "./libraries/TransientLock.sol";
 import {LaunchConfig, Phase, PoolState, ProtocolTemplate, Bounds} from "./types/LaunchTypes.sol";
-import {EconomicConfig} from "./types/PayoutTypes.sol";
+import {EconomicConfig, PluginEntry} from "./types/PayoutTypes.sol";
 
 /// @title MilestoneHook
 /// @notice The protocol core: one deployed hook serving every launch, holding per-pool state keyed by
@@ -76,7 +76,8 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
         address coldPaths_,
         address payoutPaths_,
         address protocolController_,
-        address protocolRecipient_
+        address protocolRecipient_,
+        address trustedOperator_
     ) BaseHook(poolManager_) MilestoneBase(revenueNft_, launchSupport_, template_, protocolController_) {
         if (protocolRecipient_ == address(0)) revert ZeroAddress();
 
@@ -89,6 +90,9 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
         coldPaths = coldPaths_;
         payoutPaths = payoutPaths_;
         protocolRecipient = protocolRecipient_;
+        // Zero is a deliberate value: it disables the relayed-launch path until governance names an
+        // operator, while direct creator launches keep working.
+        trustedOperator = trustedOperator_;
     }
 
     /// @inheritdoc BaseHook
@@ -137,6 +141,18 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
 
         protocolRecipient = recipient;
         emit ProtocolRecipientSet(recipient);
+    }
+
+    /// @notice Replaces the launch operator whose signatures authorize relayed launches.
+    /// @dev Zero disables the relayed path; direct creator launches are unaffected. Key rotation is
+    /// the operator model's whole security story, so it routes through the same typed governance path
+    /// as every other administrative change.
+    function setTrustedOperator(address operator) external {
+        TransientLock.requireNoPayoutDelivery();
+        if (msg.sender != protocolController) revert NotProtocolController();
+
+        trustedOperator = operator;
+        emit TrustedOperatorSet(operator);
     }
 
     // --- Claim entry points ---
@@ -263,15 +279,85 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
         return ret;
     }
 
-    /// @notice Delivers the complete payout pot and retries carry without touching the swap path.
-    function flush(PoolId poolId) external {
-        _delegatePayoutPathCall(abi.encodeCall(MilestonePayoutPaths.flush, (poolId)));
+    /// @notice Delivers one pool's payout pot with the 1% tip directed to `tipTo`.
+    /// @dev The tip recipient is always explicit, so relays and bundlers that accept no bare ETH pass
+    /// their own address onward or direct the tip to the real beneficiary. A zero recipient reverts.
+    function flushTo(PoolId poolId, address tipTo) external {
+        _delegatePayoutPathCall(abi.encodeCall(MilestonePayoutPaths.flushTo, (poolId, tipTo)));
+    }
+
+    /// @notice Flushes every pool in `pools`, delivering all tips to `tipTo` in one transfer.
+    /// @dev The batch shares one redemption unlock and one tip transfer; it is all-or-nothing, so any
+    /// pool's unrecoverable failure reverts the whole batch. Callers wanting per-pool isolation use
+    /// multicall over {flushTo}. A batch's cost is bounded by {flushBatchGasCeiling}.
+    function flushBatch(PoolId[] calldata pools, address tipTo) external {
+        _delegatePayoutPathCall(abi.encodeCall(MilestonePayoutPaths.flushBatch, (pools, tipTo)));
+    }
+
+    /// @notice Worst-case outer gas for one flush of `poolId`, for batch planning.
+    ///
+    /// @dev Sums every selected or carrying entry's registered gas limit plus the per-call reserve,
+    /// plus finalization and the redemption/tip/event base allowance. A batch caller divides the gas
+    /// budget it is willing to spend by this figure; the same arithmetic backs the in-flush preflight,
+    /// so a flush that exceeded the ceiling could not have started. Deliberately conservative: entries
+    /// the flush skips (zero attempt, suspension, codehash mismatch) still reserve here.
+    function flushGasCeiling(PoolId poolId) public view returns (uint256 ceiling) {
+        PoolState storage state = _pools[poolId];
+        if (state.phase == Phase.NONE) revert NotInBondingCurvePhase(poolId, Phase.NONE);
+
+        uint256 bits = state.payoutPlan | _carryBitmap[poolId];
+        ceiling = Bounds.FINALIZE_GAS + Bounds.FLUSH_BASE_GAS;
+        while (bits != 0) {
+            uint8 index = uint8(BitMath.leastSignificantBit(bits));
+            bits &= bits - 1;
+            PluginEntry memory entry = payoutPluginRegistry.entry(index);
+            ceiling += entry.gasLimit + Bounds.POST_CALL_GAS;
+        }
+    }
+
+    /// @notice Worst-case outer gas for a batch flush of `pools`.
+    /// @dev The sum of the per-pool ceilings. It over-reserves by the redemption and tip transfers the
+    /// batch shares, which is the safe direction; a batch sized to this bound cannot run out of gas
+    /// mid-way unless the block itself is tighter than the caller asked for.
+    function flushBatchGasCeiling(PoolId[] calldata pools) external view returns (uint256 ceiling) {
+        uint256 len = pools.length;
+        for (uint256 i; i < len; ++i) {
+            ceiling += flushGasCeiling(pools[i]);
+        }
+    }
+
+    /// @notice Worst-case outer gas for one creator-path claim of `poolId`: a full flush plus the
+    /// bounded final transfer, its EIP-150 margin, and the fixed call overhead.
+    function creatorPathGasCeiling(PoolId poolId) public view returns (uint256) {
+        uint256 callGas = Bounds.MAX_PLUGIN_CALL_GAS;
+        return flushGasCeiling(poolId) + callGas + (callGas + 62) / 63 + Bounds.CALL_FIXED_GAS;
+    }
+
+    /// @notice Worst-case outer gas for a creator-path batch over `pools`.
+    function creatorPathBatchGasCeiling(PoolId[] calldata pools) external view returns (uint256 ceiling) {
+        uint256 len = pools.length;
+        for (uint256 i; i < len; ++i) {
+            ceiling += creatorPathGasCeiling(pools[i]);
+        }
     }
 
     /// @notice Flushes first and then claims creator-path entitlement for the current NFT holder.
     function claimCreatorPath(PoolId poolId) external returns (bool success, uint256 attemptedAmount) {
         (success, attemptedAmount) = abi.decode(
             _delegatePayoutPathCall(abi.encodeCall(MilestonePayoutPaths.claimCreatorPath, (poolId))), (bool, uint256)
+        );
+    }
+
+    /// @notice Creator-path claim across many pools under one shared redemption.
+    /// @dev The caller must hold every pool's RevenueNFT at entry and at every recheck; any ownership
+    /// change reverts the whole batch. Per-pool results are reported positionally.
+    function claimCreatorPathBatch(PoolId[] calldata pools)
+        external
+        returns (bool[] memory successes, uint256[] memory attemptedAmounts)
+    {
+        (successes, attemptedAmounts) = abi.decode(
+            _delegatePayoutPathCall(abi.encodeCall(MilestonePayoutPaths.claimCreatorPathBatch, (pools))),
+            (bool[], uint256[])
         );
     }
 
@@ -435,32 +521,39 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
     }
 
     /// @inheritdoc BaseHook
-    /// @dev All pool liquidity is hook-owned, in every phase. This single guard is what delivers several
-    /// separate spec requirements at once: no external LPs, no just-in-time liquidity around a swap, no
-    /// external party resizing or repricing a curve position or a band, and no path by which anyone but
-    /// the hook can touch the code-locked full-range position.
+    /// @dev Phase-dependent admission. While a pool is on its bonding curve, every wei of liquidity is
+    /// protocol-owned — the curve's nested positions, and later the ladder, are the mechanism, and a
+    /// foreign deposit would sit outside the simulation that sizes them. After graduation the pool is
+    /// an ordinary market: anyone may add or remove liquidity for their own positions. The protocol's
+    /// own positions stay untouchable either way, because v4 keys positions to their owner and the
+    /// full-range principal additionally has no removal path at all (which `make lock-check` asserts
+    /// structurally).
     function _beforeAddLiquidity(
         address sender,
-        PoolKey calldata,
+        PoolKey calldata key,
         IPoolManager.ModifyLiquidityParams calldata,
         bytes calldata
     ) internal view override returns (bytes4) {
-        if (sender != address(this)) revert ExternalLiquidityNotAllowed(sender);
+        if (sender != address(this) && _pools[key.toId()].phase != Phase.GRADUATED) {
+            revert ExternalLiquidityNotAllowed(sender);
+        }
         return BaseHook.beforeAddLiquidity.selector;
     }
 
     /// @inheritdoc BaseHook
-    /// @dev The mirror of {_beforeAddLiquidity}. Note this rejects *external* removal only; the hook
-    /// still removes its own curve positions at graduation and its own bands at harvest. What makes the
-    /// full-range position permanently locked is the absence of any code path that removes it, not this
-    /// guard — which `make lock-check` asserts structurally.
+    /// @dev The mirror of {_beforeAddLiquidity}. Note that even after graduation, `sender` must own
+    /// the position it modifies — v4 enforces that — so the hook's curve, band, and full-range
+    /// positions are unreachable by third parties on both phases. What changes at graduation is only
+    /// whether *new, self-owned* positions may exist.
     function _beforeRemoveLiquidity(
         address sender,
-        PoolKey calldata,
+        PoolKey calldata key,
         IPoolManager.ModifyLiquidityParams calldata,
         bytes calldata
     ) internal view override returns (bytes4) {
-        if (sender != address(this)) revert ExternalLiquidityNotAllowed(sender);
+        if (sender != address(this) && _pools[key.toId()].phase != Phase.GRADUATED) {
+            revert ExternalLiquidityNotAllowed(sender);
+        }
         return BaseHook.beforeRemoveLiquidity.selector;
     }
 
@@ -472,13 +565,34 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
         return Orientation.toLevel(tick);
     }
 
+    /// @dev no-via_ir stack limit: bundles the band walk's loop-carried scalars so the deployment frame
+    /// stays small. `level` is the walked spot in level space, `next` the undeployed cursor, `deploys`
+    /// the per-swap deploy count, and `base`/`wall` the seeded positions' liquidity the walk walks
+    /// against.
+    struct BandCursor {
+        int24 level;
+        uint32 next;
+        uint256 index;
+        uint256 deploys;
+        uint128 base;
+        uint128 wall;
+    }
+
     /// @notice Mints every undeployed band the incoming buy's simulated path will cross.
     ///
     /// @dev The walk alternates between two liquidity regimes, and that is the whole of its structure:
-    /// in the gap between bands the only liquidity is the full-range position, and inside a band it is
-    /// the full-range position plus that band. Bands never overlap, so at most one is ever in range.
-    /// Both figures are exact — the full-range liquidity is stored, a live band's is read from the pool
-    /// — which is what makes the simulation an evaluation of v4's own swap math rather than an estimate.
+    /// in the gap between bands the only liquidity is the full-range position plus the wall, and inside
+    /// a band it is those two plus that band. Bands never overlap, so at most one is ever in range. All
+    /// three figures are exact — the seeded positions' liquidity is stored, a live band's is read from
+    /// the pool — which is what makes the simulation an evaluation of v4's own swap math rather than an
+    /// estimate.
+    ///
+    /// The wall spans from one level above graduation upward, and the walk is charged its liquidity from
+    /// the first step. When spot sits a level below the wall's top — the state graduation itself leaves —
+    /// that one-level sliver is priced with the wall included, an overestimate of at most one level's
+    /// worth of resistance. The walk then reaches boundaries marginally sooner in budget terms, and its
+    /// only failure mode is the specified one: stopping early under-deploys, which degrades to
+    /// skip-and-carry.
     ///
     /// The walk starts at the lowest *live* band rather than at the next undeployed one, because a band
     /// deployed by an earlier swap and not yet completed still sits in the path and still resists the
@@ -492,39 +606,54 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
         PoolState storage state,
         IPoolManager.SwapParams calldata params
     ) private {
-        uint128 base = state.fullRangeLiquidity;
-        if (base == 0) return;
+        if (state.fullRangeLiquidity == 0) return;
 
-        (uint160 sqrtPriceX96, int24 tick,,) = poolManager.getSlot0(poolId);
-        int24 level = Orientation.toLevel(tick);
-
-        LadderLib.Walk memory walk = LadderLib.Walk({
-            sqrtPriceX96: sqrtPriceX96,
-            amountRemaining: params.amountSpecified,
-            sqrtPriceLimitX96: params.sqrtPriceLimitX96,
-            feePips: tradingFeeHundredthsBip
-        });
+        LadderLib.Walk memory walk;
+        {
+            (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(poolId);
+            walk = LadderLib.Walk({
+                sqrtPriceX96: sqrtPriceX96,
+                amountRemaining: params.amountSpecified,
+                sqrtPriceLimitX96: params.sqrtPriceLimitX96,
+                feePips: tradingFeeHundredthsBip
+            });
+        }
 
         uint256 live = state.deployedBands & ~state.completedBands;
-        uint32 next = state.nextBandIndex;
-        uint256 index = live == 0 ? next : BitMath.leastSignificantBit(live);
-        uint256 deploys;
+
+        // no-via_ir stack limit: the loop's carried scalars bundle into one cursor, five locals collapsed
+        // into one.
+        BandCursor memory cur = BandCursor({
+            level: _currentLevel(poolId),
+            next: state.nextBandIndex,
+            index: 0,
+            deploys: 0,
+            base: state.fullRangeLiquidity,
+            wall: state.wallLiquidity
+        });
+        cur.index = live == 0 ? cur.next : BitMath.leastSignificantBit(live);
 
         for (uint256 step = 0; step < LadderLib.MAX_WALK_STEPS; step++) {
-            if (!LadderLib.withinLadderCap(coreBandCount, index, state.feeFundedBandsCreated, maxFeeFundedBands)) {
+            if (!LadderLib.withinLadderCap(coreBandCount, cur.index, state.feeFundedBandsCreated, maxFeeFundedBands)) {
                 break;
             }
 
-            (int24 lower, int24 upper, bool exists) =
-                LadderLib.bandLevels(state.graduationLevel, bandLevelSpacing, bandWidthLevels, index);
+            (int24 lower, int24 upper, bool exists) = LadderLib.bandLevels(
+                state.graduationLevel,
+                bandFirstStepLevels,
+                bandStepDecayLevels,
+                bandLevelSpacing,
+                bandWidthLevels,
+                cur.index
+            );
             if (!exists) break;
 
-            bool isNew = index >= next;
-            bool isLive = !isNew && (live & (uint256(1) << index)) != 0;
+            bool isNew = cur.index >= cur.next;
+            bool isLive = !isNew && (live & (uint256(1) << cur.index)) != 0;
 
             // Completed or skipped: no liquidity at this level, so the walk passes straight over it.
             if (!isNew && !isLive) {
-                index += 1;
+                cur.index += 1;
                 continue;
             }
 
@@ -540,49 +669,49 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
             // revert `beforeSwap` — bricking every buy until someone sold the price back below the band.
             // `break` would avoid the revert but strand the ladder at this index forever, so the escape
             // has to be a skip.
-            if (isNew && lower < level) {
-                _skipBand(poolId, state, uint32(index));
-                next = uint32(index) + 1;
-                index += 1;
+            if (isNew && lower < cur.level) {
+                _skipBand(poolId, state, uint32(cur.index));
+                cur.next = uint32(cur.index) + 1;
+                cur.index += 1;
                 continue;
             }
 
             // A live band the price has already risen out of holds only quote, so an upward walk meets
             // nothing in it. It stays live until a harvest settles it.
-            if (isLive && upper <= level) {
-                index += 1;
+            if (isLive && upper <= cur.level) {
+                cur.index += 1;
                 continue;
             }
 
-            // Cross the gap up to this band's lower bound against the full-range position alone.
-            if (lower > level) {
-                if (!LadderLib.advance(walk, LadderLib.sqrtPriceAtLevel(lower), base)) break;
-                level = lower;
+            // Cross the gap up to this band's lower bound against the seeded positions alone.
+            if (lower > cur.level) {
+                if (!LadderLib.advance(walk, LadderLib.sqrtPriceAtLevel(lower), cur.base + cur.wall)) break;
+                cur.level = lower;
             }
 
             uint128 bandLiquidity;
             if (isLive) {
-                bandLiquidity = _bandLiquidity(poolId, lower, upper, index);
+                bandLiquidity = _bandLiquidity(poolId, lower, upper, cur.index);
             } else {
-                if (deploys >= maxDeploysPerSwap) break;
+                if (cur.deploys >= maxDeploysPerSwap) break;
 
-                bandLiquidity = _deployBand(key, poolId, state, uint32(index), lower, upper);
+                bandLiquidity = _deployBand(key, poolId, state, uint32(cur.index), lower, upper);
                 // Nothing available to fund this band with. Leaving the index unadvanced is deliberate:
                 // "extension requires accrued inventory" means the ladder goes quiet until accrual
                 // resumes, not that the level is consumed.
                 if (bandLiquidity == 0) break;
 
-                next = uint32(index) + 1;
-                deploys += 1;
+                cur.next = uint32(cur.index) + 1;
+                cur.deploys += 1;
             }
 
             // Traverse the band itself, so the next gap is priced from its top.
-            if (!LadderLib.advance(walk, LadderLib.sqrtPriceAtLevel(upper), base + bandLiquidity)) break;
-            level = upper;
-            index += 1;
+            if (!LadderLib.advance(walk, LadderLib.sqrtPriceAtLevel(upper), cur.base + cur.wall + bandLiquidity)) break;
+            cur.level = upper;
+            cur.index += 1;
         }
 
-        if (next != state.nextBandIndex) state.nextBandIndex = next;
+        if (cur.next != state.nextBandIndex) state.nextBandIndex = cur.next;
     }
 
     /// @notice Steps over a band the price rose past without it ever being deployed.
@@ -748,8 +877,9 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
         while (live != 0 && harvests < maxHarvestsPerSwap) {
             uint256 index = BitMath.leastSignificantBit(live);
 
-            (int24 lower, int24 upper, bool exists) =
-                LadderLib.bandLevels(graduationLevel, bandLevelSpacing, bandWidthLevels, index);
+            (int24 lower, int24 upper, bool exists) = LadderLib.bandLevels(
+                graduationLevel, bandFirstStepLevels, bandStepDecayLevels, bandLevelSpacing, bandWidthLevels, index
+            );
             if (!exists) break;
             if (level < upper) break;
 
@@ -849,6 +979,8 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
         t.curvePositions = curvePositions;
         t.curveSpanLevels = curveSpanLevels;
         t.bandLevelSpacing = bandLevelSpacing;
+        t.bandFirstStepLevels = bandFirstStepLevels;
+        t.bandStepDecayLevels = bandStepDecayLevels;
         t.bandWidthLevels = bandWidthLevels;
         t.coreBandCount = coreBandCount;
         t.maxFeeFundedBands = maxFeeFundedBands;
@@ -973,7 +1105,14 @@ contract MilestoneHook is MilestoneBase, BaseHook, IUnlockCallback {
         view
         returns (int24 levelLower, int24 levelUpper, bool exists)
     {
-        return LadderLib.bandLevels(_pools[poolId].graduationLevel, bandLevelSpacing, bandWidthLevels, index);
+        return LadderLib.bandLevels(
+            _pools[poolId].graduationLevel,
+            bandFirstStepLevels,
+            bandStepDecayLevels,
+            bandLevelSpacing,
+            bandWidthLevels,
+            index
+        );
     }
 
     /// @notice Whether bonding curve position `index` has been minted for this pool.

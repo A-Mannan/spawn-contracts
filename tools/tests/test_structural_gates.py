@@ -102,7 +102,7 @@ class FullRangeLockTests(unittest.TestCase):
 
     def seed_function(self, artifact):
         contract = next(node for node in artifact["ast"]["nodes"] if node.get("name") == "MilestoneColdPaths")
-        return next(node for node in contract["nodes"] if node.get("name") == "_seedFullRange")
+        return next(node for node in contract["nodes"] if node.get("name") == "_seedFullRangePosition")
 
     def calls(self, function):
         return [node for node in load_tool("check_full_range_lock").walk(function["body"]) if node.get("nodeType") == "FunctionCall"]

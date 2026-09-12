@@ -119,7 +119,8 @@ contract SettlementTest is HarnessLaunchpadTest {
                 address(coldPaths),
                 address(payoutPaths),
                 address(controller),
-                PROTOCOL_RECIPIENT
+                PROTOCOL_RECIPIENT,
+                operator
             ),
             plainAddr
         );

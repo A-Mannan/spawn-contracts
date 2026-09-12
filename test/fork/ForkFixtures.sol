@@ -110,7 +110,8 @@ abstract contract BaseForkTest is LaunchpadTest {
                 address(coldPaths),
                 address(payoutPaths),
                 address(controller),
-                PROTOCOL_RECIPIENT
+                PROTOCOL_RECIPIENT,
+                vm.addr(OPERATOR_PK)
             ),
             HOOK_ADDR
         );
@@ -129,19 +130,17 @@ abstract contract BaseForkTest is LaunchpadTest {
     ///
     /// @dev The fixture's own helpers cover the two pure cases — {LaunchpadTest._launchDirectWithValue}
     /// sends value with no signature, {LaunchpadTest._launchRelayedSignedBy} sends a signature with no
-    /// value — and the lifecycle needs both at once. Both gates are satisfied honestly rather than
-    /// bypassed: the signature is verified against the declared creator exactly as on a relay, and the dev
-    /// buy rides because `msg.sender` *is* the creator, which is the whole of what
-    /// `MilestoneColdPaths.launch` checks (design Decision 19; `token-launch`'s "Dev buy requires the
-    /// creator's own transaction"). A signature is not what suppresses a dev buy — a foreign sender is.
+    /// value — and the lifecycle needs both at once. The direct path needs no signature: a creator's own
+    /// transaction proves identity by origin, which is the whole of what `MilestoneColdPaths.launch`
+    /// checks (design Decision 19; `token-launch`'s "Dev buy requires the creator's own transaction").
+    /// A signature is not what suppresses a dev buy — a foreign sender is.
     function _launchSignedByCreatorWithValue(LaunchConfig memory config, uint256 value)
         internal
         returns (PoolId id, PoolKey memory k, MilestoneToken t)
     {
-        bytes memory signature = _sign(config, CREATOR_PK);
         vm.deal(creator, creator.balance + value);
         vm.prank(creator);
-        (PoolId poolId_, address tokenAddr, PoolKey memory key_) = hook.launch{value: value}(config, signature);
+        (PoolId poolId_, address tokenAddr, PoolKey memory key_) = hook.launch{value: value}(config, "");
         return (poolId_, key_, MilestoneToken(tokenAddr));
     }
 }

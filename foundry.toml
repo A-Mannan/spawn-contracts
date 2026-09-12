@@ -67,6 +67,16 @@ runs = 64
 runs = 32
 depth = 32
 
+# Fast iteration profile: identical semantics, no via_ir. via_ir is load-bearing only for deployed
+# bytecode size (EIP-170), which tests do not care about — so behavior suites run here in seconds
+# instead of ~10 minutes. Artifacts land in a separate out/cache so switching profiles never thrashes
+# the release build; the size and layout gates must therefore run under the DEFAULT profile, whose
+# artifacts are the ones they audit.
+[profile.fast]
+via_ir = false
+out = "out-fast"
+cache_path = "cache-fast"
+
 # Deeper settings for the release check (task 14.4).
 [profile.deep.fuzz]
 runs = 10_000

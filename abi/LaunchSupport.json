@@ -35,6 +35,11 @@
             "internalType": "string"
           },
           {
+            "name": "uri",
+            "type": "string",
+            "internalType": "string"
+          },
+          {
             "name": "totalSupply",
             "type": "uint256",
             "internalType": "uint256"
@@ -77,6 +82,11 @@
       },
       {
         "name": "symbol",
+        "type": "string",
+        "internalType": "string"
+      },
+      {
+        "name": "uri",
         "type": "string",
         "internalType": "string"
       },
@@ -149,6 +159,11 @@
             "internalType": "string"
           },
           {
+            "name": "uri",
+            "type": "string",
+            "internalType": "string"
+          },
+          {
             "name": "totalSupply",
             "type": "uint256",
             "internalType": "uint256"
@@ -213,6 +228,11 @@
         "internalType": "string"
       },
       {
+        "name": "uri",
+        "type": "string",
+        "internalType": "string"
+      },
+      {
         "name": "supply",
         "type": "uint256",
         "internalType": "uint256"
@@ -258,6 +278,11 @@
           },
           {
             "name": "symbol",
+            "type": "string",
+            "internalType": "string"
+          },
+          {
+            "name": "uri",
             "type": "string",
             "internalType": "string"
           },
@@ -323,6 +348,11 @@
             "internalType": "string"
           },
           {
+            "name": "uri",
+            "type": "string",
+            "internalType": "string"
+          },
+          {
             "name": "totalSupply",
             "type": "uint256",
             "internalType": "uint256"
@@ -370,6 +400,17 @@
     "inputs": [
       {
         "name": "totalTakeWad",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "SupplyNotFixed",
+    "inputs": [
+      {
+        "name": "requested",
         "type": "uint256",
         "internalType": "uint256"
       }

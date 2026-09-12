@@ -34,14 +34,16 @@ contract ProtocolTemplateTest is LaunchpadTest {
         assertEq(hook.templateHash(), payoutPaths.templateHash(), "payout path parity");
     }
 
-    function test_launchesWithDifferentSupplyShareGeometry() public {
+    /// @dev Supply is pinned protocol-wide and the FDV anchors are template constants, so every launch
+    /// shares one geometry: derived, no scenario of its own.
+    function test_launchesShareOneProtocolGeometry() public {
         LaunchConfig memory other = _defaultConfig("Other", "OTH");
-        other.totalSupply = 42_000_000 ether;
         (PoolId otherId,,) = _launchDirect(other);
         PoolState memory a = hook.poolState(poolId);
         PoolState memory b = hook.poolState(otherId);
         assertEq(a.farLevel - a.openingLevel, b.farLevel - b.openingLevel, "same curve span");
-        assertTrue(a.openingLevel != b.openingLevel, "FDV anchor changes opening level");
+        assertEq(a.openingLevel, b.openingLevel, "pinned supply pins the anchored opening level");
+        assertEq(a.farLevel, b.farLevel, "and the same far level");
     }
 
     // --- Scenario: Default global configuration is published ---
@@ -50,7 +52,7 @@ contract ProtocolTemplateTest is LaunchpadTest {
         EconomicConfig memory c = hook.economicConfig();
         assertEq(c.harvestServiceFeeWad, 0.1e18, "service fee");
         assertEq(c.quoteCreatorShareWad, 0.75e18, "creator quote share");
-        assertEq(c.tokenMilestoneFundShareWad, 0.2e18, "token fund share");
+        assertEq(c.tokenMilestoneFundShareWad, 1e18, "token fund share");
         assertEq(c.version, 1, "version");
         assertEq(keccak256(abi.encode(c)), keccak256(abi.encode(controller.economicConfig())), "controller parity");
     }
@@ -122,7 +124,8 @@ contract ProtocolTemplateTest is LaunchpadTest {
     // --- Scenario: Harvest percentages are not configurable ---
 
     function test_launchConfigHasNoGeometryOrPercentageFields() public pure {
-        bytes4 expected = bytes4(keccak256("launch((address,string,string,uint256,uint64,uint256,uint256),bytes)"));
+        bytes4 expected =
+            bytes4(keccak256("launch((address,string,string,string,uint256,uint64,uint256,uint256),bytes)"));
         assertEq(MilestoneHook.launch.selector, expected, "current LaunchConfig is the public ABI");
     }
 

@@ -38,7 +38,7 @@ flowchart LR
 
 - The trading fee is **1%**, forever — buys pay it in ETH, sells in token.
 - **Nobody can provide liquidity** except the protocol. Trading is the only pool interaction.
-- The supply is **fixed at launch**; the only supply decrease is explicit token burns.
+- The supply is **fixed** — 1,000,000,000 tokens for every launch; the only supply decrease is explicit token burns.
 - Launches are **pre-deployment on testnet today** — treat all addresses as provisional until the deployment manifest is published.
 {% endhint %}
 

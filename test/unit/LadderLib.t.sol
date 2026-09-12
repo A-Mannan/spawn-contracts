@@ -13,8 +13,8 @@ import {Orientation} from "../../src/libraries/Orientation.sol";
 import {Bounds, ProtocolTemplate, WAD} from "../../src/types/LaunchTypes.sol";
 
 /// @notice Unit tests for task 8.1 — ladder geometry, covering the `milestone-ladder` scenarios
-/// "Band ticks are computable by any observer", "Uniform tick spacing yields geometric market caps",
-/// "Band width is a fraction of the gap", and "One template applies to all launches".
+/// "Band ticks are computable by any observer", "The schedule decays from a wide first step to the
+/// floor spacing", "Band width is a fraction of the gap", and "One template applies to all launches".
 ///
 /// @dev Deliberately on plain `Test` rather than the shared `LaunchpadTest` fixture: every function here
 /// is a statement about the library and the immutable template, so a deployed protocol would add a launch
@@ -39,15 +39,20 @@ contract LadderLibTest is Test {
     // --- Scenario: Band ticks are computable by any observer ---
 
     /// @dev The point of the scenario is that no protocol state is needed. So this recomputes the whole
-    /// ladder from the two public inputs with open-coded arithmetic — deliberately not by calling the
-    /// library — and requires the library to agree.
+    /// ladder from the public inputs with open-coded arithmetic — deliberately not by calling the
+    /// library — and requires the library to agree. Step `i` (the gap between band `i-1` and band `i`)
+    /// is `max(bandLevelSpacing, bandFirstStepLevels - bandStepDecayLevels*i)` levels.
     function test_bandsAreDerivableFromConfigAndGraduationLevelAlone() public view {
+        int24 cumulative;
         for (uint256 i = 0; i < template.coreBandCount; i++) {
-            int24 expectedLower = graduationLevel + int24(int256(i + 1)) * template.bandLevelSpacing;
+            int24 step = template.bandFirstStepLevels - int24(int256(i)) * template.bandStepDecayLevels;
+            if (step < template.bandLevelSpacing) step = template.bandLevelSpacing;
+            cumulative += step;
+
+            int24 expectedLower = graduationLevel + cumulative;
             int24 expectedUpper = expectedLower + template.bandWidthLevels;
 
-            (int24 lower, int24 upper, bool exists) =
-                LadderLib.bandLevels(graduationLevel, template.bandLevelSpacing, template.bandWidthLevels, i);
+            (int24 lower, int24 upper, bool exists) = _band(i);
 
             assertTrue(exists, "band exists");
             assertEq(lower, expectedLower, "lower level derivable");
@@ -76,48 +81,75 @@ contract LadderLibTest is Test {
         }
     }
 
-    /// @dev No band sits at or below graduation: the first is a full spacing step above it, so graduating
+    /// @dev No band sits at or below graduation: the first is the full first step above it, so graduating
     /// does not instantly complete a milestone.
     function test_firstBandSitsOneFullStepAboveGraduation() public view {
         (int24 lower,,) = _band(0);
-        assertEq(lower - graduationLevel, template.bandLevelSpacing, "one full step above graduation");
+        assertEq(lower - graduationLevel, template.bandFirstStepLevels, "one full first step above graduation");
         assertGt(lower, graduationLevel, "strictly above");
     }
 
-    // --- Scenario: Uniform tick spacing yields geometric market caps ---
+    // --- Scenario: The schedule decays from a wide first step to the floor spacing ---
 
-    function test_consecutiveBandOffsetsAreConstant() public view {
+    /// @dev The step between band `i-1` and band `i` is `max(spacing, firstStep - decay*i)`: shrinking
+    /// until it reaches the floor, then constant. The decay runs exactly
+    /// `(firstStep - spacing) / decay` shrinking steps before locking.
+    function test_stepsDecayToTheFloorSpacing() public view {
         int24 previousLower;
+        uint256 shrinking;
         for (uint256 i = 0; i < template.coreBandCount; i++) {
             (int24 lower,,) = _band(i);
-            if (i > 0) {
-                assertEq(lower - previousLower, template.bandLevelSpacing, "constant level offset");
-            }
+            int24 step = template.bandFirstStepLevels - int24(int256(i)) * template.bandStepDecayLevels;
+            if (step < template.bandLevelSpacing) step = template.bandLevelSpacing;
+            else shrinking = i;
+
+            if (i > 0) assertEq(lower - previousLower, step, "step follows the schedule");
             previousLower = lower;
         }
+
+        // The schedule actually has both phases: it decays for a while, then locks at the floor.
+        assertGt(shrinking, 0, "some steps are shrinking");
+        assertLt(
+            template.bandFirstStepLevels - int24(int256(shrinking + 1)) * template.bandStepDecayLevels,
+            template.bandLevelSpacing,
+            "the next step would fall below the floor, so it locks there"
+        );
+        (int24 lastLower,,) = _band(template.coreBandCount - 1);
+        (int24 beforeLastLower,,) = _band(template.coreBandCount - 2);
+        assertEq(lastLower - beforeLastLower, template.bandLevelSpacing, "the core ladder ends at the floor");
     }
 
-    /// @dev The geometric claim, checked against v4's own price curve rather than restated.
-    ///
-    /// Market cap per token is ETH-per-token, which is `1.0001^level`. A constant level offset is
-    /// therefore a constant price *ratio*, and the ratio between two adjacent bands is
-    /// `1.0001^bandLevelSpacing` for every pair.
-    function test_marketCapMultipleIsConstantAcrossTheLadder() public view {
-        uint256 firstRatio;
-        for (uint256 i = 1; i < template.coreBandCount; i++) {
-            (int24 lower,,) = _band(i);
-            (int24 previousLower,,) = _band(i - 1);
+    /// @dev The ratios the schedule fixes: the first step is a market-cap doubling, the floor is the
+    /// documented 1.2504x step, and ratios only ever shrink toward it.
+    function test_firstStepIsADoublingAndTheFloorIsOnePointTwoFive() public view {
+        (int24 firstLower,,) = _band(0);
+        (int24 secondLower,,) = _band(1);
+        (int24 lastLower,,) = _band(template.coreBandCount - 1);
+        (int24 beforeLastLower,,) = _band(template.coreBandCount - 2);
 
-            uint256 ratio = _capRatioQ96(previousLower, lower);
-            if (i == 1) firstRatio = ratio;
-            // Same multiple every step; the tolerance absorbs TickMath's fixed-point rounding only.
-            assertApproxEqRel(ratio, firstRatio, 0.0001e18, "constant market-cap multiple");
-        }
+        assertApproxEqRel(
+            _capRatioQ96(graduationLevel, firstLower),
+            2 * FixedPoint96.Q96,
+            0.001e18,
+            "the first milestone is a 2x above graduation"
+        );
+        assertApproxEqRel(
+            _capRatioQ96(firstLower, secondLower),
+            _capRatioQ96(0, Bounds.BAND_FIRST_STEP_LEVELS - Bounds.BAND_STEP_DECAY_LEVELS),
+            0.0001e18,
+            "the second step is exactly one decay smaller"
+        );
+        assertApproxEqRel(
+            _capRatioQ96(beforeLastLower, lastLower),
+            (5 * FixedPoint96.Q96) / 4,
+            0.001e18,
+            "the last core step is the 1.25x floor"
+        );
     }
 
     /// @dev The number the scenario fixes: 2,235 levels is a 1.25x market-cap step. The 2x constant is
-    /// asserted alongside it because it is the *curve* span, and reading one for the other is exactly the
-    /// mix-up this checks against — the ladder rungs are 1.25x apart, not 2x.
+    /// asserted alongside it because it is the *curve* span's unit, and reading one for the other is
+    /// exactly the mix-up this checks against — the ladder rungs decay toward 1.25x, not 2x.
     function test_defaultSpacingIsAOnePointTwoFiveTimesMarketCapStep() public pure {
         assertEq(Bounds.BAND_LEVEL_SPACING, 2235, "the documented constant");
         assertApproxEqRel(
@@ -134,6 +166,9 @@ contract LadderLibTest is Test {
             0.001e18,
             "6931 levels doubles the market cap"
         );
+
+        assertEq(Bounds.BAND_FIRST_STEP_LEVELS, 6932, "the first ladder step is one level past a doubling");
+        assertEq(Bounds.BAND_STEP_DECAY_LEVELS, 391, "the per-step decay");
     }
 
     /// @dev Market cap per token at `levelHigh` divided by the same at `levelLow`, in Q96.
@@ -172,8 +207,8 @@ contract LadderLibTest is Test {
 
     // --- Scenario: One template applies to all launches ---
 
-    /// @dev Spacing and width are scalars in `ProtocolTemplate`, so uniformity is structural. This asserts
-    /// the observable consequence across every addressable band, core and fee-funded alike.
+    /// @dev Width and the schedule are scalars in `ProtocolTemplate`, so uniformity is structural. This
+    /// asserts the observable consequence across every addressable band, core and fee-funded alike.
     function test_geometryIsUniformAcrossEveryAddressableBand() public view {
         uint256 last = uint256(template.coreBandCount) + template.maxFeeFundedBands - 1;
 
@@ -183,7 +218,11 @@ contract LadderLibTest is Test {
             assertTrue(exists, "default geometry fits inside tick space for the whole ladder");
 
             assertEq(upper - lower, template.bandWidthLevels, "same width for every band");
-            if (i > 0) assertEq(lower - previousLower, template.bandLevelSpacing, "same spacing for every band");
+            if (i > 0) {
+                int24 step = template.bandFirstStepLevels - int24(int256(i)) * template.bandStepDecayLevels;
+                if (step < template.bandLevelSpacing) step = template.bandLevelSpacing;
+                assertEq(lower - previousLower, step, "same schedule for every band");
+            }
             previousLower = lower;
         }
     }
@@ -214,28 +253,32 @@ contract LadderLibTest is Test {
     function test_bandBeyondTickSpaceDoesNotExist() public pure {
         // Graduating near the ceiling leaves no room for a band above it.
         int24 nearTheTop = Orientation.MAX_LEVEL - 100;
-        (,, bool exists) = LadderLib.bandLevels(nearTheTop, Bounds.BAND_LEVEL_SPACING, 520, 0);
+        (,, bool exists) = LadderLib.bandLevels(
+            nearTheTop, Bounds.BAND_FIRST_STEP_LEVELS, Bounds.BAND_STEP_DECAY_LEVELS, Bounds.BAND_LEVEL_SPACING, 520, 0
+        );
         assertFalse(exists, "no room above");
     }
 
     function test_ladderEndsRatherThanRevertingWhenItRunsOffTheTop() public pure {
-        // A huge spacing puts even band 0 out of reach from a mid-range graduation.
-        (,, bool exists) = LadderLib.bandLevels(0, type(int24).max, 1, 0);
+        // A huge first step puts even band 0 out of reach from a mid-range graduation.
+        (,, bool exists) = LadderLib.bandLevels(0, type(int24).max, 1, Bounds.BAND_LEVEL_SPACING, 1, 0);
         assertFalse(exists, "band 0 out of range");
 
         // And every later band stays out of reach, so the cursor can never wrap into a valid band.
         for (uint256 i = 1; i < 8; i++) {
-            (,, bool later) = LadderLib.bandLevels(0, type(int24).max, 1, i);
+            (,, bool later) = LadderLib.bandLevels(0, type(int24).max, 1, Bounds.BAND_LEVEL_SPACING, 1, i);
             assertFalse(later, "still out of range");
         }
     }
 
     function test_lastValidBandIsFollowedByAnInvalidOne() public pure {
-        int24 spacing = 100_000;
+        int24 firstStep = 100_000;
         int24 width = 500;
         uint256 i;
         while (true) {
-            (, int24 upper, bool exists) = LadderLib.bandLevels(0, spacing, width, i);
+            // Decay of 1 with spacing equal to the first step is the uniform schedule, expressed in the
+            // decayed form the library implements.
+            (, int24 upper, bool exists) = LadderLib.bandLevels(0, firstStep, 1, firstStep, width, i);
             if (!exists) break;
             assertLe(upper, Orientation.MAX_LEVEL, "every existing band is inside tick space");
             i++;
@@ -386,21 +429,29 @@ contract LadderLibTest is Test {
 
     // --- Fuzzed geometry ---
 
-    function testFuzz_geometryIsNonOverlappingAndUniform(int24 gradLevel, int24 spacing, int24 width) public pure {
+    function testFuzz_geometryIsNonOverlappingAndScheduleShaped(int24 gradLevel, int24 firstStep, int24 width)
+        public
+        pure
+    {
         gradLevel = int24(bound(gradLevel, Orientation.MIN_LEVEL, 0));
-        spacing = int24(bound(spacing, 2, 200_000));
+        int24 spacing = Bounds.BAND_LEVEL_SPACING;
+        firstStep = int24(bound(firstStep, spacing, 200_000));
         width = int24(bound(width, 1, spacing - 1));
+        int24 decay = Bounds.BAND_STEP_DECAY_LEVELS;
 
         int24 previousLower;
         int24 previousUpper;
         for (uint256 i = 0; i < 20; i++) {
-            (int24 lower, int24 upper, bool exists) = LadderLib.bandLevels(gradLevel, spacing, width, i);
+            (int24 lower, int24 upper, bool exists) =
+                LadderLib.bandLevels(gradLevel, firstStep, decay, spacing, width, i);
             if (!exists) break;
 
             assertEq(upper - lower, width, "uniform width");
             assertLe(upper, Orientation.MAX_LEVEL, "inside tick space");
             if (i > 0) {
-                assertEq(lower - previousLower, spacing, "uniform spacing");
+                int24 step = firstStep - int24(int256(i)) * decay;
+                if (step < spacing) step = spacing;
+                assertEq(lower - previousLower, step, "schedule-shaped spacing");
                 assertLt(previousUpper, lower, "no overlap");
             }
             previousLower = lower;
@@ -410,7 +461,14 @@ contract LadderLibTest is Test {
 
     /// @dev The template geometry, applied at the index under test.
     function _band(uint256 index) internal view returns (int24 lower, int24 upper, bool exists) {
-        return LadderLib.bandLevels(graduationLevel, template.bandLevelSpacing, template.bandWidthLevels, index);
+        return LadderLib.bandLevels(
+            graduationLevel,
+            template.bandFirstStepLevels,
+            template.bandStepDecayLevels,
+            template.bandLevelSpacing,
+            template.bandWidthLevels,
+            index
+        );
     }
 }
 

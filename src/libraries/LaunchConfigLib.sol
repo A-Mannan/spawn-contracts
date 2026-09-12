@@ -20,6 +20,7 @@ import {Bounds, LaunchConfig} from "../types/LaunchTypes.sol";
 library LaunchConfigLib {
     error ZeroCreator();
     error ZeroTotalSupply();
+    error SupplyNotFixed(uint256 requested);
     error EmptyTokenMetadata();
 
     error DevBuyAboveCap(uint64 shareWad);
@@ -31,6 +32,9 @@ library LaunchConfigLib {
         // creator ledger would accrue to it, so it is worth failing on rather than assuming.
         if (config.creator == address(0)) revert ZeroCreator();
         if (config.totalSupply == 0) revert ZeroTotalSupply();
+        // Supply is a protocol constant, not a launch choice: the full-range and wall tick bounds are
+        // derived from the graduation valuation this supply produces, so the two must move together.
+        if (config.totalSupply != Bounds.FIXED_TOTAL_SUPPLY) revert SupplyNotFixed(config.totalSupply);
         if (bytes(config.name).length == 0 || bytes(config.symbol).length == 0) revert EmptyTokenMetadata();
 
         if (config.devBuyShareWad > Bounds.MAX_DEV_BUY_SHARE_WAD) {

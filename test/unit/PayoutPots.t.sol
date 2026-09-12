@@ -37,7 +37,7 @@ contract PayoutPotsTest is PayoutTestFixture {
         (PoolId second,,) = _launchWithPlan("Second", "SEC", 0);
         _fundPot(poolId, 0, 100 ether);
         _fundPot(second, 0, 40 ether);
-        hook.flush(poolId);
+        hook.flushTo(poolId, STRANGER);
         assertEq(hook.payoutPot(poolId), 0);
         assertEq(hook.payoutPot(second), 36 ether);
         assertEq(hook.creatorPathClaimable(second), 0);
@@ -75,7 +75,7 @@ contract PayoutPotsTest is PayoutTestFixture {
         (PoolId id,,) = _launchWithPlan("Aggregate", "AGG", _plan(index));
         plugin.setShouldRevert(true);
         _fundPot(id, 0, 100 ether);
-        hook.flush(id);
+        hook.flushTo(id, STRANGER);
         (
             uint256 pots,
             uint256 carry,

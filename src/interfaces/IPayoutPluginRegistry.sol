@@ -34,4 +34,6 @@ interface IProtocolConfigurationTarget {
     function payoutDeliveryInFlight() external view returns (bool);
     function setEconomicConfig(EconomicConfig calldata config) external;
     function setProtocolRecipient(address recipient) external;
+    function trustedOperator() external view returns (address);
+    function setTrustedOperator(address operator) external;
 }

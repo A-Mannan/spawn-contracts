@@ -57,7 +57,7 @@ contract CurveRetirementTest is LaunchpadTest {
     /// releases, fees included. Reading it between the crossing buy and the graduating swap is exact,
     /// because auto-graduation runs in the triggering swap's `beforeSwap`, before that swap settles a wei.
     function test_accruedCurveFeesAreCollected() public {
-        _buy(2 ether);
+        _buy(0.5 ether);
         _sell(token.balanceOf(address(router)) / 2);
 
         int24 far = hook.poolState(poolId).farLevel;
@@ -89,7 +89,7 @@ contract CurveRetirementTest is LaunchpadTest {
     /// the burn returns is fee. A sell before the crossing pays its fee in token, and that is what shows
     /// up as ladder inventory.
     function test_curveTokenFeesReachTheLadderNotARecipient() public {
-        _buy(2 ether);
+        _buy(0.5 ether);
         _sell(token.balanceOf(address(router)) / 2);
 
         _graduate();
@@ -137,7 +137,7 @@ contract CurveRetirementTest is LaunchpadTest {
     /// transfer the balance cannot cover. Asserted against both ledgers at once, since the band path draws
     /// on `ladderInventoryRemaining` and `carriedInventory` together.
     function test_carriedLadderInventoryIsBackedByHookCustody() public {
-        _buy(2 ether);
+        _buy(0.5 ether);
         _sell(token.balanceOf(address(router)) / 2);
 
         _graduate();
@@ -155,7 +155,7 @@ contract CurveRetirementTest is LaunchpadTest {
     /// nothing. The creator and protocol ledgers are quote-only (Decision 21), so there is no token ledger
     /// for this inventory to leak into.
     function test_ladderInventoryIsNeverCreditedToARecipient() public {
-        _buy(2 ether);
+        _buy(0.5 ether);
         _sell(token.balanceOf(address(router)) / 2);
 
         uint256 creatorTokenBefore = token.balanceOf(creator);

@@ -69,7 +69,7 @@ contract MilestoneLadderTest is LaunchpadTest {
     /// @dev Graduation cannot land the price inside a milestone: band 0's floor is a full spacing step above
     /// the graduation level, and the crossing swap stops at that level.
     function test_graduationDoesNotInstantlyCompleteAMilestone() public view {
-        assertEq(_bandLower(0), _graduationLevel() + template.bandLevelSpacing, "one full step above");
+        assertEq(_bandLower(0), _graduationLevel() + template.bandFirstStepLevels, "one full first step above");
         assertLt(_level(), _bandLower(0), "so the price is below the first band");
         assertEq(hook.poolState(poolId).completedMilestones, 0, "no milestone came free with graduation");
     }

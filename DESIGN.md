@@ -30,7 +30,7 @@ BONDING_CURVE
         |
         v
 GRADUATED
-  immutable 40/55/5 graduation split; one code-locked full-range position
+  immutable 10/20/70 graduation split; one code-locked full-range position and its wall reserve
   ladder bands deploy just ahead of buys and retire after crossing their tops
   harvests fund claim-backed pots; permissionless flushes deliver them later
 ```
@@ -42,8 +42,10 @@ executes completely only during a creator-direct launch, and transfers bought to
 Relayed launches skip it and leave that inventory on the curve.
 
 Graduation burns deployed curves, credits undeployed and returned token inventory to the ladder, splits
-quote proceeds 40% locked-LP seed / 55% direct creator revenue / 5% global protocol revenue, and seeds
-the sole full-range position with 10% of supply. No code path later adds to or removes from that position.
+quote proceeds 10% global protocol revenue / 20% locked-LP seed / 70% direct creator revenue, and seeds
+the sole full-range position with 20% of quote proceeds over a bounded market-cap range, plus a
+single-sided wall position holding the full-range token share the seed did not consume. No code path
+later adds to or removes from either position.
 
 ## 3. Contract architecture
 
@@ -78,13 +80,16 @@ The immutable template defaults are:
 
 | Parameter | Value |
 |---|---:|
-| Opening fully diluted valuation | 125 ETH |
-| Bonding curve | 32 nested positions over one 2× level span |
-| Supply | 25% curve / 65% ladder / 10% full-range seed |
-| Ladder | 30 core bands, 2,235 levels apart, 447 levels wide |
+| Opening fully diluted valuation | 2 ETH |
+| Bonding curve | 32 nested positions over two 2× level spans (~8 ETH FDV) |
+| Total supply | pinned to 1B tokens |
+| Supply split | 25% curve / 10% ladder / 65% full-range seed + wall |
+| Ladder | 22 core bands, first step a 2× multiple decaying to 2,235-level (1.2504×) spacing, 447 levels wide |
+| Full-range seed | $5,100–$150B market-cap range, whole LP seed on the quote side |
+| Wall reserve | token-only, graduation level → +880,000 levels, code-locked |
 | Fee-funded extensions | at most 30 |
 | Band inventory cap | 2× nominal per-band inventory |
-| Graduation quote split | 40% LP / 55% creator / 5% protocol |
+| Graduation quote split | 10% protocol / 20% LP / 70% creator |
 | Trading fee | literal 1% |
 | Per-swap deployment / harvest work | at most 8 each |
 

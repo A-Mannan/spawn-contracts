@@ -3,7 +3,7 @@
 # Task groups referenced below are from
 # openspec/changes/add-milestone-launchpad/tasks.md
 
-.PHONY: all build test test-unit test-fork test-invariant deep size size-gate-selftest structural-gate-selftest scenario-tool-selftest scenario-check lock-check layout-check abis fmt fmt-check clean deps pins release-check
+.PHONY: all build test test-unit test-fast test-fork test-invariant deep size size-gate-selftest structural-gate-selftest scenario-tool-selftest scenario-check lock-check layout-check abis fmt fmt-check clean deps pins release-check
 
 SIZE_LIMIT ?= 24576
 FIXTURE_DIR := .sizegate-fixture
@@ -32,6 +32,11 @@ build:
 # target because it costs minutes; without excluding it here `release-check` would run it twice.
 test-unit:
 	forge test --no-match-path '{test/fork/**,test/invariant/**}'
+
+# Same suite under the no-via_ir fast profile: seconds per run instead of minutes, separate out/cache,
+# identical semantics. Never use these artifacts for the size or layout gates.
+test-fast:
+	FOUNDRY_PROFILE=fast forge test --no-match-path '{test/fork/**,test/invariant/**}'
 
 # Fork tests need BASE_RPC_URL in the environment.
 test-fork:

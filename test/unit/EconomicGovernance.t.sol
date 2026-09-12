@@ -10,8 +10,10 @@ import {ProtocolController} from "../../src/ProtocolController.sol";
 contract GovernanceTargetMock is IProtocolConfigurationTarget {
     EconomicConfig private _config;
     address public protocolRecipient;
+    address public trustedOperator;
     uint256 public economicConfigCalls;
     uint256 public recipientCalls;
+    uint256 public operatorCalls;
     bool public payoutDeliveryInFlight;
 
     function setPayoutDeliveryInFlight(bool active) external {
@@ -26,6 +28,11 @@ contract GovernanceTargetMock is IProtocolConfigurationTarget {
     function setProtocolRecipient(address recipient) external {
         protocolRecipient = recipient;
         ++recipientCalls;
+    }
+
+    function setTrustedOperator(address operator) external {
+        trustedOperator = operator;
+        ++operatorCalls;
     }
 
     function economicConfig() external view returns (EconomicConfig memory) {
@@ -210,7 +217,7 @@ contract EconomicGovernanceTest is Test {
         EconomicConfig memory config = controller.economicConfig();
         assertEq(config.harvestServiceFeeWad, 0.1e18);
         assertEq(config.quoteCreatorShareWad, 0.75e18);
-        assertEq(config.tokenMilestoneFundShareWad, 0.2e18);
+        assertEq(config.tokenMilestoneFundShareWad, 1e18);
         assertEq(config.version, 1);
         assertEq(controller.governanceDelay(), 0);
     }
@@ -236,7 +243,7 @@ contract EconomicGovernanceTest is Test {
     // --- Scenario (swap-fees): Token-fund cap is enforced ---
 
     function test_tokenFundCapIsEnforced() public {
-        EconomicConfig memory config = _config(0.1e18, 0.75e18, 0.5e18 + 1, 2);
+        EconomicConfig memory config = _config(0.1e18, 0.75e18, 1e18 + 1, 2);
         vm.prank(ADMINISTRATOR);
         vm.expectRevert(ProtocolController.InvalidEconomicConfig.selector);
         controller.scheduleEconomicConfig(config, bytes32("token-cap"));
@@ -245,7 +252,7 @@ contract EconomicGovernanceTest is Test {
     // --- Scenario (swap-fees): Exact cap values are accepted ---
 
     function test_exactCapValuesAreAccepted() public {
-        EconomicConfig memory config = _config(0.2e18, 0.9e18, 0.5e18, 2);
+        EconomicConfig memory config = _config(0.2e18, 0.9e18, 1e18, 2);
         bytes32 salt = bytes32("exact-caps");
         vm.prank(ADMINISTRATOR);
         controller.scheduleEconomicConfig(config, salt);

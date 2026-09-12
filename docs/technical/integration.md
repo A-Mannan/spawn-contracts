@@ -76,7 +76,8 @@ Useful level distances (template constants):
 | Distance | Levels | Meaning |
 | --- | --- | --- |
 | `LEVELS_PER_DOUBLING` | 6931 | 2x market cap |
-| `BAND_LEVEL_SPACING` | 2235 | one milestone rung: **1.2504x** market cap |
+| `BAND_FIRST_STEP_LEVELS` / `BAND_STEP_DECAY_LEVELS` | 6932 / 391 | the first rung sits **2x** the graduation valuation; each successive gap shrinks by 391 levels |
+| `BAND_LEVEL_SPACING` | 2235 | the ladder's spacing **floor**: **1.2504x** market cap, where the schedule locks |
 | `BAND_WIDTH_LEVELS` | 447 | one band's wall: ~4.5% of price |
 
 ---
@@ -93,8 +94,9 @@ never reverts back. Read it via `poolPhase(poolId)` or from `poolState(poolId)`.
 - Position `i` spans levels `[opening + i * span/32, far]` holding only token. Curve supply is 25%
   of total supply (`curveSupplyShareWad`).
 - `opening` is derived from supply so every launch opens at the template FDV:
-  `openingLevel = log_1.0001(openingFdvWei / totalSupplyWei)` (template: 125 ETH FDV).
-- `far = opening + curveSpanLevels` (template: +6931 levels = **2x the opening FDV**).
+  `openingLevel = log_1.0001(openingFdvWei / totalSupplyWei)` (template: 2 ETH FDV on the pinned
+  1,000,000,000 supply; any other declared supply reverts `SupplyNotFixed`).
+- `far = opening + curveSpanLevels` (template: +13,862 levels = **4x the opening FDV**, two 2x spans).
 
 ### 3.2 Graduation
 
@@ -103,16 +105,23 @@ never reverts back. Read it via `poolPhase(poolId)` or from `poolState(poolId)`.
 - Two racing paths, both permissionless: the **next buy's `beforeSwap` auto-graduates**, or anyone
   calls `graduate(key)` deliberately. Both are idempotent; the second one reverts having changed
   nothing.
-- Graduation burns all curve positions. Quote proceeds split 40% LP seed / 55% creator / 5%
-  protocol, and one **full-range** position is seeded. That position is code-locked: no removal path
-  exists, and the hook rejects every third-party liquidity operation anyway (see 4.2).
+- Graduation burns all curve positions. Quote proceeds split 20% LP seed / 70% creator / 10%
+  protocol, and two code-locked positions are seeded — no removal path exists, and the hook rejects
+  every third-party liquidity operation anyway (see 4.2). The **full-range** position is funded by
+  the 20% seed (ETH-limited, ~72.77M of the 650M graduation tokens) and bounded to a market-cap
+  range of ~$5,100 to ~$150B FDV. A **wall** position absorbs the remaining ~577.23M tokens as a
+  single-sided, token-only reserve spanning the 880,000 levels above graduation at zero ETH cost —
+  deep buy-side liquidity with a hard price floor.
 
 ### 3.3 Milestone ladder (the differentiator)
 
-- Protocol-owned, one-sided **sell-limit bands** at ascending market caps:
-  `levelLower(i) = graduationLevel + (i+1) * 2235`, `levelUpper(i) = levelLower(i) + 447`.
-- 30 core bands (65% of supply) reach roughly **800x** the graduation valuation; up to 30
-  fee-funded extensions (funded by the token-fee stream) continue above that.
+- Protocol-owned, one-sided **sell-limit bands** at ascending market caps. The schedule decays:
+  band `i+1` starts `max(2235, 6932 - 391*i)` levels above band `i` (first step **2x** the
+  graduation valuation, locking at the 2,235-level **1.2504x** floor), and
+  `levelUpper(i) = levelLower(i) + 447`.
+- 22 core bands (10% of supply, ~4,545,454.5 tokens each) reach roughly **2,900x** the graduation
+  valuation (~$58M FDV at the $2,500/ETH reference); up to 30 fee-funded extensions (funded by the
+  token-fee stream) continue above that at the floor spacing.
 - Bands deploy JIT as a buy's path approaches them, and are **harvested** (burned into the pot) the
   moment a swap crosses a band's top. Harvests fund the payout pot that later flushes to plugins.
 - Live set is `deployedBands & ~completedBands` and may hold several bands at once. Work per swap is
@@ -129,10 +138,11 @@ never reverts back. Read it via `poolPhase(poolId)` or from `poolState(poolId)`.
 
 ```solidity
 struct LaunchConfig {
-    address creator;          // declared, signed against, never inferred
+    address creator;          // declared; vouched for by the operator, or proven as sender
     string name;
     string symbol;
-    uint256 totalSupply;
+    string uri;               // off-chain metadata, stored as the token's tokenURI
+    uint256 totalSupply;      // pinned to 1,000,000,000; any other value reverts (SupplyNotFixed)
     uint64  devBuyShareWad;   // <= 0.1e18 (10% of supply, hard cap)
     uint256 payoutPlan;       // bitset of registry indices
     uint256 deadline;         // unix seconds, checked against block.timestamp
@@ -167,7 +177,7 @@ verifyingContract: <hook address from the manifest>
 Struct (typehash string, exact — copy verbatim):
 
 ```
-LaunchConfig(address creator,string name,string symbol,uint256 totalSupply,uint64 devBuyShareWad,uint256 payoutPlan,uint256 deadline)
+LaunchConfig(address creator,string name,string symbol,string uri,uint256 totalSupply,uint64 devBuyShareWad,uint256 payoutPlan,uint256 deadline)
 ```
 
 viem example:
@@ -212,14 +222,16 @@ creator publishing byte-identical economics gets a different address.
 `MilestoneHook.launch(config, signature)` is **payable**. Two modes:
 
 - **Creator self-send** (identity = `msg.sender`): attach `msg.value` = the ETH budget for the dev
-  buy. The creator receives exactly `totalSupply * devBuyShareWad` tokens and pays whatever the
-  fresh curve charges; **unused ETH refunds automatically**. Emits `DevBuyExecuted`.
-- **Relayed** (any third party, signature required): attach no value. The dev-buy share stays curve
-  inventory and `DevBuySkipped` records the skip. Any attached value is refunded — the relay path
-  never spends the relayer's ETH on the creator's behalf.
+  buy, **no signature**. The creator receives exactly `totalSupply * devBuyShareWad` tokens and pays
+  whatever the fresh curve charges; **unused ETH refunds automatically**. Emits `DevBuyExecuted`.
+- **Relayed** (any third party, **operator signature required**): attach no value. The protocol's
+  trusted operator — an on-chain, governance-rotatable address — signs the digest; a signature
+  recovering to any other address reverts. The dev-buy share stays curve inventory and
+  `DevBuySkipped` records the skip. Any attached value is refunded — the relay path never spends the
+  relayer's ETH on the creator's behalf.
 
-Returns `(poolId, tokenAddress, poolKey)`. Emits, in order: `Launched` (poolId, creator, token,
-totalSupply, openingLevel, farLevel, configHash), `LaunchConfigured` (payoutPlan, devBuyShareWad),
+Returns `(poolId, tokenAddress, poolKey)`. Emits, in order: `Launched` (poolId, creator, token, name,
+symbol, uri, totalSupply, openingLevel, farLevel, configHash), `LaunchConfigured` (payoutPlan, devBuyShareWad),
 then the dev-buy event.
 
 ### 4.5 Pre-launch dev-buy quote
@@ -270,12 +282,19 @@ The fee is **static** — no dynamic-fee flag, no governance knob. Quote-ledger 
 
 - **v4 SDK** (`@uniswap/v4-sdk`) for quotes/encoding against the pool, via the PoolManager's
   `unlock`/`swap`/`settle` flow. This is the normal trading path.
-- **`hook.flush(poolId)`** as a standalone permissionless call. The immediate caller receives the
-  1% tip, so callers must be able to receive native ETH (an EOA, or a contract with `receive()`).
-  Bundlers cannot relay a tip-bearing flush for someone else: Multicall3 accepts no bare ETH, so
-  the tip transfer fails and the flush reverts atomically. `claimCreatorPath(poolId)` is the
-  composition path for the NFT holder: it flushes first and includes its own tip in the final
-  payment, and it multicalls safely because it pays the holder directly.
+- **`hook.flushTo(poolId, tipTo)`** flushes one pool; the tip goes to `tipTo` (pass `msg.sender` to
+  keep it), so bundlers and batch relays that accept no bare ETH (Multicall3) work directly.
+  **`hook.flushBatch(pools, tipTo)`** flushes many pools under one shared redemption unlock and one
+  combined tip transfer — all-or-nothing: any pool's unrecoverable failure reverts the whole batch,
+  so use multicall over `flushTo` when you need per-pool isolation.
+  **`hook.claimCreatorPathBatch(pools)`** claims several pools' creator-path entitlements under one
+  shared redemption; the caller must hold every pool's RevenueNFT, and any ownership change reverts
+  the batch. A single `claimCreatorPath(poolId)` flushes first and pays the holder everything,
+  retained tip included.
+  Before batching, read `hook.flushGasCeiling(poolId)` / `hook.creatorPathGasCeiling(poolId)` (and
+  the `flushBatchGasCeiling` / `creatorPathBatchGasCeiling` sums): worst-case outer gas per
+  operation, so a batch can be sized against the block gas budget. A zero tip recipient reverts; a
+  rejecting recipient still reverts the whole flush atomically.
 - Users **cannot provide liquidity**: the hook's `beforeAddLiquidity`/`beforeRemoveLiquidity` reject
   every position except the protocol's own. Trading is the only external pool interaction.
 - Curve empty space: until graduation nothing provides liquidity above the far level, so an
@@ -315,9 +334,11 @@ Simulation notes:
   is held as a PoolManager ERC-6909 claim until a flush redeems it.
 - **Quote swap fees** (ETH side, realized from the full-range position by `collectFees`): default
   75% to the pool's direct creator ledger, remainder to protocol (cap 90% creator share).
-- **Token swap fees**: default 20% (cap 50%) funds the next not-yet-created fee-funded band's
-  inventory; the remainder **burns**. At zero remaining extension capacity, 100% burns.
-- **Graduation**: 55% of curve proceeds to the creator's direct ledger, 5% to protocol (raw ETH).
+- **Token swap fees**: default 100% (cap 100%) funds the next not-yet-created fee-funded band's
+  inventory, clamped to the remaining extension capacity; every token not admitted to that capacity
+  **burns** immediately. At zero remaining extension capacity, 100% burns.
+- **Graduation**: 70% of curve proceeds to the creator's direct ledger, 10% to protocol (raw ETH);
+  the 20% LP seed funds the full-range position.
 - **Flush tip**: 1% of a new pot (`pot / 100`, floor) to the flush caller.
 
 ### 7.2 The claim matrix
@@ -393,8 +414,8 @@ Event ordering inside one tx is deterministic: manager events for the swap body 
 - Supply is constant per launch (`totalSupply`) and only ever falls via explicit token `burn`s —
   no rebases, no mint hooks.
 - Curve progress for "raised X of Y": curve supply = 25% of total supply; position `i` covers
-  `[opening + i*6931/32, far]` levels; `CurvePositionsDeployed.deployed` is the **cumulative
-  bitmap**. Position of spot within the curve: `(level - opening) * 32 / 6931`.
+  `[opening + i*13862/32, far]` levels; `CurvePositionsDeployed.deployed` is the **cumulative
+  bitmap**. Position of spot within the curve: `(level - opening) * 32 / 13862`.
 - Milestone progress: band `i` geometry from `BandDeployed` (carries `levelLower`/`levelUpper`
   explicitly — never recompute from a possibly-stale graduation level), completion from
   `MilestoneHarvested.completedMilestones` (cumulative count).
@@ -421,7 +442,7 @@ verbatim, never accumulate.
 | `BandDeployed` | poolId (ix), index (ix), levelLower, levelUpper, liquidity, tokenInventory | Full band geometry — the terminal should store it, not derive it |
 | `BandSkipped` | poolId (ix), index (ix), carriedInventory | Price outran an undeployed band; share moved to carried inventory (post-skip total) |
 | `MilestoneHarvested` | poolId (ix), index (ix), quoteProceeds, tokenResidue, completedMilestones | Band retired. `quoteProceeds` = gross (principal + accrued band fees). `tokenResidue` = dust, already carried |
-| `Graduated` | poolId (ix), graduationLevel, quoteProceeds, lpSeedQuote, creatorQuote, protocolQuote, fullRangeLiquidity | The 40/55/5 split, realized. `graduationLevel` is the **live** level observed, and anchors all band geometry |
+| `Graduated` | poolId (ix), graduationLevel, quoteProceeds, lpSeedQuote, creatorQuote, protocolQuote, fullRangeLiquidity, wallLiquidity | The 20/70/10 split, realized. `graduationLevel` is the **live** level observed, and anchors all band geometry. Both seeded positions' liquidity rides the event; their tick bounds are the derived constants (`Bounds.FULL_RANGE_TICK_LOWER/UPPER`, wall = graduation level +1 to +880,000) |
 
 **Payout delivery**
 
@@ -480,14 +501,16 @@ deployment generation; read `template()` for the live values rather than trustin
 
 | Constant | Value |
 | --- | --- |
-| `openingFdvWei` | 125e18 ETH FDV, every launch |
+| `openingFdvWei` | 2e18 ETH FDV, every launch |
+| Total supply | Pinned to 1,000,000,000 (`FIXED_TOTAL_SUPPLY`); any other value reverts `SupplyNotFixed` |
 | `curvePositions` | 32 |
-| `curveSpanLevels` | 6931 (2x) |
-| `bandLevelSpacing` | 2235 (1.2504x) |
+| `curveSpanLevels` | 13,862 (4x opening, two 2x spans) |
+| `bandLevelSpacing` | 2235 (1.2504x floor) |
+| `bandFirstStepLevels` / `bandStepDecayLevels` | 6,932 (2x first step) / 391 |
 | `bandWidthLevels` | 447 |
-| `coreBandCount` / `maxFeeFundedBands` | 30 / 30 |
-| Supply split (curve / ladder / full-range) | 25% / 65% / 10% |
-| Graduation split (LP / creator / protocol) | 40% / 55% / 5% |
+| `coreBandCount` / `maxFeeFundedBands` | 22 / 30 |
+| Supply split (curve / ladder / graduation LP + wall) | 25% / 10% / 65% |
+| Graduation split (LP / creator / protocol) | 20% / 70% / 10% |
 | `tradingFeeHundredthsBip` | 10 000 (1%) |
 | `POOL_TICK_SPACING` | 1 |
 | `MAX_DEV_BUY_SHARE_WAD` | 0.1e18 |
@@ -500,7 +523,7 @@ Economic tuple (`EconomicConfig`, governance-mutable **prospectively** — alway
 | --- | --- | --- |
 | `harvestServiceFeeWad` | 0.10e18 | 0.20e18 |
 | `quoteCreatorShareWad` | 0.75e18 | 0.90e18 |
-| `tokenMilestoneFundShareWad` | 0.20e18 | 0.50e18 |
+| `tokenMilestoneFundShareWad` | 1.00e18 | 1.00e18 |
 | `version` | 1 | increments per replacement |
 
 Flush tip: `pot / 100` (floor), new pot only.

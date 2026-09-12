@@ -114,7 +114,7 @@ contract LaunchConfigLibTest is Test {
     // --- Scenario: Preset names are absent ---
 
     function test_launchConfigAbiContainsOnlyCurrentFields() public pure {
-        bytes4 expected = bytes4(keccak256("validate((address,string,string,uint256,uint64,uint256,uint256))"));
+        bytes4 expected = bytes4(keccak256("validate((address,string,string,string,uint256,uint64,uint256,uint256))"));
         assertEq(LaunchSupport.validate.selector, expected, "only metadata, supply, dev buy, plan, and deadline");
     }
 
@@ -129,6 +129,30 @@ contract LaunchConfigLibTest is Test {
         LaunchConfig memory config = _base();
         config.totalSupply = 0;
         vm.expectRevert(LaunchConfigLib.ZeroTotalSupply.selector);
+        support.validate(config);
+    }
+
+    // --- Supply is a protocol constant, not a launch choice ---
+
+    // --- Scenario (token-launch): Supply is the protocol constant ---
+
+    /// @dev The full-range and wall tick bounds are constants derived from the graduation valuation the
+    /// pinned supply produces, so any other supply would seed positions whose bounds do not match the
+    /// price they were computed for.
+    function test_supplyOtherThanThePinnedConstantIsRejected() public {
+        LaunchConfig memory config = _base();
+        config.totalSupply = Bounds.FIXED_TOTAL_SUPPLY / 100;
+        vm.expectRevert(
+            abi.encodeWithSelector(LaunchConfigLib.SupplyNotFixed.selector, Bounds.FIXED_TOTAL_SUPPLY / 100)
+        );
+        support.validate(config);
+
+        config.totalSupply = Bounds.FIXED_TOTAL_SUPPLY * 2;
+        vm.expectRevert(abi.encodeWithSelector(LaunchConfigLib.SupplyNotFixed.selector, Bounds.FIXED_TOTAL_SUPPLY * 2));
+        support.validate(config);
+
+        // And the pinned value itself passes every non-registry bound.
+        config.totalSupply = Bounds.FIXED_TOTAL_SUPPLY;
         support.validate(config);
     }
 

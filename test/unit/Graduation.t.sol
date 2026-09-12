@@ -42,8 +42,8 @@ contract GraduationTest is HarnessLaunchpadTest {
     {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         uint256 at = _firstLogAt(logs, MilestoneBase.Graduated.selector);
-        (, proceeds, lpSeed, creatorQuote, protocolQuote,) =
-            abi.decode(logs[at].data, (int24, uint256, uint256, uint256, uint256, uint128));
+        (, proceeds, lpSeed, creatorQuote, protocolQuote,,) =
+            abi.decode(logs[at].data, (int24, uint256, uint256, uint256, uint256, uint128, uint128));
     }
 
     // --- Scenario: The crossing swap itself does not graduate ---
@@ -89,21 +89,21 @@ contract GraduationTest is HarnessLaunchpadTest {
     // --- Graduation gas is bounded by the template: derived, no scenario of its own ---
 
     /// @dev Graduation's only loop runs to `curvePositions`, an immutable template value, and touches just
-    /// the positions the price actually woke. Nothing a launch chooses enters that bound, so two launches a
-    /// hundredfold apart in supply must graduate for the same cost.
+    /// the positions the price actually woke. Nothing a launch chooses enters that bound, and supply is
+    /// pinned protocol-wide, so two separately launched pools must graduate for the same cost.
     ///
     /// Asserted as a ratio rather than against a gas ceiling. The claim is that the cost is the template's
     /// and not the launch's; a hard number would only record today's opcode prices, and would have to be
     /// revised for reasons that have nothing to do with the property.
     function test_graduationGasIsBoundedByTheTemplate() public {
-        (uint256 largeGas, uint256 largeBurns) = _graduationCost("Large", "LRG", SUPPLY);
-        (uint256 smallGas, uint256 smallBurns) = _graduationCost("Small", "SML", SUPPLY / 100);
+        (uint256 firstGas, uint256 firstBurns) = _graduationCost("First", "FST", SUPPLY);
+        (uint256 secondGas, uint256 secondBurns) = _graduationCost("Second", "SND", SUPPLY);
 
-        assertGt(largeBurns, 0, "curve positions really were burned");
-        assertEq(smallBurns, largeBurns, "the same number either way, because the geometry is the template's");
-        assertLe(largeBurns, template.curvePositions, "and never more than the loop bound");
+        assertGt(firstBurns, 0, "curve positions really were burned");
+        assertEq(secondBurns, firstBurns, "the same number either way, because the geometry is the template's");
+        assertLe(firstBurns, template.curvePositions, "and never more than the loop bound");
 
-        assertApproxEqRel(smallGas, largeGas, 0.1e18, "so graduation cost the same, a hundredfold apart in supply");
+        assertApproxEqRel(secondGas, firstGas, 0.1e18, "so graduation cost the same for every pool");
     }
 
     /// @dev Launches at `supply`, crosses the far level, and measures the swap that graduates it. The burn
@@ -170,7 +170,7 @@ contract GraduationTest is HarnessLaunchpadTest {
     }
 
     function test_graduationRejectedPartWayUpTheCurve() public {
-        _buy(20 ether);
+        _buy(0.5 ether);
         assertLt(_level(), _far(), "not there yet");
 
         vm.expectRevert(abi.encodeWithSelector(MilestoneBase.FarLevelNotReached.selector, _level(), _far()));
@@ -324,9 +324,9 @@ contract GraduationTest is HarnessLaunchpadTest {
         _graduate();
         (uint256 proceeds, uint256 lpSeed, uint256 creatorQuote, uint256 protocolQuote) = _graduatedEvent();
 
-        assertEq(lpSeed, (proceeds * 0.4e18) / WAD, "40% locked LP seed");
-        assertEq(creatorQuote, (proceeds * 0.55e18) / WAD, "55% direct creator credit");
-        assertEq(protocolQuote, proceeds - lpSeed - creatorQuote, "5% global protocol remainder");
+        assertEq(lpSeed, (proceeds * 0.2e18) / WAD, "20% locked LP seed");
+        assertEq(creatorQuote, (proceeds * 0.7e18) / WAD, "70% direct creator credit");
+        assertEq(protocolQuote, proceeds - lpSeed - creatorQuote, "10% global protocol remainder");
     }
 
     // --- Scenario: Graduation allocations conserve proceeds ---
@@ -422,10 +422,10 @@ contract GraduationTest is HarnessLaunchpadTest {
         assertEq(_level(), priceAtCrossing, "and seeding did not move the price");
         assertGe(state.graduationLevel, _far(), "which is at or above the far level");
 
-        // Wide, but deliberately inside TickMath's extremes — see Bounds.FULL_RANGE_TICK_BOUND for why a
-        // literal full range would make graduation revert from a drained curve.
-        assertEq(state.fullRangeTickLower, -Bounds.FULL_RANGE_TICK_BOUND, "spans the low end");
-        assertEq(state.fullRangeTickUpper, Bounds.FULL_RANGE_TICK_BOUND, "spans the high end");
+        // The template's bounded market-cap range — see Bounds.FULL_RANGE_TICK_LOWER/UPPER for the
+        // $5,100-$150B derivation and why the bounds sit well inside TickMath's extremes.
+        assertEq(state.fullRangeTickLower, Bounds.FULL_RANGE_TICK_LOWER, "spans the expensive bound");
+        assertEq(state.fullRangeTickUpper, Bounds.FULL_RANGE_TICK_UPPER, "spans the cheap bound");
         assertGt(state.fullRangeTickLower, TickMath.minUsableTick(Bounds.POOL_TICK_SPACING), "inside the extreme");
         assertLt(state.fullRangeTickUpper, TickMath.maxUsableTick(Bounds.POOL_TICK_SPACING), "inside the extreme");
     }
@@ -533,7 +533,7 @@ contract GraduationTest is HarnessLaunchpadTest {
 
         (int24 lower, int24 upper, bool exists) = hook.bandLevels(poolId, 0);
         assertTrue(exists, "band 0 exists");
-        assertEq(lower, hook.poolState(poolId).graduationLevel + template.bandLevelSpacing, "one rung above");
+        assertEq(lower, hook.poolState(poolId).graduationLevel + template.bandFirstStepLevels, "one rung above");
         assertEq(upper - lower, template.bandWidthLevels, "of the template's width");
         assertGt(hook.poolState(poolId).ladderInventoryRemaining, 0, "with inventory to sell into it");
     }
@@ -551,11 +551,17 @@ contract GraduationTest is HarnessLaunchpadTest {
         assertGt(address(router).balance, ethBefore, "sell filled after graduation");
     }
 
-    function test_externalLiquidityStillRejectedAfterGraduation() public {
+    // --- Scenario (token-launch): Graduated pools accept external liquidity ---
+    // --- Scenario (token-launch): Protocol positions are not externally reachable ---
+
+    /// @dev Post-graduation the pool is an ordinary market. The router adds and removes its own
+    /// position; the protocol's full-range principal stays locked because no removal path exists and
+    /// v4 keys positions to their owner.
+    function test_externalLiquidityIsAcceptedAfterGraduation() public {
         _graduate();
 
-        vm.expectRevert();
         router.addLiquidity(key, -200_000, -100_000, 1e18);
+        router.removeLiquidity(key, -200_000, -100_000, -1e18);
     }
 
     // --- Scenario: No migration entry point exists ---

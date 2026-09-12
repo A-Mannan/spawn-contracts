@@ -9,9 +9,13 @@ import sys
 REQUIRED_CONTRACTS = ("MilestoneBase", "MilestoneHook", "MilestoneColdPaths")
 SOURCE_ACTIVATED_CONTRACTS = ("MilestonePayoutPaths",)
 FULL_RANGE_SALT = "FULL_RANGE_SALT"
+WALL_SALT = "WALL_SALT"
 KNOWN_NON_FULL_SALTS = ("bandSalt", "curvePositionSalt")
 POSITIVE_ALLOWLIST = {
-    ("MilestoneColdPaths", "_seedFullRange(PoolKey,PoolId,uint256,uint256,uint256)"),
+    ("MilestoneColdPaths", "_seedFullRangePosition(PoolKey,PoolId,uint256)"),
+}
+WALL_POSITIVE_ALLOWLIST = {
+    ("MilestoneColdPaths", "_seedWall(PoolKey,PoolId,PoolState,uint256)"),
 }
 
 
@@ -77,8 +81,11 @@ def callee_name(call: dict) -> str | None:
 
 def salt_kind(expression: dict, values: dict[int, dict]) -> str:
     expression = resolve_local(expression, values)
-    if expression.get("nodeType") == "Identifier" and expression.get("name") == FULL_RANGE_SALT:
-        return "full"
+    if expression.get("nodeType") == "Identifier":
+        if expression.get("name") == FULL_RANGE_SALT:
+            return "full"
+        if expression.get("name") == WALL_SALT:
+            return "wall"
     if expression.get("nodeType") == "FunctionCall" and callee_name(expression) in KNOWN_NON_FULL_SALTS:
         return "other"
     return "unknown"
@@ -213,8 +220,22 @@ def main() -> int:
     violations = []
     positive_sites = []
     zero_sites = []
+    wall_positive_sites = []
+    wall_zero_sites = []
     for contract, location, function, salt, delta in all_sites:
         if salt == "other":
+            continue
+        if salt == "wall":
+            if delta == "zero":
+                wall_zero_sites.append(location)
+            elif delta == "positive":
+                wall_positive_sites.append((contract, function, location))
+                if (contract, function) not in WALL_POSITIVE_ALLOWLIST:
+                    violations.append(f"{location}: positive {WALL_SALT} mutation outside the graduation wall seed")
+            elif delta == "negative":
+                violations.append(f"{location}: negative {WALL_SALT} mutation is forbidden")
+            else:
+                violations.append(f"{location}: cannot prove {WALL_SALT} liquidityDelta sign")
             continue
         if salt != "full":
             violations.append(f"{location}: cannot prove modifyLiquidity salt is not {FULL_RANGE_SALT}")
@@ -233,12 +254,21 @@ def main() -> int:
     allowed_found = {(contract, function) for contract, function, _ in positive_sites}
     missing = POSITIVE_ALLOWLIST - allowed_found
     extras = len(positive_sites) - len(allowed_found)
+    wall_allowed_found = {(contract, function) for contract, function, _ in wall_positive_sites}
+    wall_missing = WALL_POSITIVE_ALLOWLIST - wall_allowed_found
+    wall_extras = len(wall_positive_sites) - len(wall_allowed_found)
     for contract, function in sorted(missing):
         violations.append(f"missing graduation seed allowlist site {contract}.{function}")
     if extras:
         violations.append("graduation seed appears more than once; exactly one positive full-range mutation is allowed")
     if not zero_sites:
         violations.append("missing zero-delta full-range fee collection site")
+    for contract, function in sorted(wall_missing):
+        violations.append(f"missing graduation wall seed allowlist site {contract}.{function}")
+    if wall_extras:
+        violations.append("wall seed appears more than once; exactly one positive wall mutation is allowed")
+    if not wall_zero_sites:
+        violations.append("missing zero-delta wall fee collection site")
 
     for violation in violations:
         print(f"FAIL {violation}", file=sys.stderr)
@@ -255,7 +285,9 @@ def main() -> int:
         suffix = f"; pending source not present: {', '.join(pending)}"
     print(
         f"check_full_range_lock: OK, {len(all_sites)} modifyLiquidity site(s), "
-        f"{len(zero_sites)} zero-delta collection site(s), one graduation seed, no other full-range mutation{suffix}"
+        f"{len(zero_sites)} zero-delta full-range collection site(s), one graduation seed, "
+        f"{len(wall_zero_sites)} zero-delta wall collection site(s), one wall seed, "
+        f"no other full-range or wall mutation{suffix}"
     )
     return 0
 

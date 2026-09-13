@@ -5,6 +5,7 @@
 ## User guides
 
 * [How it works](user/how-it-works.md)
+* [Milestones and payouts — the numbers](user/milestones-and-payouts.md)
 * [Launching a token](user/launching-a-token.md)
 * [Trading](user/trading.md)
 * [Revenue and claims](user/revenue-and-claims.md)

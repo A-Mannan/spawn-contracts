@@ -37,7 +37,8 @@ contract MineHookSalt is Script {
             selfIssuesCreate2: false,
             bootstrapAdministrator: vm.envAddress("BOOTSTRAP_ADMINISTRATOR"),
             protocolAdmin: vm.envAddress("PROTOCOL_ADMIN"),
-            protocolRecipient: vm.envAddress("PROTOCOL_RECIPIENT")
+            protocolRecipient: vm.envAddress("PROTOCOL_RECIPIENT"),
+            trustedOperator: vm.envAddress("TRUSTED_OPERATOR")
         });
 
         Deployment memory d;

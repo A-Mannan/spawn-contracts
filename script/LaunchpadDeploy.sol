@@ -54,6 +54,7 @@ struct DeployParams {
     address bootstrapAdministrator;
     address protocolAdmin;
     address protocolRecipient;
+    address trustedOperator;
 }
 
 /// @notice The two read-only inputs to a deployment, bundled behind one memory pointer.
@@ -114,7 +115,8 @@ library LaunchpadDeploy {
             address(d.coldPaths),
             address(d.payoutPaths),
             address(d.controller),
-            p.protocolRecipient
+            p.protocolRecipient,
+            p.trustedOperator
         );
     }
 
@@ -204,6 +206,7 @@ library LaunchpadDeploy {
         require(p.bootstrapAdministrator != address(0), "deploy: bootstrap admin");
         require(p.protocolAdmin != address(0), "deploy: protocol admin");
         require(p.protocolRecipient != address(0), "deploy: protocol recipient");
+        // A zero trusted operator is legal: governance names one later, and direct launches work.
         if (p.selfIssuesCreate2) {
             require(p.bootstrapAdministrator == p.create2Deployer, "deploy: bootstrap executor");
         }
@@ -339,6 +342,7 @@ library LaunchpadDeploy {
         require(d.coldPaths.protocolController() == address(d.controller), "verify: cold controller");
         require(d.payoutPaths.protocolController() == address(d.controller), "verify: payout controller");
         require(d.hook.protocolRecipient() == p.protocolRecipient, "verify: protocol recipient");
+        require(d.hook.trustedOperator() == p.trustedOperator, "verify: trusted operator");
     }
 
     function verifyConfiguration(

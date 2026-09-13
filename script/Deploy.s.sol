@@ -19,7 +19,7 @@ import {EconomicConfig} from "../src/types/PayoutTypes.sol";
 /// protocol whose economics no front-end could quote from the source.
 ///
 /// ```
-/// POOL_MANAGER=0x… PROTOCOL_ADMIN=0x… PROTOCOL_RECIPIENT=0x… \
+/// POOL_MANAGER=0x… PROTOCOL_ADMIN=0x… PROTOCOL_RECIPIENT=0x… TRUSTED_OPERATOR=0x… \
 /// forge script script/Deploy.s.sol --rpc-url "$BASE_RPC_URL" --broadcast
 /// ```
 ///
@@ -42,7 +42,8 @@ contract Deploy is Script {
             selfIssuesCreate2: false,
             bootstrapAdministrator: bootstrapAdministrator,
             protocolAdmin: vm.envAddress("PROTOCOL_ADMIN"),
-            protocolRecipient: vm.envAddress("PROTOCOL_RECIPIENT")
+            protocolRecipient: vm.envAddress("PROTOCOL_RECIPIENT"),
+            trustedOperator: vm.envOr("TRUSTED_OPERATOR", address(0))
         });
 
         vm.startBroadcast(bootstrapAdministrator);
@@ -63,6 +64,7 @@ contract Deploy is Script {
         console2.log("bootstrap admin   ", d.controller.administrator());
         console2.log("pending admin     ", d.controller.pendingAdministrator());
         console2.log("protocol recipient", d.hook.protocolRecipient());
+        console2.log("trusted operator  ", d.hook.trustedOperator());
 
         _writeManifest(d, p);
     }
@@ -88,6 +90,7 @@ contract Deploy is Script {
         vm.serializeAddress(json, "bootstrapAdministrator", p.bootstrapAdministrator);
         vm.serializeAddress(json, "protocolAdmin", p.protocolAdmin);
         vm.serializeAddress(json, "protocolRecipient", p.protocolRecipient);
+        vm.serializeAddress(json, "trustedOperator", p.trustedOperator);
         vm.serializeAddress(json, "hook", address(d.hook));
         vm.serializeAddress(json, "coldPaths", address(d.coldPaths));
         vm.serializeAddress(json, "payoutPaths", address(d.payoutPaths));
